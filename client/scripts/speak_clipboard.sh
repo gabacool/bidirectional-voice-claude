@@ -32,20 +32,64 @@ import sys
 content = sys.stdin.read()
 lines = content.strip().split('\n')
 
-response_lines = []
 bullet = '\u23fa'  # ⏺ character
+all_responses = []
+current_block = []
+in_response = False
 
 for line in lines:
     stripped = line.strip()
+
+    # Skip empty lines
+    if not stripped:
+        continue
+
+    # Check for markers that END a response block
+    if stripped.startswith('⎿') or stripped.startswith('│') or stripped.startswith('∴') or stripped.startswith('✢') or stripped.startswith('✻'):
+        if current_block:
+            all_responses.append(' '.join(current_block))
+            current_block = []
+        in_response = False
+        continue
+
+    # Check for user input (starts with >)
+    if stripped.startswith('>'):
+        if current_block:
+            all_responses.append(' '.join(current_block))
+            current_block = []
+        in_response = False
+        continue
+
+    # Check if this is a Claude text response line (starts with ⏺)
     if stripped.startswith(bullet):
         rest = stripped[1:].strip()
-        # Skip tool calls
-        if rest and '(' not in rest[:30] and not any(rest.startswith(t) for t in ['Bash', 'Write', 'Read', 'Edit', 'Todo', 'Grep', 'Glob']):
-            response_lines.append(rest)
+        # Skip tool calls like ⏺ Bash(...)
+        if rest and '(' in rest[:30] or any(rest.startswith(t) for t in ['Bash', 'Write', 'Read', 'Edit', 'Todo', 'Grep', 'Glob']):
+            if current_block:
+                all_responses.append(' '.join(current_block))
+                current_block = []
+            in_response = False
+        else:
+            # This is actual response text
+            if rest:
+                current_block.append(rest)
+            in_response = True
+        continue
 
-if response_lines:
-    # Get only the last response block
-    print(response_lines[-1])
+    # Continuation lines (indented content, bullets, options)
+    # These don't start with ⏺ but are part of the response
+    if in_response and stripped:
+        # Skip terminal UI elements
+        if not any(stripped.startswith(x) for x in ['╭', '╰', '───', 'gabagool@', '$', 'tokens']):
+            current_block.append(stripped)
+
+# Don't forget the last block
+if current_block:
+    all_responses.append(' '.join(current_block))
+
+# Get the last complete response block
+if all_responses:
+    print(all_responses[-1])
 ")
 
 echo "$(date): Captured ${#RESPONSE} chars" >> /tmp/tts_debug.log
