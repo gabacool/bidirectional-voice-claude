@@ -24,6 +24,8 @@ Voice input AND output for terminal sessions using NVIDIA Parakeet ASR + Piper T
 2. Press **Option+S**
 3. Hear a spoken summary of the response
 
+**Note:** Auto-capture works in iTerm2 only. For other terminals (VS Code, Terminal.app), copy the response first (Cmd+C), then press Option+S.
+
 ---
 
 ## Architecture
