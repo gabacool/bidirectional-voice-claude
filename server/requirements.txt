@@ -2,3 +2,7 @@
 nemo_toolkit[asr]
 websockets>=12.0
 soundfile
+
+# TTS server dependencies
+piper-tts>=1.2.0
+aiohttp>=3.9.0

@@ -1,219 +1,97 @@
-# Parakeet Voice Input for Claude Code
+# Bidirectional Voice for Claude Code
 
-Voice-to-text input for terminal sessions using NVIDIA Parakeet ASR on a local GPU server.
+Voice input AND output for terminal sessions using NVIDIA Parakeet ASR + Piper TTS on a local GPU server.
+
+**Talk to Claude, hear Claude talk back.**
 
 ---
 
-## Quick Start Guide
+## Quick Start
 
-### Usage (3 Steps)
+| Hotkey | Action |
+|--------|--------|
+| **Option+V** | Voice Input - speak to type |
+| **Option+S** | Voice Output - hear Claude's response |
 
-1. **Option+V** - Start recording (REC appears in menubar)
-2. **Speak** your message
-3. **Option+V** - Stop recording → text copied to clipboard
-4. **Cmd+V** - Paste into terminal
+### Voice Input (Option+V)
+1. Press **Option+V** - "REC" appears in menubar
+2. Speak your message
+3. Press **Option+V** again - text copied to clipboard
+4. **Cmd+V** to paste into terminal
 
-### Manual Mode (without hotkey)
+### Voice Output (Option+S)
+1. Claude responds in terminal
+2. Press **Option+S**
+3. Hear a spoken summary of the response
 
-```bash
-cd ~/Git/nvidia_parakeet
-source venv/bin/activate
-python client/voice_client.py
-# Speak, then Ctrl+C to stop
-# Result copied to clipboard, Cmd+V to paste
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              Mac (Client)                                │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   Option+V (Voice Input)              Option+S (Voice Output)           │
+│         │                                    │                          │
+│         ▼                                    ▼                          │
+│   voice_client.py                    speak_clipboard.sh                 │
+│   - Mic capture                      - Capture terminal text            │
+│   - VAD filter                       - Send to TTS server               │
+│   - Stream audio                     - Play audio response              │
+│         │                                    │                          │
+└─────────┼────────────────────────────────────┼──────────────────────────┘
+          │                                    │
+          ▼                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         GPU Server (Origin)                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   ASR Server :8087                    TTS Server :8088                  │
+│   ┌─────────────────┐                 ┌─────────────────┐               │
+│   │ Parakeet Model  │                 │ vLLM → Piper    │               │
+│   │ (120M params)   │                 │ Summarize → TTS │               │
+│   │ Audio → Text    │                 │ Text → Audio    │               │
+│   └─────────────────┘                 └─────────────────┘               │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Server Commands
+---
+
+## Components
+
+### Voice Input (STT)
+- **Model:** nvidia/parakeet_realtime_eou_120m-v1
+- **Server:** `server/server.py` on port 8087
+- **Client:** `client/voice_client.py`
+- **Features:** VAD filtering, utterance-based transcription
+
+### Voice Output (TTS)
+- **Summarizer:** vLLM (your existing instance on port 8086)
+- **TTS:** Piper (en_US-lessac-medium voice)
+- **Server:** `server/tts_server.py` on port 8088
+- **Client:** `client/tts_client.py`
+- **Features:** Auto-captures Claude response from terminal, summarizes technical content
+
+---
+
+## Server Commands
 
 ```bash
-# Check status (SSH to your GPU server)
+# ASR Server (Voice Input)
 ssh YOUR_SERVER "systemctl --user status parakeet-asr.service"
-
-# Restart
 ssh YOUR_SERVER "systemctl --user restart parakeet-asr.service"
+
+# TTS Server (Voice Output)
+ssh YOUR_SERVER "systemctl --user status tts-server.service"
+ssh YOUR_SERVER "systemctl --user restart tts-server.service"
 
 # View logs
 ssh YOUR_SERVER "journalctl --user -u parakeet-asr.service -f"
+ssh YOUR_SERVER "journalctl --user -u tts-server.service -f"
 ```
-
----
-
-## Architecture Overview
-
-```
-┌─────────────────┐        ┌─────────────────────────────────┐
-│  Mac (Client)   │        │   GPU Server (YOUR_SERVER_IP)   │
-├─────────────────┤        ├─────────────────────────────────┤
-│ Hammerspoon     │        │ Parakeet ASR Model              │
-│ (Option+V)      │        │ nvidia/parakeet_realtime_eou    │
-│       ↓         │        │ 120M params, GPU accelerated    │
-│ voice_client.py │───────▶│ WebSocket server :8087          │
-│ - Mic capture   │ audio  │ - Receives audio chunks         │
-│ - VAD filter    │ stream │ - Transcribes on finalize       │
-│ - WebSocket     │◀───────│ - Returns text                  │
-│       ↓         │  text  │                                 │
-│ Clipboard       │        │ systemd service (auto-start)    │
-└─────────────────┘        └─────────────────────────────────┘
-```
-
----
-
-## Server Code (`server/server.py`)
-
-The server runs on a Linux machine with NVIDIA GPU.
-
-### Key Components
-
-**1. Model Loading**
-```python
-asr_model = nemo_asr.models.ASRModel.from_pretrained(
-    model_name="nvidia/parakeet_realtime_eou_120m-v1"
-)
-asr_model.eval().cuda()
-```
-
-**2. WebSocket Handler**
-- Accepts connections on port 8087
-- Receives binary audio data (16-bit PCM, 16kHz mono)
-- Accumulates audio in buffer
-- Transcribes on "finalize" command
-
-**3. Transcription**
-- Saves audio buffer to temp WAV file
-- Calls NeMo `model.transcribe()`
-- Returns text with `<EOU>` (end-of-utterance) token stripped
-
-### Why Utterance-Based (Not Streaming)
-
-Initially tried streaming (transcribe every 160ms), but:
-- Model lacks context → fragmented output
-- "hello how are you" became "hello" ... "are" ... "how"
-
-Solution: Accumulate all audio, transcribe once at end. Model gets full context → accurate transcription.
-
----
-
-## Client Code (`client/voice_client.py`)
-
-The client runs on Mac, captures audio, streams to server.
-
-### Key Components
-
-**1. Audio Capture**
-```python
-stream = sd.InputStream(
-    samplerate=16000,
-    channels=1,
-    dtype='float32',
-    blocksize=chunk_size,
-    callback=audio_callback
-)
-```
-
-**2. Voice Activity Detection (VAD)**
-```python
-rms = np.sqrt(np.mean(indata ** 2))
-if rms > 0.005:  # Only send if energy exceeds threshold
-    # Send audio chunk
-```
-
-Why VAD? Without it, silent audio causes model to hallucinate ("yeah", "four", etc).
-
-**3. WebSocket Streaming**
-- Sends audio chunks as binary data
-- Sends `{"command": "finalize"}` on stop
-- Receives transcription JSON
-
-**4. Clipboard Output**
-```python
-subprocess.run(['pbcopy'], input=text.encode())
-```
-
-Safe approach - user manually pastes with Cmd+V. Prevents accidental command execution.
-
----
-
-## Development Saga: Fixing Bad Recognition
-
-### Problem 1: Event Loop Error
-
-```
-RuntimeError: There is no current event loop in thread 'Dummy-1'
-```
-
-**Cause:** Sounddevice callback runs in separate thread without asyncio loop.
-
-**Fix:** Capture loop reference before callback:
-```python
-loop = asyncio.get_running_loop()  # Main thread
-# In callback:
-loop.call_soon_threadsafe(queue.put_nowait, data)
-```
-
----
-
-### Problem 2: Hallucination on Silence
-
-```
-Transcription: yeah
-Transcription: yeah
-Transcription: yeah
-```
-
-**Cause:** ASR models hallucinate on low-energy/silent input.
-
-**Fix:** Energy-based VAD filter:
-```python
-rms = np.sqrt(np.mean(indata ** 2))
-if rms > 0.005:  # Skip silent chunks
-    send_audio()
-```
-
----
-
-### Problem 3: Fragmented Output
-
-```
-Transcription: hello
-Transcription: are
-Transcription: hello
-Transcription: how
-```
-
-**Cause:** Transcribing small 160ms chunks independently. No context.
-
-**Fix:** Utterance-based approach:
-- Accumulate ALL audio during session
-- Only transcribe on finalize (user stops speaking)
-- Model gets full context → coherent output
-
-```python
-# Before (bad):
-if len(buffer) >= 160ms:
-    transcribe_and_return()
-
-# After (good):
-def add_audio():
-    buffer.extend(audio)
-    return None  # Don't transcribe yet
-
-def finalize():
-    return transcribe(buffer)  # Full context
-```
-
----
-
-### Problem 4: Garbled Terminal Output
-
-Text auto-typed into terminal, accidentally executed commands.
-
-**Fix:** Clipboard-only mode:
-```python
-subprocess.run(['pbcopy'], input=text.encode())
-print("Copied to clipboard, Cmd+V to paste")
-```
-
-User controls when/where to paste.
 
 ---
 
@@ -223,25 +101,19 @@ User controls when/where to paste.
 nvidia_parakeet/
 ├── README.md
 ├── PLAN.md
-├── venv/                    # Mac Python venv
 ├── client/
-│   ├── voice_client.py     # Audio capture + WebSocket
-│   ├── config.yaml         # Server URL
-│   ├── requirements.txt
+│   ├── voice_client.py      # STT: Audio capture → server
+│   ├── tts_client.py        # TTS: Receive audio → playback
+│   ├── config.yaml          # Server URLs
 │   └── scripts/
-│       ├── start_voice.sh  # Hammerspoon calls this
-│       └── stop_voice.sh
+│       ├── start_voice.sh   # Option+V start
+│       ├── stop_voice.sh    # Option+V stop
+│       └── speak_clipboard.sh  # Option+S handler
 └── server/
-    ├── server.py           # WebSocket ASR server
-    ├── requirements.txt
-    └── parakeet-asr.service
-
-# On GPU Server:
-~/parakeet-asr/
-├── venv/
-├── server.py
-└── scripts/
-    └── start_server.sh
+    ├── server.py            # ASR WebSocket server
+    ├── tts_server.py        # TTS WebSocket server
+    ├── parakeet-asr.service # ASR systemd service
+    └── tts-server.service   # TTS systemd service
 ```
 
 ---
@@ -250,16 +122,63 @@ nvidia_parakeet/
 
 ### Client (`client/config.yaml`)
 ```yaml
-# Copy config.yaml.example to config.yaml and update
+# Voice Input (STT)
 server_url: "ws://YOUR_SERVER_IP:8087"
 sample_rate: 16000
 chunk_duration: 0.1
+
+# Voice Output (TTS)
+tts_server_url: "ws://YOUR_SERVER_IP:8088"
 ```
 
 ### Hammerspoon (`~/.hammerspoon/init.lua`)
-- Hotkey: Option+V (toggle recording)
-- Shows "REC" in menubar
-- Reload: Cmd+Ctrl+R
+- Option+V: Toggle voice recording
+- Option+S: Speak Claude's response
+- Cmd+Ctrl+R: Reload config
+
+---
+
+## TTS Summarization
+
+The TTS server uses vLLM to convert technical Claude responses into natural speech:
+
+**Input (technical):**
+```
+The backpropagation algorithm computes dL/dw = dL/da * da/dz * dz/dw
+using the chain rule. ReLU(Wx + b) activations flow forward...
+```
+
+**Output (spoken):**
+> "The network learns by calculating how wrong each prediction was
+> and adjusting weights to reduce errors over time."
+
+This makes complex responses listenable without losing meaning.
+
+---
+
+## Development Notes
+
+### STT Challenges Solved
+1. **Event loop errors** - Captured asyncio loop before thread callback
+2. **Hallucination on silence** - Added energy-based VAD filter
+3. **Fragmented output** - Switched to utterance-based transcription
+4. **Garbled terminal** - Clipboard-only output for safety
+
+### TTS Challenges Solved
+1. **Terminal capture** - AppleScript to read iTerm2 content
+2. **Unicode encoding** - Explicit UTF-8 for special characters
+3. **Response isolation** - Extract only latest Claude response
+4. **Technical jargon** - vLLM summarizes before TTS
+
+---
+
+## Models
+
+| Component | Model | Size | Latency |
+|-----------|-------|------|---------|
+| STT | nvidia/parakeet_realtime_eou_120m-v1 | 120M | ~200ms |
+| Summarizer | vLLM (your model) | varies | ~1s |
+| TTS | Piper lessac-medium | 63MB | ~100ms |
 
 ---
 
@@ -268,18 +187,7 @@ chunk_duration: 0.1
 | Issue | Solution |
 |-------|----------|
 | No audio captured | Check mic permissions in System Preferences |
-| Server not responding | `ssh YOUR_SERVER "systemctl --user restart parakeet-asr.service"` |
-| Poor recognition | Speak clearly, reduce background noise, use full sentences |
-| VAD too sensitive | Adjust threshold in `voice_client.py` (default: 0.005) |
-
----
-
-## Model Info
-
-**nvidia/parakeet_realtime_eou_120m-v1**
-- 120M parameters
-- FastConformer-RNNT architecture
-- Optimized for real-time voice agents
-- Native end-of-utterance detection
-- ~9% word error rate
-- Requires 16kHz mono audio
+| ASR server down | `systemctl --user restart parakeet-asr.service` |
+| TTS server down | `systemctl --user restart tts-server.service` |
+| Option+S no sound | Check speaker volume, verify TTS service running |
+| Wrong response spoken | Terminal capture may include old text, scroll down first |

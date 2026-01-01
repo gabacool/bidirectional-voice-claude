@@ -1,0 +1,15 @@
+[Unit]
+Description=TTS WebSocket Server (Piper + vLLM)
+After=network.target
+
+[Service]
+Type=simple
+# Update these paths to match your installation
+WorkingDirectory=/home/YOUR_USER/parakeet-asr
+ExecStart=/home/YOUR_USER/parakeet-asr/venv/bin/python /home/YOUR_USER/parakeet-asr/tts_server.py --host 0.0.0.0 --port 8088 --vllm-url http://localhost:8086/v1/chat/completions
+Restart=on-failure
+RestartSec=10
+Environment=CUDA_VISIBLE_DEVICES=0
+
+[Install]
+WantedBy=default.target
