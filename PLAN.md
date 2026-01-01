@@ -1,7 +1,15 @@
-# Voice Input for Claude Code via NVIDIA Parakeet
+# Bidirectional Voice for Claude Code
 
 ## Overview
-Real-time voice-to-text input for iTerm2/Claude Code sessions using NVIDIA Parakeet ASR running on Origin server.
+Real-time voice input AND output for iTerm2/Claude Code sessions using:
+- **STT:** NVIDIA Parakeet ASR (speech-to-text)
+- **TTS:** Piper + vLLM summarization (text-to-speech)
+
+Both running on local GPU server.
+
+---
+
+# Part 1: Voice Input (STT)
 
 ## Selected Model
 **nvidia/parakeet_realtime_eou_120m-v1**
@@ -15,24 +23,18 @@ Real-time voice-to-text input for iTerm2/Claude Code sessions using NVIDIA Parak
 [Mac: iTerm2] <-- paste text
       ^
       |
-[Mac: Voice Client] -- audio stream --> [Origin: ASR Server]
+[Mac: Voice Client] -- audio stream --> [Origin: ASR Server :8087]
       |                                        |
-  (keyboard shortcut)                   (parakeet model)
+  (Option+V hotkey)                     (parakeet model)
 ```
-
-**Components:**
-1. **GPU Server**: ASR service with WebSocket API
-2. **Mac Client**: Audio capture + hotkey daemon
 
 ---
 
-## Implementation Plan
+## Phase 1.1: ASR Server Setup (Origin)
 
-### Phase 1: Origin Server Setup
+**Location:** `~/parakeet-asr/`
 
-**Location:** `YOUR_USER@YOUR_SERVER:~/parakeet-asr/`
-
-#### 1.1 Create Python venv and install dependencies
+### Directory Structure
 ```
 ~/parakeet-asr/
 ├── venv/
@@ -42,124 +44,213 @@ Real-time voice-to-text input for iTerm2/Claude Code sessions using NVIDIA Parak
     └── start_server.sh
 ```
 
-**Dependencies:**
+### Dependencies
 - nemo_toolkit[asr] (includes PyTorch, CUDA support)
 - websockets
 - soundfile
 
-#### 1.2 Implement WebSocket ASR server
+### Implementation
 - Load `parakeet_realtime_eou_120m-v1` model on startup
 - Accept WebSocket connections on port 8087
 - Receive 16kHz mono audio chunks
-- Stream transcriptions back, emit final on `<EOU>`
-- Handle multiple concurrent connections
+- Accumulate audio, transcribe on "finalize" command
+- Return text with `<EOU>` token stripped
 
-#### 1.3 Create systemd service for auto-start
-- Service file: `/etc/systemd/user/parakeet-asr.service`
+### Systemd Service
+- File: `~/.config/systemd/user/parakeet-asr.service`
 - Auto-restart on failure
 
 ---
 
-### Phase 2: Mac Client Setup
+## Phase 1.2: Voice Client Setup (Mac)
 
-**Location:** `~/nvidia_parakeet/` (your local clone)
+**Location:** `~/nvidia_parakeet/client/`
 
-#### 2.1 Create Python venv and install dependencies
+### Directory Structure
 ```
-nvidia_parakeet/
-├── venv/
-├── voice_client.py    # Audio capture + WebSocket client
+client/
+├── voice_client.py    # Audio capture + WebSocket
+├── config.yaml        # Server URL
 ├── requirements.txt
-├── config.yaml        # Server address, hotkey, audio settings
 └── scripts/
-    ├── install.sh
-    └── voice-input.sh  # Entry script for hotkey
+    ├── start_voice.sh
+    └── stop_voice.sh
 ```
 
-**Dependencies:**
-- sounddevice (or pyaudio)
+### Dependencies
+- sounddevice
 - websockets
 - pyyaml
+- numpy
 
-#### 2.2 Implement voice client
+### Implementation
 - Capture microphone audio (16kHz, mono)
-- Stream to Origin server via WebSocket
-- Buffer incoming transcriptions
-- On `<EOU>`: paste final text into active terminal via AppleScript
+- Energy-based VAD filter (threshold: 0.005)
+- Stream to server via WebSocket
+- Copy transcription to clipboard on finalize
 
-#### 2.3 Global hotkey setup via Hammerspoon
-- Install Hammerspoon via Homebrew (new installation)
-- Configure toggle hotkey: `Option+V` (⌥V)
-- First press: start recording, show menubar indicator
-- Second press: stop recording, paste result, hide indicator
+### Hammerspoon Hotkey
+- **Option+V:** Toggle recording
+- Shows "REC" in menubar while active
 
-**Why Hammerspoon over Karabiner:**
-- Karabiner = key remapping (what you have for MS apps)
-- Hammerspoon = automation/scripting (run Python, show UI, toggle states)
-- Both can coexist, no conflicts
+---
 
-**Hammerspoon config:**
-```lua
--- ~/.hammerspoon/init.lua
-local voiceRecording = false
-local menubarItem = nil
+## Phase 1.3: Challenges Solved
 
-hs.hotkey.bind({"alt"}, "v", function()
-    if voiceRecording then
-        -- Stop recording
-        hs.task.new("/path/to/stop_voice.sh", nil):start()
-        menubarItem:delete()
-        voiceRecording = false
-    else
-        -- Start recording
-        hs.task.new("/path/to/start_voice.sh", nil):start()
-        menubarItem = hs.menubar.new():setTitle("🎤")
-        voiceRecording = true
-    end
-end)
+| Problem | Cause | Solution |
+|---------|-------|----------|
+| Event loop error | Callback in separate thread | Capture `asyncio.get_running_loop()` before callback |
+| Hallucination on silence | ASR hallucinates on low energy | VAD filter: `rms > 0.005` |
+| Fragmented output | Small chunks lack context | Utterance-based: transcribe all at once |
+| Garbled terminal | Auto-typing caused issues | Clipboard-only output |
+
+---
+
+# Part 2: Voice Output (TTS)
+
+## Selected Models
+- **Summarizer:** vLLM (existing instance on port 8086)
+- **TTS:** Piper `en_US-lessac-medium` (63MB, ~100ms latency)
+
+## Architecture
+
+```
+[Mac: Terminal] -- capture text --> [speak_clipboard.sh]
+                                           |
+                                           v
+                                    [tts_client.py]
+                                           |
+                                           v
+[Mac: Speaker] <-- audio stream -- [Origin: TTS Server :8088]
+                                           |
+                                    ┌──────┴──────┐
+                                    v             v
+                              [vLLM :8086]  [Piper TTS]
+                              (summarize)   (synthesize)
 ```
 
 ---
 
-### Phase 3: Integration & Testing
+## Phase 2.1: TTS Server Setup (Origin)
 
-#### 3.1 End-to-end test
-- Start server on Origin
-- Run client on Mac
-- Press hotkey, speak, verify text appears in terminal
+**Location:** `~/parakeet-asr/`
 
-#### 3.2 Error handling
-- Server unavailable: show notification, fail gracefully
-- Audio device issues: prompt user
-- Network latency: buffer handling
+### New Files
+```
+~/parakeet-asr/
+├── tts_server.py      # WebSocket TTS server
+├── tts-server.service # Systemd service
+└── voices/
+    └── en-us-lessac-medium.onnx  # Piper voice model
+```
+
+### Dependencies (added to requirements.txt)
+- piper-tts>=1.2.0
+- aiohttp>=3.9.0
+
+### Implementation
+- Accept WebSocket connections on port 8088
+- Receive text from client
+- If text > 200 chars or contains code: call vLLM to summarize
+- Pass summary to Piper TTS
+- Stream WAV audio back to client
+
+### Summarization Prompt
+```
+Summarize this Claude Code response for spoken output.
+Rules:
+- Convert code blocks to brief descriptions
+- Skip ASCII diagrams, describe what they show
+- Keep it conversational, 2-4 sentences max
+- No markdown formatting in output
+```
+
+### Systemd Service
+- File: `~/.config/systemd/user/tts-server.service`
+- Port 8088, runs alongside ASR service
 
 ---
 
-## Files to Create
+## Phase 2.2: TTS Client Setup (Mac)
+
+**Location:** `~/nvidia_parakeet/client/`
+
+### New Files
+```
+client/
+├── tts_client.py           # Audio playback client
+└── scripts/
+    └── speak_clipboard.sh  # Terminal capture + TTS trigger
+```
+
+### Implementation
+
+**speak_clipboard.sh:**
+1. Capture iTerm2 terminal content via AppleScript
+2. Extract last Claude response (lines starting with ⏺)
+3. Send to TTS server via tts_client.py
+4. Play received audio
+
+**tts_client.py:**
+1. Read text from clipboard
+2. Connect to TTS server via WebSocket
+3. Send text, receive WAV audio
+4. Play audio using sounddevice
+
+### Hammerspoon Hotkey
+- **Option+S:** Speak Claude's last response
+
+---
+
+## Phase 2.3: Challenges Solved
+
+| Problem | Cause | Solution |
+|---------|-------|----------|
+| Piper API mismatch | `synthesize_stream_raw` doesn't exist | Use `synthesize()` returning AudioChunk |
+| Voice model not found | Piper doesn't auto-download | Manual download to `voices/` directory |
+| Terminal capture empty | Unicode ⏺ not matching | Set `LANG=en_US.UTF-8`, use `\u23fa` |
+| Multiple responses captured | Grabbing too many lines | Only take `response_lines[-1]` |
+| Technical jargon unlistenable | Code/formulas hard to speak | vLLM summarizes before TTS |
+
+---
+
+# Files Summary
 
 | File | Location | Purpose |
 |------|----------|---------|
-| `server.py` | Origin: `~/parakeet-asr/` | WebSocket ASR server |
-| `requirements.txt` | Origin: `~/parakeet-asr/` | Server dependencies |
-| `parakeet-asr.service` | Origin: `/etc/systemd/user/` | Systemd service |
-| `voice_client.py` | Mac: `nvidia_parakeet/` | Audio capture client |
-| `requirements.txt` | Mac: `nvidia_parakeet/` | Client dependencies |
-| `config.yaml` | Mac: `nvidia_parakeet/` | Configuration |
-| `init.lua` (edit) | Mac: `~/.hammerspoon/` | Hotkey binding |
+| `server.py` | server/ | ASR WebSocket server |
+| `tts_server.py` | server/ | TTS WebSocket server |
+| `parakeet-asr.service` | server/ | ASR systemd service |
+| `tts-server.service` | server/ | TTS systemd service |
+| `voice_client.py` | client/ | STT: Audio capture |
+| `tts_client.py` | client/ | TTS: Audio playback |
+| `speak_clipboard.sh` | client/scripts/ | Terminal capture + TTS trigger |
+| `config.yaml` | client/ | Server URLs |
 
 ---
 
-## Hotkey: Option+V (⌥V)
+# Hotkeys
 
-Currently types `√` symbol - will be intercepted by Hammerspoon before reaching any app.
+| Hotkey | Action |
+|--------|--------|
+| **Option+V** | Voice Input - toggle recording |
+| **Option+S** | Voice Output - speak last response |
+| **Cmd+Ctrl+R** | Reload Hammerspoon config |
 
 ---
 
-## Success Criteria
+# Success Criteria
 
-1. Press `Option+V` in any terminal
-2. See microphone indicator in menubar
-3. Speak naturally
-4. Press `Option+V` again to stop
-5. Transcribed text appears at cursor position
-6. Latency < 500ms end-to-end
+## Voice Input (STT)
+1. Press Option+V, see "REC" in menubar
+2. Speak naturally
+3. Press Option+V again
+4. Text copied to clipboard
+5. Latency < 500ms
+
+## Voice Output (TTS)
+1. Claude responds in terminal
+2. Press Option+S
+3. Hear spoken summary of response
+4. Technical content converted to natural speech
+5. Latency < 2 seconds
