@@ -80,7 +80,7 @@ for line in lines:
     # These don't start with ⏺ but are part of the response
     if in_response and stripped:
         # Skip terminal UI elements
-        if not any(stripped.startswith(x) for x in ['╭', '╰', '───', 'gabagool@', '$', 'tokens']):
+        if not any(stripped.startswith(x) for x in ['╭', '╰', '───', '$', 'tokens']) and '@' not in stripped[:20]:
             current_block.append(stripped)
 
 # Don't forget the last block
