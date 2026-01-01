@@ -1,0 +1,26 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/
+
+# Local config (contains server IP)
+client/config.yaml
+
+# Temp files
+*.log
+*.pid
+/tmp/
+
+# OS
+.DS_Store
+Thumbs.db

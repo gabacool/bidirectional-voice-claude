@@ -1,0 +1,15 @@
+[Unit]
+Description=Parakeet ASR WebSocket Server
+After=network.target
+
+[Service]
+Type=simple
+# Update these paths to match your installation
+WorkingDirectory=/home/YOUR_USER/parakeet-asr
+ExecStart=/home/YOUR_USER/parakeet-asr/venv/bin/python /home/YOUR_USER/parakeet-asr/server.py --host 0.0.0.0 --port 8087
+Restart=on-failure
+RestartSec=10
+Environment=CUDA_VISIBLE_DEVICES=0
+
+[Install]
+WantedBy=default.target

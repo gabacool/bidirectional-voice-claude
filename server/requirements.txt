@@ -1,0 +1,4 @@
+# Server dependencies for Parakeet ASR
+nemo_toolkit[asr]
+websockets>=12.0
+soundfile
