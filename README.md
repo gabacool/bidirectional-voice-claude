@@ -138,6 +138,11 @@ tts_server_url: "ws://YOUR_SERVER_IP:8088"
 - Option+S: Speak Claude's response
 - Cmd+Ctrl+R: Reload config
 
+**Security Note:** Hammerspoon requires Accessibility permissions to capture hotkeys. This config only listens for specific hotkeys (not all keystrokes) and only communicates with your local server. Recommendations:
+- Don't install untrusted Hammerspoon plugins ("Spoons")
+- Periodically verify `~/.hammerspoon/init.lua` hasn't been modified
+- Hammerspoon is open-source and widely trusted in the Mac community
+
 ---
 
 ## TTS Summarization
