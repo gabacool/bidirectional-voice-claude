@@ -42,16 +42,12 @@ def _manual_cleanup(text: str) -> str:
     text = re.sub(r'\n{3,}', '\n\n', text)
     text = re.sub(r' {2,}', ' ', text)
 
-    # Truncate if too long
-    if len(text) > 500:
-        text = text[:500] + "... and more."
-
     return text.strip()
 
 
 def _prepare_for_speech(text: str) -> str:
-    """Prepare text for TTS - clean up if complex, pass through if simple."""
-    if len(text) < 200 and "```" not in text and not any(c in text for c in ['|', '─', '│', '┌', '└']):
+    """Prepare text for TTS - strip markdown/code artifacts, pass plain text through."""
+    if "```" not in text and not any(c in text for c in ['|', '─', '│', '┌', '└']):
         return text.replace("**", "").replace("*", "").replace("`", "").strip()
     return _manual_cleanup(text)
 
