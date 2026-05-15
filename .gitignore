@@ -16,6 +16,9 @@ __pycache__/
 # Local config (contains server IP)
 client/config.yaml
 
+# Downloaded voice models
+client/voices/
+
 # Temp files
 *.log
 *.pid

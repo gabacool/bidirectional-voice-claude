@@ -15,8 +15,8 @@ if kill -0 "$PID" 2>/dev/null; then
     # Send SIGUSR1 to stop recording gracefully
     kill -USR1 "$PID"
 
-    # Wait for process to finish (up to 5 seconds)
-    for i in {1..50}; do
+    # Wait for process to finish (up to 30 seconds for model load + transcription)
+    for i in {1..300}; do
         if ! kill -0 "$PID" 2>/dev/null; then
             break
         fi

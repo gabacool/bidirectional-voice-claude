@@ -1,6 +1,9 @@
 #!/bin/bash
 # Start voice recording - called by Hammerspoon
 
+# Hammerspoon doesn't inherit user's shell PATH — add Homebrew
+export PATH="/opt/homebrew/bin:$PATH"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLIENT_DIR="$(dirname "$SCRIPT_DIR")"
 PID_FILE="/tmp/parakeet_voice.pid"

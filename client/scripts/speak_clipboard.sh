@@ -1,7 +1,14 @@
 #!/bin/bash
-# Speak Claude's last response via TTS server
+# Speak clipboard text via TTS daemon
 # Called by Hammerspoon on Option+S
+# Works from any app — copy text, press Option+S
+#
+# Daemon reads clipboard at processing time (always fresh).
+# First press auto-starts daemon (~30s model load).
+# Pressing Option+S while speaking interrupts and speaks new clipboard.
 
+# Hammerspoon doesn't inherit user's shell PATH — add Homebrew
+export PATH="/opt/homebrew/bin:$PATH"
 export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 
@@ -9,106 +16,28 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 VENV_DIR="$(dirname "$PROJECT_DIR")/venv"
 
-# Capture iTerm2 terminal content
-TERM_CONTENT=$(osascript -e '
-tell application "iTerm2"
-    tell current session of current window
-        set termContent to contents
-    end tell
-end tell
-return termContent
-' 2>/dev/null)
+DAEMON_PORT=8089
+DAEMON_URL="http://127.0.0.1:$DAEMON_PORT"
 
-if [ -z "$TERM_CONTENT" ]; then
-    echo "$(date): Failed to capture terminal" >> /tmp/tts_debug.log
-    exit 1
+# Fast path: daemon already running
+if curl -s --max-time 1 "$DAEMON_URL/health" > /dev/null 2>&1; then
+    curl -s -X POST "$DAEMON_URL/speak" >> /tmp/tts_debug.log 2>&1
+    exit 0
 fi
 
-# Extract last response using Python with proper encoding
-RESPONSE=$(echo "$TERM_CONTENT" | python3 -c "
-# -*- coding: utf-8 -*-
-import sys
-
-content = sys.stdin.read()
-lines = content.strip().split('\n')
-
-bullet = '\u23fa'  # ⏺ character
-all_responses = []
-current_block = []
-in_response = False
-
-for line in lines:
-    stripped = line.strip()
-
-    # Skip empty lines
-    if not stripped:
-        continue
-
-    # Check for markers that END a response block
-    if stripped.startswith('⎿') or stripped.startswith('│') or stripped.startswith('∴') or stripped.startswith('✢') or stripped.startswith('✻'):
-        if current_block:
-            all_responses.append(' '.join(current_block))
-            current_block = []
-        in_response = False
-        continue
-
-    # Check for user input (starts with >)
-    if stripped.startswith('>'):
-        if current_block:
-            all_responses.append(' '.join(current_block))
-            current_block = []
-        in_response = False
-        continue
-
-    # Check if this is a Claude text response line (starts with ⏺)
-    if stripped.startswith(bullet):
-        rest = stripped[1:].strip()
-        # Skip tool calls like ⏺ Bash(...)
-        if rest and '(' in rest[:30] or any(rest.startswith(t) for t in ['Bash', 'Write', 'Read', 'Edit', 'Todo', 'Grep', 'Glob']):
-            if current_block:
-                all_responses.append(' '.join(current_block))
-                current_block = []
-            in_response = False
-        else:
-            # This is actual response text
-            if rest:
-                current_block.append(rest)
-            in_response = True
-        continue
-
-    # Continuation lines (indented content, bullets, options)
-    # These don't start with ⏺ but are part of the response
-    if in_response and stripped:
-        # Skip terminal UI elements
-        if not any(stripped.startswith(x) for x in ['╭', '╰', '───', '$', 'tokens']) and '@' not in stripped[:20]:
-            current_block.append(stripped)
-
-# Don't forget the last block
-if current_block:
-    all_responses.append(' '.join(current_block))
-
-# Get the last complete response block
-if all_responses:
-    print(all_responses[-1])
-")
-
-echo "$(date): Captured ${#RESPONSE} chars" >> /tmp/tts_debug.log
-
-if [ -z "$RESPONSE" ] || [ ${#RESPONSE} -lt 5 ]; then
-    echo "$(date): No response - trying fallback" >> /tmp/tts_debug.log
-    # Fallback: just use clipboard
-    RESPONSE=$(pbpaste)
-fi
-
-if [ -z "$RESPONSE" ] || [ ${#RESPONSE} -lt 5 ]; then
-    echo "$(date): Still no response" >> /tmp/tts_debug.log
-    exit 1
-fi
-
-echo "$RESPONSE" >> /tmp/tts_debug.log
-
-# Send to TTS
-echo "$RESPONSE" | pbcopy
-
+# Slow path: start daemon, wait for model to load, then speak
+echo "$(date): Starting TTS daemon..." >> /tmp/tts_debug.log
 source "$VENV_DIR/bin/activate"
-python "$PROJECT_DIR/tts_client.py" 2>&1 | tee -a /tmp/tts_client.log
+python "$PROJECT_DIR/tts_daemon.py" >> /tmp/tts_daemon.log 2>&1 &
+
+for i in $(seq 1 120); do
+    if curl -s --max-time 1 "$DAEMON_URL/health" > /dev/null 2>&1; then
+        echo "$(date): Daemon ready" >> /tmp/tts_debug.log
+        curl -s -X POST "$DAEMON_URL/speak" >> /tmp/tts_debug.log 2>&1
+        exit 0
+    fi
+    sleep 0.5
+done
+
+echo "$(date): Daemon failed to start within 60s" >> /tmp/tts_debug.log
+exit 1
