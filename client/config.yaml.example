@@ -1,12 +1,37 @@
-# Voice input client configuration
-# Copy this file to config.yaml and update with your server address
+# Voice client configuration
+# Copy this file to config.yaml and update settings
 
-# Parakeet ASR server address (voice input)
-server_url: "ws://YOUR_SERVER_IP:8087"
+# Backend: "origin" (GPU server via WebSocket) or "local" (Apple Silicon via MLX)
+backend: local
 
 # Audio settings
-sample_rate: 16000       # Must match server expectation
+sample_rate: 16000       # Must match model expectation
 chunk_duration: 0.1      # Send audio every 100ms
 
-# TTS server address (voice output)
-tts_server_url: "ws://YOUR_SERVER_IP:8088"
+# Origin backend - GPU server over network
+origin:
+  server_url: "ws://YOUR_SERVER_IP:8087"
+  tts_server_url: "ws://YOUR_SERVER_IP:8088"
+
+# Local backend - Apple Silicon (MLX)
+# First run downloads models automatically from HuggingFace
+local:
+  # STT (speech-to-text)
+  stt_model: "mlx-community/parakeet-tdt-0.6b-v3"   # 600M, best accuracy
+  # stt_model: "mlx-community/parakeet-tdt_ctc-110m" # 110M, lightweight
+
+  # TTS (text-to-speech) - Qwen3-TTS via mlx-audio
+  tts_model: "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit"
+  # Faster alternatives (trade quality for speed):
+  # tts_model: "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit"   # ~2x faster
+  # tts_model: "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit"   # smaller model, faster
+  # tts_model: "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit"   # fastest
+  tts_speaker: "aiden"              # aiden, ryan, serena, vivian, dylan, eric, uncle_fu
+  tts_language: "english"           # auto, english, chinese, german, french, spanish, italian, portuguese, japanese, korean, russian
+  tts_instruct: null                # Emotion/style instruction, e.g. "excited", "calm and professional", "whispering"
+  tts_temperature: 0.9              # Randomness (lower = more consistent, 0.1-1.5)
+  tts_top_k: 50                     # Token sampling pool size
+  tts_top_p: 1.0                    # Nucleus sampling threshold (0.0-1.0)
+  tts_repetition_penalty: 1.05      # Penalize repeated tokens (1.0 = off)
+  tts_max_tokens: 4096              # Maximum generation length
+  tts_streaming_interval: 2.0       # Seconds of audio per chunk (lower = faster first sound)
