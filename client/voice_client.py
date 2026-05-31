@@ -46,15 +46,18 @@ class LocalTranscriber:
 
         try:
             result = self._model.transcribe(temp_path)
-            # Result is an AlignedResult with sentences containing tokens
+            # AlignedResult.text is already correctly spaced — parakeet tokens
+            # carry their own leading space, so the library joins them with "".
+            # Joining tokens with " " ourselves inserts spurious mid-word spaces
+            # ("H ello", "he ar"), so prefer .text and never space-join tokens.
+            if hasattr(result, 'text') and result.text:
+                return result.text.strip()
             if hasattr(result, 'sentences') and result.sentences:
-                return ' '.join(
-                    ' '.join(t.text for t in s.tokens if hasattr(t, 'text'))
+                return ''.join(
+                    ''.join(t.text for t in s.tokens if hasattr(t, 'text'))
                     for s in result.sentences
                 ).strip()
-            elif hasattr(result, 'text'):
-                return result.text.strip()
-            elif isinstance(result, str):
+            if isinstance(result, str):
                 return result.strip()
             return str(result).strip()
         finally:
