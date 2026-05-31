@@ -17,6 +17,9 @@ import numpy as np
 import sounddevice as sd
 import yaml
 
+# Final transcription is written here for Hammerspoon to paste (opt-v stop).
+TRANSCRIPTION_FILE = "/tmp/parakeet_transcription.txt"
+
 
 class LocalTranscriber:
     """Transcribe audio locally using parakeet-mlx on Apple Silicon."""
@@ -292,13 +295,16 @@ class VoiceClient:
         self.recording = False
 
     @staticmethod
-    def paste_to_terminal(text: str):
-        """Copy text to clipboard for manual paste."""
-        if not text:
-            return
-        subprocess.run(['pbcopy'], input=text.encode(), check=True)
-        print(f"Copied to clipboard: {text}")
-        print("Press Cmd+V to paste")
+    def write_transcription(text: str):
+        """Write the transcription to a temp file for Hammerspoon to paste.
+
+        We intentionally do NOT touch the clipboard — Hammerspoon pastes via a
+        save/restore so the user's existing clipboard is preserved.
+        """
+        with open(TRANSCRIPTION_FILE, 'w') as f:
+            f.write(text or "")
+        if text:
+            print(f"Transcription written: {text}")
 
 
 async def main():
@@ -330,6 +336,12 @@ async def main():
 
     print(f"Backend: {client.backend}")
 
+    # Clear any stale transcription so a silent/failed run won't re-paste old text
+    try:
+        open(TRANSCRIPTION_FILE, 'w').close()
+    except OSError:
+        pass
+
     # Now that client exists, point signal handlers at it
     signal.signal(signal.SIGINT, client.stop_recording)
     signal.signal(signal.SIGUSR1, client.stop_recording)
@@ -352,7 +364,7 @@ async def main():
         transcription = await client.record_and_transcribe()
 
         if transcription and not args.no_paste:
-            client.paste_to_terminal(transcription)
+            client.write_transcription(transcription)
         elif transcription:
             print(f"Transcription: {transcription}")
 
