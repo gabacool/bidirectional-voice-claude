@@ -61,40 +61,19 @@ hs.hotkey.bind({"alt"}, "v", function()
     end
 end)
 
--- Speak SELECTED text with Option+S (TTS) — without polluting the clipboard
-local function speakText(text)
-    local args = {voiceScriptsPath .. "/speak_clipboard.sh"}
-    if text and text ~= "" then
-        -- Passed via the task args array (execve), so no shell escaping needed;
-        -- newlines/quotes/unicode in the selection are preserved verbatim.
-        table.insert(args, text)
-    end
+-- Speak the CLIPBOARD with Option+S (TTS).
+-- Workflow: copy text (Cmd+C), then press Option+S to hear it.
+-- The daemon reads the clipboard itself, so multi-paragraph selections are
+-- captured in full (the reliable, simple path).
+hs.hotkey.bind({"alt"}, "s", function()
+    print("Speaking clipboard via TTS...")
+
+    local speakScript = voiceScriptsPath .. "/speak_clipboard.sh"
     hs.task.new("/bin/bash", function(exitCode, stdOut, stdErr)
         print("Speak script finished: " .. (stdOut or "") .. (stdErr or ""))
-    end, args):start()
-    hs.notify.new({title="TTS", informativeText="Speaking selection..."}):send()
-end
+    end, {speakScript}):start()
 
-hs.hotkey.bind({"alt"}, "s", function()
-    print("Speaking selection via TTS...")
-
-    -- Use Cmd+C to capture the selection. This is the reliable path: the AX
-    -- selectedText() API returns only the focused element (e.g. just the first
-    -- paragraph in a browser), which truncates multi-paragraph selections.
-    -- Copying grabs the FULL selection across elements. We save and restore the
-    -- clipboard around the copy so the user's clipboard is left untouched.
-    local saved = hs.pasteboard.getContents()
-    hs.pasteboard.clearContents()
-    hs.eventtap.keyStroke({"cmd"}, "c")
-    hs.timer.doAfter(0.15, function()
-        local copied = hs.pasteboard.getContents()
-        if saved ~= nil then
-            hs.pasteboard.setContents(saved)
-        else
-            hs.pasteboard.clearContents()
-        end
-        speakText(copied)
-    end)
+    hs.notify.new({title="TTS", informativeText="Speaking clipboard..."}):send()
 end)
 
 -- Reload config with Cmd+Ctrl+R

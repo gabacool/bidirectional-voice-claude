@@ -156,6 +156,7 @@ class LocalTTS:
             return stop_event is not None and stop_event.is_set()
 
         with sd.OutputStream(samplerate=24000, channels=1, dtype='float32') as output:
+            completed = False
             try:
                 while not stopped():
                     try:
@@ -163,11 +164,19 @@ class LocalTTS:
                     except queue.Empty:
                         continue
                     if chunk is None:
+                        completed = True
                         break
                     for i in range(0, len(chunk), SUBCHUNK):
                         if stopped():
                             break
                         output.write(chunk[i:i + SUBCHUNK])
+                # Drain: closing the stream discards audio still in PortAudio's
+                # buffer, which clips the last fraction of a second. If we
+                # finished normally (not interrupted), pad with a short silence
+                # and wait so the real final samples are flushed first.
+                if completed and not stopped():
+                    output.write(np.zeros(SUBCHUNK, dtype=np.float32))
+                    sd.sleep(150)
             except sd.PortAudioError:
                 if not stopped():
                     raise
