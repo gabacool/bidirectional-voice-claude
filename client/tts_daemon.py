@@ -51,6 +51,9 @@ class TTSHandler(BaseHTTPRequestHandler):
                 return
 
             with self.server.speak_lock:
+                # Pick up any config.yaml edits (voice, speed, etc.) without
+                # needing a daemon restart.
+                maybe_reload_config(self.server)
                 self.server.stop_event.clear()
                 try:
                     self.server.tts.synthesize_and_play(
@@ -98,12 +101,32 @@ class ThreadedHTTPServer(HTTPServer):
             self.shutdown_request(request)
 
 
+CONFIG_PATH = Path(__file__).parent / 'config.yaml'
+
+
 def load_config():
-    config_path = Path(__file__).parent / 'config.yaml'
-    if config_path.exists():
-        with open(config_path) as f:
+    if CONFIG_PATH.exists():
+        with open(CONFIG_PATH) as f:
             return yaml.safe_load(f) or {}
     return {}
+
+
+def maybe_reload_config(server):
+    """Re-apply config.yaml to the live TTS object if the file changed on disk.
+
+    Lets voice/speed/etc. edits take effect without restarting the daemon.
+    Only reloads the model if tts_model itself changed (handled in apply_config).
+    """
+    try:
+        mtime = CONFIG_PATH.stat().st_mtime
+    except OSError:
+        return
+    if mtime == server.config_mtime:
+        return
+    server.config_mtime = mtime
+    local_cfg = load_config().get('local', {})
+    server.tts.apply_config(local_cfg)
+    print(f"Reloaded config (speaker={server.tts.speaker}, speed={server.tts.speed})")
 
 
 def main():
@@ -120,6 +143,10 @@ def main():
     server.tts = tts
     server.speak_lock = threading.Lock()
     server.stop_event = threading.Event()
+    try:
+        server.config_mtime = CONFIG_PATH.stat().st_mtime
+    except OSError:
+        server.config_mtime = 0
 
     PID_FILE.write_text(str(os.getpid()))
 

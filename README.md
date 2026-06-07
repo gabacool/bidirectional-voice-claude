@@ -144,11 +144,9 @@ local:
   tts_streaming_interval: 2.0
 ```
 
-**After changing config:** The TTS daemon caches settings in memory. Restart it to pick up changes:
-```bash
-kill $(cat /tmp/tts_daemon.pid)
-```
-The next Option+S press will start a fresh daemon with the new config (~30s model load).
+**After changing config:** The TTS daemon watches `config.yaml` and auto-reloads
+voice/speed/etc. on the next Option+S — no restart needed. The model stays loaded
+unless you change `tts_model` itself (then it reloads on the next press).
 
 **Alternative STT models:**
 

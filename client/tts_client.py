@@ -56,7 +56,22 @@ class LocalTTS:
     """Synthesize speech locally using Qwen3-TTS via mlx-audio."""
 
     def __init__(self, config: dict):
-        self.model_name = config.get('tts_model', 'mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit')
+        self._model = None
+        self.model_name = None
+        self.apply_config(config)
+
+    def apply_config(self, config: dict):
+        """(Re)load all generation settings from a config dict.
+
+        Safe to call on a live daemon: only the cheap params are swapped in
+        place. The model is reloaded ONLY if tts_model changed, so changing
+        voice/speed/etc. takes effect instantly with the model staying resident.
+        """
+        new_model = config.get('tts_model', 'mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit')
+        if new_model != self.model_name:
+            # Model identity changed — drop the loaded model so it reloads lazily.
+            self.model_name = new_model
+            self._model = None
         self.speaker = config.get('tts_speaker', 'aiden')
         self.language = config.get('tts_language', 'english')
         self.instruct = config.get('tts_instruct')  # None means no instruction
@@ -67,7 +82,6 @@ class LocalTTS:
         self.max_tokens = config.get('tts_max_tokens', 4096)
         self.streaming_interval = config.get('tts_streaming_interval', 2.0)
         self.speed = config.get('tts_speed', 1.0)  # >1 faster, <1 slower (pitch preserved)
-        self._model = None
 
     def _ensure_model(self):
         """Lazy-load the TTS model on first use."""
