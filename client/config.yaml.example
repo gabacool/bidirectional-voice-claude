@@ -7,6 +7,7 @@ backend: local
 # Audio settings
 sample_rate: 16000       # Must match model expectation
 chunk_duration: 0.1      # Send audio every 100ms
+max_record_seconds: 120  # Hard cap; recording auto-stops after this many seconds
 
 # Origin backend - GPU server over network
 origin:

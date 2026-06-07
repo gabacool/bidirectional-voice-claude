@@ -78,6 +78,10 @@ class VoiceClient:
         self.chunk_duration = self.config.get('chunk_duration', 0.1)
         self.chunk_size = int(self.sample_rate * self.chunk_duration)
         self.backend = self.config.get('backend', 'origin')
+        # Hard safety cap: recording auto-stops after this many seconds so a
+        # missed/lost stop signal (e.g. a Hammerspoon reload orphaning the
+        # recorder) can never hold the mic open indefinitely.
+        self.max_record_seconds = self.config.get('max_record_seconds', 120)
         self.recording = False
         self.transcription = ""
 
@@ -158,7 +162,11 @@ class VoiceClient:
         try:
             with stream:
                 print("Recording... (press Ctrl+C or send SIGUSR1 to stop)")
+                start = loop.time()
                 while self.recording:
+                    if loop.time() - start > self.max_record_seconds:
+                        print(f"\n[Max record time {self.max_record_seconds}s reached - stopping]")
+                        break
                     try:
                         audio_data = await asyncio.wait_for(
                             audio_queue.get(), timeout=0.5
@@ -241,8 +249,12 @@ class VoiceClient:
         try:
             with stream:
                 print("Recording... (press Ctrl+C or send SIGUSR1 to stop)")
+                start = loop.time()
                 while self.recording:
                     await asyncio.sleep(0.1)
+                    if loop.time() - start > self.max_record_seconds:
+                        print(f"\n[Max record time {self.max_record_seconds}s reached - stopping]")
+                        break
         finally:
             self.recording = False
 
