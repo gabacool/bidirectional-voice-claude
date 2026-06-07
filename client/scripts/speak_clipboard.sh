@@ -1,11 +1,12 @@
 #!/bin/bash
-# Speak clipboard text via TTS daemon
-# Called by Hammerspoon on Option+S
-# Works from any app — copy text, press Option+S
+# Speak selected text via TTS daemon — called by Hammerspoon on Option+S
 #
-# Daemon reads clipboard at processing time (always fresh).
-# First press auto-starts daemon (~30s model load).
-# Pressing Option+S while speaking interrupts and speaks new clipboard.
+# Text is passed as $1 (the selected text, captured by Hammerspoon without
+# polluting the clipboard) and sent to the daemon as the POST body. If no
+# argument is given, the daemon falls back to reading the clipboard.
+#
+# First press auto-starts the daemon (~30s model load).
+# Pressing Option+S while speaking interrupts and speaks the new text.
 
 # Hammerspoon doesn't inherit user's shell PATH — add Homebrew
 export PATH="/opt/homebrew/bin:$PATH"
@@ -18,10 +19,22 @@ VENV_DIR="$(dirname "$PROJECT_DIR")/venv"
 
 DAEMON_PORT=8089
 DAEMON_URL="http://127.0.0.1:$DAEMON_PORT"
+TEXT="$1"
+
+post_speak() {
+    if [ -n "$TEXT" ]; then
+        # --data-raw sends the body verbatim (no '@file' interpretation) and
+        # lets curl set Content-Length, which the daemon needs to read the body.
+        curl -s -X POST "$DAEMON_URL/speak" --data-raw "$TEXT" >> /tmp/tts_debug.log 2>&1
+    else
+        # No selection passed — daemon reads the clipboard itself.
+        curl -s -X POST "$DAEMON_URL/speak" >> /tmp/tts_debug.log 2>&1
+    fi
+}
 
 # Fast path: daemon already running
 if curl -s --max-time 1 "$DAEMON_URL/health" > /dev/null 2>&1; then
-    curl -s -X POST "$DAEMON_URL/speak" >> /tmp/tts_debug.log 2>&1
+    post_speak
     exit 0
 fi
 
@@ -33,7 +46,7 @@ python "$PROJECT_DIR/tts_daemon.py" >> /tmp/tts_daemon.log 2>&1 &
 for i in $(seq 1 120); do
     if curl -s --max-time 1 "$DAEMON_URL/health" > /dev/null 2>&1; then
         echo "$(date): Daemon ready" >> /tmp/tts_debug.log
-        curl -s -X POST "$DAEMON_URL/speak" >> /tmp/tts_debug.log 2>&1
+        post_speak
         exit 0
     fi
     sleep 0.5

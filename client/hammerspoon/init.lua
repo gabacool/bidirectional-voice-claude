@@ -61,17 +61,47 @@ hs.hotkey.bind({"alt"}, "v", function()
     end
 end)
 
--- Speak clipboard with Option+S (TTS)
-hs.hotkey.bind({"alt"}, "s", function()
-    print("Speaking clipboard via TTS...")
-
-    local speakScript = voiceScriptsPath .. "/speak_clipboard.sh"
+-- Speak SELECTED text with Option+S (TTS) — without polluting the clipboard
+local function speakText(text)
+    local args = {voiceScriptsPath .. "/speak_clipboard.sh"}
+    if text and text ~= "" then
+        -- Passed via the task args array (execve), so no shell escaping needed;
+        -- newlines/quotes/unicode in the selection are preserved verbatim.
+        table.insert(args, text)
+    end
     hs.task.new("/bin/bash", function(exitCode, stdOut, stdErr)
         print("Speak script finished: " .. (stdOut or "") .. (stdErr or ""))
-        hs.notify.new({title="TTS", informativeText="Finished speaking"}):send()
-    end, {speakScript}):start()
+    end, args):start()
+    hs.notify.new({title="TTS", informativeText="Speaking selection..."}):send()
+end
 
-    hs.notify.new({title="TTS", informativeText="Speaking clipboard..."}):send()
+hs.hotkey.bind({"alt"}, "s", function()
+    print("Speaking selection via TTS...")
+
+    -- 1. Preferred: read the selection directly via the Accessibility API.
+    --    This never touches the clipboard at all.
+    local elem = hs.uielement.focusedElement()
+    local sel = elem and elem:selectedText()
+    if sel and sel ~= "" then
+        speakText(sel)
+        return
+    end
+
+    -- 2. Fallback (terminals etc. that don't expose AXSelectedText): copy the
+    --    selection with Cmd+C, but save and restore the clipboard around it so
+    --    the user's existing clipboard contents are preserved.
+    local saved = hs.pasteboard.getContents()
+    hs.pasteboard.clearContents()
+    hs.eventtap.keyStroke({"cmd"}, "c")
+    hs.timer.doAfter(0.15, function()
+        local copied = hs.pasteboard.getContents()
+        if saved ~= nil then
+            hs.pasteboard.setContents(saved)
+        else
+            hs.pasteboard.clearContents()
+        end
+        speakText(copied)
+    end)
 end)
 
 -- Reload config with Cmd+Ctrl+R
