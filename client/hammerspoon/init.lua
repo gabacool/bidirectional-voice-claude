@@ -78,18 +78,11 @@ end
 hs.hotkey.bind({"alt"}, "s", function()
     print("Speaking selection via TTS...")
 
-    -- 1. Preferred: read the selection directly via the Accessibility API.
-    --    This never touches the clipboard at all.
-    local elem = hs.uielement.focusedElement()
-    local sel = elem and elem:selectedText()
-    if sel and sel ~= "" then
-        speakText(sel)
-        return
-    end
-
-    -- 2. Fallback (terminals etc. that don't expose AXSelectedText): copy the
-    --    selection with Cmd+C, but save and restore the clipboard around it so
-    --    the user's existing clipboard contents are preserved.
+    -- Use Cmd+C to capture the selection. This is the reliable path: the AX
+    -- selectedText() API returns only the focused element (e.g. just the first
+    -- paragraph in a browser), which truncates multi-paragraph selections.
+    -- Copying grabs the FULL selection across elements. We save and restore the
+    -- clipboard around the copy so the user's clipboard is left untouched.
     local saved = hs.pasteboard.getContents()
     hs.pasteboard.clearContents()
     hs.eventtap.keyStroke({"cmd"}, "c")
