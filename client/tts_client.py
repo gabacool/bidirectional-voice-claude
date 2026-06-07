@@ -68,7 +68,6 @@ class LocalTTS:
         self.streaming_interval = config.get('tts_streaming_interval', 2.0)
         self.speed = config.get('tts_speed', 1.0)  # >1 faster, <1 slower (pitch preserved)
         self._model = None
-        self._stream = None
 
     def _ensure_model(self):
         """Lazy-load the TTS model on first use."""
@@ -132,34 +131,37 @@ class LocalTTS:
         t = threading.Thread(target=producer, daemon=True)
         t.start()
 
+        # 0.1s at 24kHz. We write in small sub-chunks and poll stop_event
+        # between them so an interrupt is honored within ~100ms WITHOUT ever
+        # touching the PortAudio stream from another thread (doing so segfaults
+        # CoreAudio). The stream's stop()/close() happen here on this same
+        # thread via the context-manager exit, which is the only safe place.
+        SUBCHUNK = 2400
+
+        def stopped():
+            return stop_event is not None and stop_event.is_set()
+
         with sd.OutputStream(samplerate=24000, channels=1, dtype='float32') as output:
-            self._stream = output
             try:
-                while True:
-                    chunk = audio_queue.get()
+                while not stopped():
+                    try:
+                        chunk = audio_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
                     if chunk is None:
                         break
-                    if stop_event is not None and stop_event.is_set():
-                        break
-                    output.write(chunk)
+                    for i in range(0, len(chunk), SUBCHUNK):
+                        if stopped():
+                            break
+                        output.write(chunk[i:i + SUBCHUNK])
             except sd.PortAudioError:
-                if stop_event is None or not stop_event.is_set():
+                if not stopped():
                     raise
-            finally:
-                self._stream = None
 
         t.join(timeout=5)
-        if gen_error[0] is not None and (stop_event is None or not stop_event.is_set()):
+        if gen_error[0] is not None and not stopped():
             raise gen_error[0]
         print("Done")
-
-    def interrupt(self):
-        stream = self._stream
-        if stream is not None:
-            try:
-                stream.abort()
-            except Exception:
-                pass
 
 
 class TTSClient:
