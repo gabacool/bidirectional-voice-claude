@@ -66,6 +66,7 @@ class LocalTTS:
         self.repetition_penalty = config.get('tts_repetition_penalty', 1.05)
         self.max_tokens = config.get('tts_max_tokens', 4096)
         self.streaming_interval = config.get('tts_streaming_interval', 2.0)
+        self.speed = config.get('tts_speed', 1.0)  # >1 faster, <1 slower (pitch preserved)
         self._model = None
         self._stream = None
 
@@ -115,6 +116,13 @@ class LocalTTS:
                     audio_np = np.array(chunk.audio, dtype=np.float32)
                     if audio_np.size == 0:
                         continue
+                    # Pitch-preserving speed change. Done here on the producer
+                    # thread so the playback thread keeps its buffer headroom.
+                    if self.speed != 1.0:
+                        import librosa
+                        audio_np = librosa.effects.time_stretch(
+                            audio_np, rate=self.speed
+                        ).astype(np.float32)
                     audio_queue.put(audio_np)
             except Exception as e:
                 gen_error[0] = e
