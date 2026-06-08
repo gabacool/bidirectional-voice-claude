@@ -58,7 +58,6 @@ class LocalTTS:
     def __init__(self, config: dict):
         self._model = None
         self.model_name = None
-        self._player = None
         self.apply_config(config)
 
     def apply_config(self, config: dict):
@@ -94,13 +93,7 @@ class LocalTTS:
         print("TTS model loaded")
 
     def synthesize_and_play(self, text: str, stop_event=None):
-        """Synthesize and play audio, streaming chunks into ffplay as they generate.
-
-        Audio chunks are piped to ffplay's stdin (raw f32le 24kHz mono) as the
-        model produces them, so playback starts after the first chunk instead of
-        waiting for the whole utterance. ffplay reliably reaches the speakers
-        where the chunked sd.OutputStream did not. Interruption kills ffplay.
-        """
+        """Synthesize text to speech and play it, streaming chunks as they generate."""
         self._ensure_model()
 
         speech_text = _prepare_for_speech(text)
@@ -108,7 +101,7 @@ class LocalTTS:
             print("No text to speak after cleanup")
             return
 
-        print(f"Speaking: {speech_text[:100]}...", flush=True)
+        print(f"Speaking: {speech_text[:100]}...")
 
         kwargs = dict(
             text=speech_text,
@@ -125,69 +118,81 @@ class LocalTTS:
         if self.instruct:
             kwargs['instruct'] = self.instruct
 
+        audio_queue = queue.Queue()
+        gen_error = [None]
+
+        def producer():
+            try:
+                for chunk in self._model.generate_custom_voice(**kwargs):
+                    if stop_event is not None and stop_event.is_set():
+                        break
+                    audio_np = np.array(chunk.audio, dtype=np.float32)
+                    if audio_np.size == 0:
+                        continue
+                    # Pitch-preserving speed change. Done here on the producer
+                    # thread so the playback thread keeps its buffer headroom.
+                    if self.speed != 1.0:
+                        import librosa
+                        audio_np = librosa.effects.time_stretch(
+                            audio_np, rate=self.speed
+                        ).astype(np.float32)
+                    audio_queue.put(audio_np)
+            except Exception as e:
+                gen_error[0] = e
+            finally:
+                audio_queue.put(None)
+
+        t = threading.Thread(target=producer, daemon=True)
+        t.start()
+
+        # 0.1s at 24kHz. We write in small sub-chunks and poll stop_event
+        # between them so an interrupt is honored within ~100ms WITHOUT ever
+        # touching the PortAudio stream from another thread (doing so segfaults
+        # CoreAudio). The stream's stop()/close() happen here on this same
+        # thread via the context-manager exit, which is the only safe place.
+        SUBCHUNK = 2400
+
         def stopped():
             return stop_event is not None and stop_event.is_set()
 
-        # ffplay reads raw float32 mono @ 24kHz from stdin and plays it as it
-        # arrives. -autoexit quits at EOF; -nodisp/-loglevel keep it silent.
-        proc = subprocess.Popen(
-            ['ffplay', '-f', 'f32le', '-ar', '24000', '-ch_layout', 'mono',
-             '-nodisp', '-autoexit', '-loglevel', 'quiet', '-i', 'pipe:0'],
-            stdin=subprocess.PIPE,
-        )
-        self._player = proc
-
         written = 0
         outcome = "ok"
-        try:
-            for chunk in self._model.generate_custom_voice(**kwargs):
-                if stopped():
+        completed = False
+        with sd.OutputStream(samplerate=24000, channels=1, dtype='float32') as output:
+            try:
+                while not stopped():
+                    try:
+                        chunk = audio_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    if chunk is None:
+                        completed = True
+                        break
+                    for i in range(0, len(chunk), SUBCHUNK):
+                        if stopped():
+                            break
+                        output.write(chunk[i:i + SUBCHUNK])
+                        written += len(chunk[i:i + SUBCHUNK])
+                # Drain: closing the stream discards audio still in PortAudio's
+                # buffer, clipping the final ~second of speech. On normal
+                # completion, append a generous silence pad and wait long enough
+                # for the real tail to actually play out before the stream closes.
+                if completed and not stopped():
+                    output.write(np.zeros(12000, dtype=np.float32))  # 0.5s silence
+                    sd.sleep(800)
+                elif stopped():
                     outcome = "interrupted"
-                    break
-                audio_np = np.array(chunk.audio, dtype=np.float32)
-                if audio_np.size == 0:
-                    continue
-                if self.speed != 1.0:
-                    import librosa
-                    audio_np = librosa.effects.time_stretch(
-                        audio_np, rate=self.speed
-                    ).astype(np.float32)
-                try:
-                    proc.stdin.write(audio_np.tobytes())
-                    proc.stdin.flush()
-                except BrokenPipeError:
-                    outcome = "player-closed"
-                    break
-                written += audio_np.size
-        finally:
-            try:
-                if proc.stdin and not proc.stdin.closed:
-                    proc.stdin.close()
-            except Exception:
-                pass
-            # Let ffplay drain its buffer and finish unless we were interrupted.
-            if stopped():
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-            else:
-                try:
-                    proc.wait(timeout=60)
-                except Exception:
-                    pass
-            self._player = None
+                else:
+                    outcome = "queue-ended-early"
+            except sd.PortAudioError as e:
+                outcome = f"PortAudioError:{e}"
+                if not stopped():
+                    raise
 
-        print(f"Done [{written/24000:.1f}s, {outcome}]", flush=True)
-
-    def interrupt(self):
-        """Kill any in-progress ffplay so a new Option+S takes over immediately."""
-        proc = getattr(self, '_player', None)
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+        t.join(timeout=5)
+        if gen_error[0] is not None and not stopped():
+            raise gen_error[0]
+        print(f"Done [{written/24000:.1f}s played, {outcome}]", flush=True)
 
 
 class TTSClient:
