@@ -157,68 +157,37 @@ class LocalTTS:
 
         written = 0
         outcome = "ok"
-
-        def open_stream():
-            s = sd.OutputStream(samplerate=24000, channels=1, dtype='float32')
-            s.start()
-            return s
-
-        def write_resilient(buf, output):
-            # Write one sub-chunk, recovering from transient PortAudio device
-            # errors (-9986) caused by another app grabbing/reconfiguring the
-            # audio device mid-playback. On error, reopen the stream and retry
-            # so playback continues instead of cutting off. Returns the (maybe
-            # new) stream.
-            for attempt in range(3):
-                try:
-                    output.write(buf)
-                    return output
-                except sd.PortAudioError:
-                    if stopped():
-                        raise
-                    try:
-                        output.close()
-                    except Exception:
-                        pass
-                    sd.sleep(80)
-                    output = open_stream()
-            return output
-
-        output = open_stream()
         completed = False
-        try:
-            while not stopped():
-                try:
-                    chunk = audio_queue.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-                if chunk is None:
-                    completed = True
-                    break
-                for i in range(0, len(chunk), SUBCHUNK):
-                    if stopped():
-                        break
-                    buf = chunk[i:i + SUBCHUNK]
-                    output = write_resilient(buf, output)
-                    written += len(buf)
-            # Drain: closing the stream discards audio still in PortAudio's
-            # buffer, which clips the last fraction of a second. If we finished
-            # normally (not interrupted), pad with a short silence and wait so
-            # the real final samples are flushed first.
-            if completed and not stopped():
-                output = write_resilient(np.zeros(SUBCHUNK, dtype=np.float32), output)
-                sd.sleep(150)
-            else:
-                outcome = "interrupted" if stopped() else "queue-ended-early"
-        except sd.PortAudioError as e:
-            outcome = f"PortAudioError:{e}"
-            if not stopped():
-                raise
-        finally:
+        with sd.OutputStream(samplerate=24000, channels=1, dtype='float32') as output:
             try:
-                output.close()
-            except Exception:
-                pass
+                while not stopped():
+                    try:
+                        chunk = audio_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    if chunk is None:
+                        completed = True
+                        break
+                    for i in range(0, len(chunk), SUBCHUNK):
+                        if stopped():
+                            break
+                        output.write(chunk[i:i + SUBCHUNK])
+                        written += len(chunk[i:i + SUBCHUNK])
+                # Drain: closing the stream discards audio still in PortAudio's
+                # buffer, clipping the final fraction of a second. On normal
+                # completion, pad with silence and wait so the last real samples
+                # flush before close.
+                if completed and not stopped():
+                    output.write(np.zeros(SUBCHUNK, dtype=np.float32))
+                    sd.sleep(150)
+                elif stopped():
+                    outcome = "interrupted"
+                else:
+                    outcome = "queue-ended-early"
+            except sd.PortAudioError as e:
+                outcome = f"PortAudioError:{e}"
+                if not stopped():
+                    raise
 
         t.join(timeout=5)
         if gen_error[0] is not None and not stopped():

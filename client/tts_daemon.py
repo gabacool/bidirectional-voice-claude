@@ -31,6 +31,7 @@ class TTSHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == '/speak':
+            print(f"[/speak received from {self.client_address}]", flush=True)
             # Signal any in-progress playback to stop. We only SET a flag here —
             # the playback thread stops itself and closes the audio stream on
             # its own thread. Never touch the PortAudio stream from this thread
