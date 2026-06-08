@@ -6,7 +6,7 @@
 # argument is given, the daemon falls back to reading the clipboard.
 #
 # First press auto-starts the daemon (~30s model load).
-# Pressing Option+S while speaking interrupts and speaks the new text.
+# Option+S is a toggle: speak (when idle) / pause / resume. Option+X stops.
 
 # Hammerspoon doesn't inherit user's shell PATH — add Homebrew
 export PATH="/opt/homebrew/bin:$PATH"

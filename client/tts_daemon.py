@@ -31,39 +31,69 @@ class TTSHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == '/speak':
-            print(f"[/speak received from {self.client_address}]", flush=True)
-            # Stop any in-progress playback: set the flag (stops generation /
-            # the poll loop) and kill the afplay subprocess so audio stops now.
+            self._handle_speak_toggle()
+        elif self.path == '/stop':
+            # Hard stop: abort playback and clear pause so the next /speak starts
+            # fresh on new clipboard text.
             self.server.stop_event.set()
-
-            content_length = int(self.headers.get('Content-Length', 0))
-            if content_length > 0:
-                text = self.rfile.read(content_length).decode('utf-8')
-            else:
-                text = subprocess.run(
-                    ['pbpaste'], capture_output=True, text=True
-                ).stdout
-
-            text = text.strip()
-            if not text:
-                self._respond(400, 'empty')
-                return
-
-            with self.server.speak_lock:
-                # Pick up any config.yaml edits (voice, speed, etc.) without
-                # needing a daemon restart.
-                maybe_reload_config(self.server)
-                self.server.stop_event.clear()
-                try:
-                    self.server.tts.synthesize_and_play(
-                        text, stop_event=self.server.stop_event
-                    )
-                    self._respond(200, 'ok')
-                except Exception as e:
-                    print(f"TTS error: {e}", file=sys.stderr)
-                    self._respond(500, str(e))
+            self.server.pause_event.clear()
+            self._respond(200, 'stopped')
         else:
             self._respond(404, 'not found')
+
+    def _handle_speak_toggle(self):
+        """Option+S is a toggle:
+          - speaking & not paused -> pause
+          - paused                -> resume
+          - idle                  -> speak the clipboard (or POST body)
+        """
+        if self.server.playing.is_set():
+            # Something is already playing: toggle pause/resume instead of
+            # starting new speech.
+            if self.server.pause_event.is_set():
+                self.server.pause_event.clear()
+                print("[resume]", flush=True)
+                self._respond(200, 'resumed')
+            else:
+                self.server.pause_event.set()
+                print("[pause]", flush=True)
+                self._respond(200, 'paused')
+            return
+
+        # Idle -> start new speech.
+        content_length = int(self.headers.get('Content-Length', 0))
+        if content_length > 0:
+            text = self.rfile.read(content_length).decode('utf-8')
+        else:
+            text = subprocess.run(
+                ['pbpaste'], capture_output=True, text=True
+            ).stdout
+
+        text = text.strip()
+        if not text:
+            self._respond(400, 'empty')
+            return
+
+        with self.server.speak_lock:
+            # Pick up any config.yaml edits (voice, speed, etc.) without
+            # needing a daemon restart.
+            maybe_reload_config(self.server)
+            self.server.stop_event.clear()
+            self.server.pause_event.clear()
+            self.server.playing.set()
+            try:
+                self.server.tts.synthesize_and_play(
+                    text,
+                    stop_event=self.server.stop_event,
+                    pause_event=self.server.pause_event,
+                )
+                self._respond(200, 'ok')
+            except Exception as e:
+                print(f"TTS error: {e}", file=sys.stderr)
+                self._respond(500, str(e))
+            finally:
+                self.server.playing.clear()
+                self.server.pause_event.clear()
 
     def do_GET(self):
         if self.path == '/health':
@@ -142,6 +172,8 @@ def main():
     server.tts = tts
     server.speak_lock = threading.Lock()
     server.stop_event = threading.Event()
+    server.pause_event = threading.Event()
+    server.playing = threading.Event()  # set while an utterance is in progress
     try:
         server.config_mtime = CONFIG_PATH.stat().st_mtime
     except OSError:

@@ -61,19 +61,29 @@ hs.hotkey.bind({"alt"}, "v", function()
     end
 end)
 
--- Speak the CLIPBOARD with Option+S (TTS).
--- Workflow: copy text (Cmd+C), then press Option+S to hear it.
+-- TTS with Option+S. Copy text (Cmd+C), then press Option+S to hear it.
+-- Option+S is a toggle: speak (when idle) -> pause -> resume -> pause ...
 -- The daemon reads the clipboard itself, so multi-paragraph selections are
 -- captured in full (the reliable, simple path).
 hs.hotkey.bind({"alt"}, "s", function()
-    print("Speaking clipboard via TTS...")
+    print("TTS Option+S (speak/pause/resume)...")
 
     local speakScript = voiceScriptsPath .. "/speak_clipboard.sh"
     hs.task.new("/bin/bash", function(exitCode, stdOut, stdErr)
         print("Speak script finished: " .. (stdOut or "") .. (stdErr or ""))
     end, {speakScript}):start()
+end)
 
-    hs.notify.new({title="TTS", informativeText="Speaking clipboard..."}):send()
+-- Stop TTS with Option+X (abort current speech; next Option+S starts fresh).
+hs.hotkey.bind({"alt"}, "x", function()
+    print("Stopping TTS...")
+
+    local stopScript = voiceScriptsPath .. "/stop_tts.sh"
+    hs.task.new("/bin/bash", function(exitCode, stdOut, stdErr)
+        print("Stop script finished: " .. (stdOut or "") .. (stdErr or ""))
+    end, {stopScript}):start()
+
+    hs.notify.new({title="TTS", informativeText="Stopped"}):send()
 end)
 
 -- Reload config with Cmd+Ctrl+R
@@ -81,5 +91,5 @@ hs.hotkey.bind({"cmd", "ctrl"}, "r", function()
     hs.reload()
 end)
 
-hs.notify.new({title="Hammerspoon", informativeText="Config loaded. Option+V=voice input, Option+S=speak"}):send()
-print("Hammerspoon config loaded. Voice input: Option+V, TTS: Option+S")
+hs.notify.new({title="Hammerspoon", informativeText="Config loaded. Option+V=voice, Option+S=speak/pause, Option+X=stop"}):send()
+print("Hammerspoon config loaded. Option+V=voice input, Option+S=speak/pause, Option+X=stop")

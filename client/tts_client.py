@@ -92,8 +92,13 @@ class LocalTTS:
         self._model = load_model(self.model_name)
         print("TTS model loaded")
 
-    def synthesize_and_play(self, text: str, stop_event=None):
-        """Synthesize text to speech and play it, streaming chunks as they generate."""
+    def synthesize_and_play(self, text: str, stop_event=None, pause_event=None):
+        """Synthesize text to speech and play it, streaming chunks as they generate.
+
+        pause_event (optional threading.Event): when SET, playback pauses (audio
+        device stopped) and holds; when CLEARED, playback resumes from where it
+        left off. stop_event aborts entirely.
+        """
         self._ensure_model()
 
         speech_text = _prepare_for_speech(text)
@@ -155,12 +160,28 @@ class LocalTTS:
         def stopped():
             return stop_event is not None and stop_event.is_set()
 
+        def paused():
+            return pause_event is not None and pause_event.is_set()
+
+        def handle_pause(output):
+            # If paused, stop the audio device (safe — same thread) and hold
+            # until resumed or stopped, then restart so playback continues from
+            # exactly where it left off.
+            if not paused():
+                return
+            output.stop()
+            while paused() and not stopped():
+                sd.sleep(100)
+            if not stopped():
+                output.start()
+
         written = 0
         outcome = "ok"
         completed = False
         with sd.OutputStream(samplerate=24000, channels=1, dtype='float32') as output:
             try:
                 while not stopped():
+                    handle_pause(output)
                     try:
                         chunk = audio_queue.get(timeout=0.1)
                     except queue.Empty:
@@ -169,6 +190,9 @@ class LocalTTS:
                         completed = True
                         break
                     for i in range(0, len(chunk), SUBCHUNK):
+                        if stopped():
+                            break
+                        handle_pause(output)
                         if stopped():
                             break
                         output.write(chunk[i:i + SUBCHUNK])
