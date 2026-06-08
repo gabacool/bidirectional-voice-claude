@@ -62,28 +62,31 @@ hs.hotkey.bind({"alt"}, "v", function()
 end)
 
 -- TTS with Option+S. Copy text (Cmd+C), then press Option+S to hear it.
--- Option+S is a toggle: speak (when idle) -> pause -> resume -> pause ...
--- The daemon reads the clipboard itself, so multi-paragraph selections are
--- captured in full (the reliable, simple path).
+--   Single press : speak (when idle) -> pause -> resume -> pause ...
+--   Double press : (two quick taps within 0.4s) STOP, so the next press
+--                  starts fresh on new clipboard text.
+-- A single press fires immediately (no latency); a second quick press
+-- overrides with a stop.
+local lastSPress = 0
+local function runTTSScript(name)
+    hs.task.new("/bin/bash", function(exitCode, stdOut, stdErr)
+        print("TTS script finished: " .. (stdOut or "") .. (stdErr or ""))
+    end, {voiceScriptsPath .. "/" .. name}):start()
+end
+
 hs.hotkey.bind({"alt"}, "s", function()
-    print("TTS Option+S (speak/pause/resume)...")
-
-    local speakScript = voiceScriptsPath .. "/speak_clipboard.sh"
-    hs.task.new("/bin/bash", function(exitCode, stdOut, stdErr)
-        print("Speak script finished: " .. (stdOut or "") .. (stdErr or ""))
-    end, {speakScript}):start()
-end)
-
--- Stop TTS with Option+X (abort current speech; next Option+S starts fresh).
-hs.hotkey.bind({"alt"}, "x", function()
-    print("Stopping TTS...")
-
-    local stopScript = voiceScriptsPath .. "/stop_tts.sh"
-    hs.task.new("/bin/bash", function(exitCode, stdOut, stdErr)
-        print("Stop script finished: " .. (stdOut or "") .. (stdErr or ""))
-    end, {stopScript}):start()
-
-    hs.notify.new({title="TTS", informativeText="Stopped"}):send()
+    local now = hs.timer.secondsSinceEpoch()
+    if now - lastSPress < 0.4 then
+        -- Double tap -> stop. Reset so a 3rd press starts a fresh sequence.
+        lastSPress = 0
+        print("TTS double Option+S -> stop")
+        runTTSScript("stop_tts.sh")
+        hs.notify.new({title="TTS", informativeText="Stopped"}):send()
+    else
+        lastSPress = now
+        print("TTS Option+S (speak/pause/resume)...")
+        runTTSScript("speak_clipboard.sh")
+    end
 end)
 
 -- Reload config with Cmd+Ctrl+R
@@ -91,5 +94,5 @@ hs.hotkey.bind({"cmd", "ctrl"}, "r", function()
     hs.reload()
 end)
 
-hs.notify.new({title="Hammerspoon", informativeText="Config loaded. Option+V=voice, Option+S=speak/pause, Option+X=stop"}):send()
-print("Hammerspoon config loaded. Option+V=voice input, Option+S=speak/pause, Option+X=stop")
+hs.notify.new({title="Hammerspoon", informativeText="Config loaded. Option+V=voice, Option+S=speak/pause, double Option+S=stop"}):send()
+print("Hammerspoon config loaded. Option+V=voice input, Option+S=speak/pause, double Option+S=stop")
