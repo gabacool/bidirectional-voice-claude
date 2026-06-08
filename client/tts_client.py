@@ -13,6 +13,7 @@ import sys
 import io
 import re
 import threading
+import time
 import wave
 from pathlib import Path
 
@@ -129,6 +130,13 @@ class LocalTTS:
         def producer():
             try:
                 for chunk in self._model.generate_custom_voice(**kwargs):
+                    if stop_event is not None and stop_event.is_set():
+                        break
+                    # While paused, block here so the lazy generator is NOT
+                    # advanced — no model/GPU work happens during a pause.
+                    while (pause_event is not None and pause_event.is_set()
+                           and not (stop_event is not None and stop_event.is_set())):
+                        time.sleep(0.1)
                     if stop_event is not None and stop_event.is_set():
                         break
                     audio_np = np.array(chunk.audio, dtype=np.float32)
