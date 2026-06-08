@@ -58,6 +58,7 @@ class LocalTTS:
     def __init__(self, config: dict):
         self._model = None
         self.model_name = None
+        self._player = None
         self.apply_config(config)
 
     def apply_config(self, config: dict):
@@ -93,7 +94,14 @@ class LocalTTS:
         print("TTS model loaded")
 
     def synthesize_and_play(self, text: str, stop_event=None):
-        """Synthesize text to speech and play it, streaming chunks as they generate."""
+        """Synthesize text to speech, then play the full audio via afplay.
+
+        We generate the whole utterance, write a temp WAV, and play it with the
+        macOS native player (afplay). Chunked sd.OutputStream playback proved
+        unreliable in the background daemon — writes succeeded into the buffer
+        but no sound came out past the first chunk. afplay always produces
+        sound; interruption kills the subprocess.
+        """
         self._ensure_model()
 
         speech_text = _prepare_for_speech(text)
@@ -101,7 +109,7 @@ class LocalTTS:
             print("No text to speak after cleanup")
             return
 
-        print(f"Speaking: {speech_text[:100]}...")
+        print(f"Speaking: {speech_text[:100]}...", flush=True)
 
         kwargs = dict(
             text=speech_text,
@@ -118,81 +126,68 @@ class LocalTTS:
         if self.instruct:
             kwargs['instruct'] = self.instruct
 
-        audio_queue = queue.Queue()
-        gen_error = [None]
-
-        def producer():
-            try:
-                for chunk in self._model.generate_custom_voice(**kwargs):
-                    if stop_event is not None and stop_event.is_set():
-                        break
-                    audio_np = np.array(chunk.audio, dtype=np.float32)
-                    if audio_np.size == 0:
-                        continue
-                    # Pitch-preserving speed change. Done here on the producer
-                    # thread so the playback thread keeps its buffer headroom.
-                    if self.speed != 1.0:
-                        import librosa
-                        audio_np = librosa.effects.time_stretch(
-                            audio_np, rate=self.speed
-                        ).astype(np.float32)
-                    audio_queue.put(audio_np)
-            except Exception as e:
-                gen_error[0] = e
-            finally:
-                audio_queue.put(None)
-
-        t = threading.Thread(target=producer, daemon=True)
-        t.start()
-
-        # 0.1s at 24kHz. We write in small sub-chunks and poll stop_event
-        # between them so an interrupt is honored within ~100ms WITHOUT ever
-        # touching the PortAudio stream from another thread (doing so segfaults
-        # CoreAudio). The stream's stop()/close() happen here on this same
-        # thread via the context-manager exit, which is the only safe place.
-        SUBCHUNK = 2400
-
         def stopped():
             return stop_event is not None and stop_event.is_set()
 
-        written = 0
-        outcome = "ok"
-        completed = False
-        with sd.OutputStream(samplerate=24000, channels=1, dtype='float32') as output:
-            try:
-                while not stopped():
-                    try:
-                        chunk = audio_queue.get(timeout=0.1)
-                    except queue.Empty:
-                        continue
-                    if chunk is None:
-                        completed = True
-                        break
-                    for i in range(0, len(chunk), SUBCHUNK):
-                        if stopped():
-                            break
-                        output.write(chunk[i:i + SUBCHUNK])
-                        written += len(chunk[i:i + SUBCHUNK])
-                # Drain: closing the stream discards audio still in PortAudio's
-                # buffer, clipping the final fraction of a second. On normal
-                # completion, pad with silence and wait so the last real samples
-                # flush before close.
-                if completed and not stopped():
-                    output.write(np.zeros(SUBCHUNK, dtype=np.float32))
-                    sd.sleep(150)
-                elif stopped():
-                    outcome = "interrupted"
-                else:
-                    outcome = "queue-ended-early"
-            except sd.PortAudioError as e:
-                outcome = f"PortAudioError:{e}"
-                if not stopped():
-                    raise
+        # Generate all audio chunks (abort early if interrupted).
+        parts = []
+        for chunk in self._model.generate_custom_voice(**kwargs):
+            if stopped():
+                break
+            a = np.array(chunk.audio, dtype=np.float32)
+            if a.size:
+                parts.append(a)
+        if not parts or stopped():
+            print("Done [no audio / interrupted during generation]", flush=True)
+            return
 
-        t.join(timeout=5)
-        if gen_error[0] is not None and not stopped():
-            raise gen_error[0]
-        print(f"Done [{written/24000:.1f}s played, {outcome}]", flush=True)
+        audio = np.concatenate(parts)
+
+        # Pitch-preserving speed change on the full waveform.
+        if self.speed != 1.0:
+            import librosa
+            audio = librosa.effects.time_stretch(audio, rate=self.speed).astype(np.float32)
+
+        # Write a temp WAV and play it with afplay (a subprocess we can kill).
+        import soundfile as sf
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+            wav_path = f.name
+        sf.write(wav_path, audio, 24000)
+
+        import time
+        proc = subprocess.Popen(['afplay', wav_path])
+        self._player = proc
+        try:
+            # Poll so a stop_event (new Option+S) can kill playback promptly.
+            while proc.poll() is None:
+                if stopped():
+                    proc.terminate()
+                    break
+                time.sleep(0.1)
+        finally:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            self._player = None
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
+
+        outcome = "interrupted" if stopped() else "ok"
+        print(f"Done [{len(audio)/24000:.1f}s, {outcome}]", flush=True)
+
+    def interrupt(self):
+        """Kill any in-progress afplay so a new Option+S takes over immediately."""
+        proc = getattr(self, '_player', None)
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
 
 
 class TTSClient:

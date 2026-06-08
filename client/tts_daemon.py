@@ -32,11 +32,10 @@ class TTSHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == '/speak':
             print(f"[/speak received from {self.client_address}]", flush=True)
-            # Signal any in-progress playback to stop. We only SET a flag here —
-            # the playback thread stops itself and closes the audio stream on
-            # its own thread. Never touch the PortAudio stream from this thread
-            # (cross-thread stream calls segfault CoreAudio).
+            # Stop any in-progress playback: set the flag (stops generation /
+            # the poll loop) and kill the afplay subprocess so audio stops now.
             self.server.stop_event.set()
+            self.server.tts.interrupt()
 
             content_length = int(self.headers.get('Content-Length', 0))
             if content_length > 0:
