@@ -30,7 +30,7 @@ local:
   tts_speaker: "aiden"              # aiden, ryan, serena, vivian, dylan, eric, uncle_fu
   tts_language: "english"           # auto, english, chinese, german, french, spanish, italian, portuguese, japanese, korean, russian
   tts_instruct: null                # Emotion/style instruction, e.g. "excited", "calm and professional", "whispering"
-  tts_temperature: 0.9              # Randomness (lower = more consistent, 0.1-1.5)
+  tts_temperature: 0.9              # Randomness. Keep 0.7-1.0; below ~0.5 this model collapses to silence after the first word
   tts_top_k: 50                     # Token sampling pool size
   tts_top_p: 1.0                    # Nucleus sampling threshold (0.0-1.0)
   tts_repetition_penalty: 1.05      # Penalize repeated tokens (1.0 = off)
