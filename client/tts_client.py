@@ -128,14 +128,10 @@ class LocalTTS:
         def stopped():
             return stop_event is not None and stop_event.is_set()
 
-        # The model outputs 24kHz, but feeding 24kHz to a 48kHz output device
-        # cut off after the first buffer (device sample-rate mismatch). Resample
-        # each chunk to 48kHz and tell ffplay the stream is 48kHz so it matches
-        # the hardware. -autoexit quits at EOF; -nodisp/-loglevel keep it silent.
-        from scipy.signal import resample_poly
-        OUT_SR = 48000
+        # ffplay reads raw float32 mono @ 24kHz from stdin and plays it as it
+        # arrives. -autoexit quits at EOF; -nodisp/-loglevel keep it silent.
         proc = subprocess.Popen(
-            ['ffplay', '-f', 'f32le', '-ar', str(OUT_SR), '-ch_layout', 'mono',
+            ['ffplay', '-f', 'f32le', '-ar', '24000', '-ch_layout', 'mono',
              '-nodisp', '-autoexit', '-loglevel', 'quiet', '-i', 'pipe:0'],
             stdin=subprocess.PIPE,
         )
@@ -156,8 +152,6 @@ class LocalTTS:
                     audio_np = librosa.effects.time_stretch(
                         audio_np, rate=self.speed
                     ).astype(np.float32)
-                # 24kHz -> 48kHz to match the output device.
-                audio_np = resample_poly(audio_np, OUT_SR, 24000).astype(np.float32)
                 try:
                     proc.stdin.write(audio_np.tobytes())
                     proc.stdin.flush()
@@ -184,7 +178,7 @@ class LocalTTS:
                     pass
             self._player = None
 
-        print(f"Done [{written/48000:.1f}s, {outcome}]", flush=True)
+        print(f"Done [{written/24000:.1f}s, {outcome}]", flush=True)
 
     def interrupt(self):
         """Kill any in-progress ffplay so a new Option+S takes over immediately."""
