@@ -12,19 +12,24 @@ Two backends: run everything on your Mac (Apple Silicon), or offload to a GPU se
 
 | Hotkey | Action |
 |--------|--------|
-| **Option+V** | Voice Input - speak to type |
-| **Option+S** | Voice Output - hear Claude's response |
+| **Option+V** | Voice Input — speak, auto-types where your cursor is |
+| **Option+S** | Voice Output — speak / pause / resume the clipboard |
+| **Option+S Option+S** | Stop voice output (two quick taps) |
 
 ### Voice Input (Option+V)
-1. Press **Option+V** - "REC" appears in menubar
+1. Press **Option+V** — "REC" appears in menubar
 2. Speak your message
-3. Press **Option+V** again - text copied to clipboard
-4. **Cmd+V** to paste into terminal
+3. Press **Option+V** again — the transcription is auto-typed at your cursor
+
+No manual paste needed. Your clipboard is preserved (it pastes via a
+save/restore).
 
 ### Voice Output (Option+S)
 1. Copy any text to clipboard (**Cmd+C**)
-2. Press **Option+S**
-3. Hear the text spoken aloud
+2. Press **Option+S** to hear it
+3. Press **Option+S** again to **pause**, again to **resume**
+4. **Double-tap Option+S** (two quick presses) to **stop** — the next press
+   starts fresh on whatever is on your clipboard
 
 Works from any app — terminal, browser, editor, etc.
 
@@ -157,9 +162,13 @@ unless you change `tts_model` itself (then it reloads on the next press).
 | `mlx-community/parakeet-tdt-1.1b` | 1.1B | Maximum accuracy |
 
 ### Hammerspoon (`~/.hammerspoon/init.lua`)
-- Option+V: Toggle voice recording
-- Option+S: Speak Claude's response
+- Option+V: Toggle voice recording (auto-types the transcription)
+- Option+S: Speak the clipboard; press again to pause/resume
+- Option+S Option+S: Stop voice output (two quick taps)
 - Cmd+Ctrl+R: Reload config
+
+After editing `~/.hammerspoon/init.lua`, reload it (Cmd+Ctrl+R) for changes
+to take effect.
 
 **Security Note:** Hammerspoon requires Accessibility permissions to capture hotkeys. This config only listens for specific hotkeys (not all keystrokes) and only communicates with your local server. Recommendations:
 - Don't install untrusted Hammerspoon plugins ("Spoons")
@@ -181,12 +190,13 @@ All parameters are set in `client/config.yaml` under `local:`.
 | `tts_speaker` | `aiden` | Voice identity |
 | `tts_language` | `english` | Output language |
 | `tts_instruct` | `null` | Emotion/style instruction (free-form text) |
-| `tts_temperature` | `0.9` | Randomness — lower is more consistent (0.1-1.5) |
+| `tts_temperature` | `0.9` | Randomness. **Keep 0.7–1.0** — below ~0.5 this model emits the first word then collapses to silence |
 | `tts_top_k` | `50` | Token sampling pool size |
 | `tts_top_p` | `1.0` | Nucleus sampling threshold (0.0-1.0) |
 | `tts_repetition_penalty` | `1.05` | Penalize repeated tokens (1.0 = off) |
 | `tts_max_tokens` | `4096` | Maximum generation length |
 | `tts_streaming_interval` | `2.0` | Seconds of audio per streaming chunk |
+| `tts_speed` | `1.0` | Playback speed, pitch preserved (1.5 faster, 0.8 slower) |
 
 ### Alternative TTS Models
 
@@ -306,10 +316,13 @@ nvidia_parakeet/
 │   ├── tts_client.py        # TTS: Text cleanup + synthesis + playback
 │   ├── tts_daemon.py        # TTS: Persistent daemon (model stays loaded)
 │   ├── config.yaml          # Backend selection + settings
+│   ├── hammerspoon/
+│   │   └── init.lua         # Hotkey bindings (backup of ~/.hammerspoon/init.lua)
 │   └── scripts/
 │       ├── start_voice.sh   # Option+V start
 │       ├── stop_voice.sh    # Option+V stop
-│       └── speak_clipboard.sh  # Option+S handler
+│       ├── speak_clipboard.sh  # Option+S handler (speak/pause/resume)
+│       └── stop_tts.sh      # Double Option+S handler (stop)
 └── server/
     ├── server.py            # ASR WebSocket server (origin)
     ├── tts_server.py        # TTS WebSocket server (origin)
@@ -373,4 +386,5 @@ On local backend, text is cleaned up with regex (code blocks removed, markdown s
 | ASR server down (origin) | `systemctl --user restart parakeet-asr.service` |
 | TTS server down (origin) | `systemctl --user restart tts-server.service` |
 | Option+S no sound | Check speaker volume, verify backend is configured |
-| Wrong response spoken | Terminal capture may include old text, scroll down first |
+| TTS only speaks the first word then stops | `tts_temperature` is too low — set it to 0.7–1.0 (below ~0.5 the model collapses to silence) |
+| Hotkey change has no effect | Reload Hammerspoon: Cmd+Ctrl+R |
