@@ -94,13 +94,12 @@ class LocalTTS:
         print("TTS model loaded")
 
     def synthesize_and_play(self, text: str, stop_event=None):
-        """Synthesize text to speech, then play the full audio via afplay.
+        """Synthesize and play audio, streaming chunks into ffplay as they generate.
 
-        We generate the whole utterance, write a temp WAV, and play it with the
-        macOS native player (afplay). Chunked sd.OutputStream playback proved
-        unreliable in the background daemon — writes succeeded into the buffer
-        but no sound came out past the first chunk. afplay always produces
-        sound; interruption kills the subprocess.
+        Audio chunks are piped to ffplay's stdin (raw f32le 24kHz mono) as the
+        model produces them, so playback starts after the first chunk instead of
+        waiting for the whole utterance. ffplay reliably reaches the speakers
+        where the chunked sd.OutputStream did not. Interruption kills ffplay.
         """
         self._ensure_model()
 
@@ -129,63 +128,64 @@ class LocalTTS:
         def stopped():
             return stop_event is not None and stop_event.is_set()
 
-        # Generate all audio chunks (abort early if interrupted).
-        parts = []
-        for chunk in self._model.generate_custom_voice(**kwargs):
-            if stopped():
-                break
-            a = np.array(chunk.audio, dtype=np.float32)
-            if a.size:
-                parts.append(a)
-        if not parts or stopped():
-            print("Done [no audio / interrupted during generation]", flush=True)
-            return
-
-        audio = np.concatenate(parts)
-
-        # Pitch-preserving speed change on the full waveform.
-        if self.speed != 1.0:
-            import librosa
-            audio = librosa.effects.time_stretch(audio, rate=self.speed).astype(np.float32)
-
-        # Write a temp WAV and play it with afplay (a subprocess we can kill).
-        import soundfile as sf
-        import tempfile, os
-        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-            wav_path = f.name
-        sf.write(wav_path, audio, 24000)
-
-        import time
-        proc = subprocess.Popen(['afplay', wav_path])
+        # ffplay reads raw float32 mono @ 24kHz from stdin and plays it as it
+        # arrives. -autoexit quits at EOF; -nodisp/-loglevel keep it silent.
+        proc = subprocess.Popen(
+            ['ffplay', '-f', 'f32le', '-ar', '24000', '-ch_layout', 'mono',
+             '-nodisp', '-autoexit', '-loglevel', 'quiet', '-i', 'pipe:0'],
+            stdin=subprocess.PIPE,
+        )
         self._player = proc
+
+        written = 0
+        outcome = "ok"
         try:
-            # Poll so a stop_event (new Option+S) can kill playback promptly.
-            while proc.poll() is None:
+            for chunk in self._model.generate_custom_voice(**kwargs):
                 if stopped():
-                    proc.terminate()
+                    outcome = "interrupted"
                     break
-                time.sleep(0.1)
+                audio_np = np.array(chunk.audio, dtype=np.float32)
+                if audio_np.size == 0:
+                    continue
+                if self.speed != 1.0:
+                    import librosa
+                    audio_np = librosa.effects.time_stretch(
+                        audio_np, rate=self.speed
+                    ).astype(np.float32)
+                try:
+                    proc.stdin.write(audio_np.tobytes())
+                    proc.stdin.flush()
+                except BrokenPipeError:
+                    outcome = "player-closed"
+                    break
+                written += audio_np.size
         finally:
-            if proc.poll() is None:
+            try:
+                if proc.stdin and not proc.stdin.closed:
+                    proc.stdin.close()
+            except Exception:
+                pass
+            # Let ffplay drain its buffer and finish unless we were interrupted.
+            if stopped():
                 try:
                     proc.terminate()
                 except Exception:
                     pass
+            else:
+                try:
+                    proc.wait(timeout=60)
+                except Exception:
+                    pass
             self._player = None
-            try:
-                os.unlink(wav_path)
-            except OSError:
-                pass
 
-        outcome = "interrupted" if stopped() else "ok"
-        print(f"Done [{len(audio)/24000:.1f}s, {outcome}]", flush=True)
+        print(f"Done [{written/24000:.1f}s, {outcome}]", flush=True)
 
     def interrupt(self):
-        """Kill any in-progress afplay so a new Option+S takes over immediately."""
+        """Kill any in-progress ffplay so a new Option+S takes over immediately."""
         proc = getattr(self, '_player', None)
         if proc is not None and proc.poll() is None:
             try:
-                proc.terminate()
+                proc.kill()
             except Exception:
                 pass
 
