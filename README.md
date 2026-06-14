@@ -15,6 +15,8 @@ Two backends: run everything on your Mac (Apple Silicon), or offload to a GPU se
 | **Option+V** | Voice Input — speak, auto-types where your cursor is |
 | **Option+S** | Voice Output — speak / pause / resume the clipboard |
 | **Option+S Option+S** | Stop voice output (two quick taps) |
+| **Option+<** | Rewind ~15s while speaking |
+| **Option+>** | Fast-forward ~15s while speaking |
 
 ### Voice Input (Option+V)
 1. Press **Option+V** — "REC" appears in menubar
@@ -30,6 +32,12 @@ save/restore).
 3. Press **Option+S** again to **pause**, again to **resume**
 4. **Double-tap Option+S** (two quick presses) to **stop** — the next press
    starts fresh on whatever is on your clipboard
+5. While it's speaking, **Option+<** rewinds ~15s and **Option+>** jumps ~15s
+   ahead. The `<`/`>` keys are Shift+comma/period, so the bindings are on the
+   plain comma/period keys (no Shift needed). Rewind reaches all the way back to
+   the start; fast-forward is capped at how much audio has been generated so far
+   (you can't skip past speech that doesn't exist yet). Tune the step with
+   `tts_seek_seconds` in `config.yaml`.
 
 Works from any app — terminal, browser, editor, etc.
 
@@ -165,6 +173,7 @@ unless you change `tts_model` itself (then it reloads on the next press).
 - Option+V: Toggle voice recording (auto-types the transcription)
 - Option+S: Speak the clipboard; press again to pause/resume
 - Option+S Option+S: Stop voice output (two quick taps)
+- Option+< / Option+>: Rewind / fast-forward ~15s while speaking
 - Cmd+Ctrl+R: Reload config
 
 After editing `~/.hammerspoon/init.lua`, reload it (Cmd+Ctrl+R) for changes
@@ -322,7 +331,9 @@ nvidia_parakeet/
 │       ├── start_voice.sh   # Option+V start
 │       ├── stop_voice.sh    # Option+V stop
 │       ├── speak_clipboard.sh  # Option+S handler (speak/pause/resume)
-│       └── stop_tts.sh      # Double Option+S handler (stop)
+│       ├── stop_tts.sh      # Double Option+S handler (stop)
+│       ├── seek_back.sh     # Option+< handler (rewind ~15s)
+│       └── seek_forward.sh  # Option+> handler (forward ~15s)
 └── server/
     ├── server.py            # ASR WebSocket server (origin)
     ├── tts_server.py        # TTS WebSocket server (origin)

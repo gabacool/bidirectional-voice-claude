@@ -53,6 +53,71 @@ def _prepare_for_speech(text: str) -> str:
     return _manual_cleanup(text)
 
 
+class SeekControl:
+    """Thread-safe accumulator for rewind/forward requests.
+
+    The HTTP handler thread adds a signed sample delta (negative = rewind,
+    positive = forward); the playback thread drains it once per loop with
+    pop() and applies it to its position pointer.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._pending = 0
+
+    def request(self, samples: int):
+        with self._lock:
+            self._pending += samples
+
+    def pop(self) -> int:
+        with self._lock:
+            d = self._pending
+            self._pending = 0
+            return d
+
+
+class AudioTape:
+    """A growable PCM buffer the consumer can seek within.
+
+    The producer appends every generated chunk here instead of discarding it
+    after playback, so we retain the full utterance and can rewind to any
+    earlier point. Forward seeks are bounded by `length` (what's been generated
+    so far) — you can't jump past audio that doesn't exist yet. Capacity grows
+    by doubling, so appends are amortized O(1) and reads copy only a sub-chunk.
+    """
+
+    def __init__(self, initial=48000):
+        self._lock = threading.Lock()
+        self._buf = np.zeros(initial, dtype=np.float32)
+        self.length = 0      # samples generated so far
+        self.done = False    # producer finished (no more audio coming)
+
+    def append(self, arr: np.ndarray):
+        with self._lock:
+            need = self.length + len(arr)
+            if need > len(self._buf):
+                cap = len(self._buf)
+                while cap < need:
+                    cap *= 2
+                grown = np.zeros(cap, dtype=np.float32)
+                grown[:self.length] = self._buf[:self.length]
+                self._buf = grown
+            self._buf[self.length:need] = arr
+            self.length = need
+
+    def read(self, pos: int, n: int):
+        """Return (samples, total_len, done) for up to n samples from pos."""
+        with self._lock:
+            if pos >= self.length:
+                return np.empty(0, dtype=np.float32), self.length, self.done
+            end = min(pos + n, self.length)
+            return self._buf[pos:end].copy(), self.length, self.done
+
+    def finish(self):
+        with self._lock:
+            self.done = True
+
+
 class LocalTTS:
     """Synthesize speech locally using Qwen3-TTS via mlx-audio."""
 
@@ -83,6 +148,7 @@ class LocalTTS:
         self.max_tokens = config.get('tts_max_tokens', 4096)
         self.streaming_interval = config.get('tts_streaming_interval', 2.0)
         self.speed = config.get('tts_speed', 1.0)  # >1 faster, <1 slower (pitch preserved)
+        self.seek_seconds = config.get('tts_seek_seconds', 15)  # rewind/forward step
 
     def _ensure_model(self):
         """Lazy-load the TTS model on first use."""
@@ -93,12 +159,18 @@ class LocalTTS:
         self._model = load_model(self.model_name)
         print("TTS model loaded")
 
-    def synthesize_and_play(self, text: str, stop_event=None, pause_event=None):
+    def synthesize_and_play(self, text: str, stop_event=None, pause_event=None,
+                            seek=None):
         """Synthesize text to speech and play it, streaming chunks as they generate.
 
         pause_event (optional threading.Event): when SET, playback pauses (audio
         device stopped) and holds; when CLEARED, playback resumes from where it
         left off. stop_event aborts entirely.
+
+        seek (optional SeekControl): pending signed sample deltas to move the
+        playback position — negative rewinds, positive fast-forwards. Rewinds
+        reach back to the start (full audio is retained); forwards are capped at
+        whatever has been generated so far.
         """
         self._ensure_model()
 
@@ -124,7 +196,7 @@ class LocalTTS:
         if self.instruct:
             kwargs['instruct'] = self.instruct
 
-        audio_queue = queue.Queue()
+        tape = AudioTape()
         gen_error = [None]
 
         def producer():
@@ -149,11 +221,11 @@ class LocalTTS:
                         audio_np = librosa.effects.time_stretch(
                             audio_np, rate=self.speed
                         ).astype(np.float32)
-                    audio_queue.put(audio_np)
+                    tape.append(audio_np)
             except Exception as e:
                 gen_error[0] = e
             finally:
-                audio_queue.put(None)
+                tape.finish()
 
         t = threading.Thread(target=producer, daemon=True)
         t.start()
@@ -183,28 +255,37 @@ class LocalTTS:
             if not stopped():
                 output.start()
 
-        written = 0
+        pos = 0          # absolute playback position in samples (into the tape)
+        written = 0      # total samples sent to the device (counts replays too)
         outcome = "ok"
         completed = False
         with sd.OutputStream(samplerate=24000, channels=1, dtype='float32') as output:
             try:
                 while not stopped():
                     handle_pause(output)
-                    try:
-                        chunk = audio_queue.get(timeout=0.1)
-                    except queue.Empty:
-                        continue
-                    if chunk is None:
-                        completed = True
+                    if stopped():
                         break
-                    for i in range(0, len(chunk), SUBCHUNK):
-                        if stopped():
+
+                    # Apply any pending rewind/forward. Rewind clamps at 0;
+                    # forward clamps at the generation frontier (can't skip past
+                    # audio that doesn't exist yet).
+                    if seek is not None:
+                        delta = seek.pop()
+                        if delta:
+                            total = tape.read(0, 0)[1]
+                            pos = max(0, min(pos + delta, total))
+
+                    sub, total, done = tape.read(pos, SUBCHUNK)
+                    if sub.size == 0:
+                        if done and pos >= total:
+                            completed = True
                             break
-                        handle_pause(output)
-                        if stopped():
-                            break
-                        output.write(chunk[i:i + SUBCHUNK])
-                        written += len(chunk[i:i + SUBCHUNK])
+                        # At the live edge: generation hasn't caught up yet.
+                        sd.sleep(50)
+                        continue
+                    output.write(sub)
+                    pos += len(sub)
+                    written += len(sub)
                 # Drain: closing the stream discards audio still in PortAudio's
                 # buffer, clipping the final ~second of speech. On normal
                 # completion, append a generous silence pad and wait long enough
@@ -214,8 +295,6 @@ class LocalTTS:
                     sd.sleep(800)
                 elif stopped():
                     outcome = "interrupted"
-                else:
-                    outcome = "queue-ended-early"
             except sd.PortAudioError as e:
                 outcome = f"PortAudioError:{e}"
                 if not stopped():

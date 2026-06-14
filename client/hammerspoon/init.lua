@@ -89,10 +89,24 @@ hs.hotkey.bind({"alt"}, "s", function()
     end
 end)
 
+-- Seek while TTS is playing. The "<" / ">" keys are Shift+comma / Shift+period,
+-- so bind the comma/period keys themselves (no Shift needed to press them).
+--   Option+, (Option+<) : rewind ~15s (reaches back to the start)
+--   Option+. (Option+>) : fast-forward ~15s (up to what's been generated)
+hs.hotkey.bind({"alt"}, ",", function()
+    print("TTS Option+< -> rewind")
+    runTTSScript("seek_back.sh")
+end)
+
+hs.hotkey.bind({"alt"}, ".", function()
+    print("TTS Option+> -> forward")
+    runTTSScript("seek_forward.sh")
+end)
+
 -- Reload config with Cmd+Ctrl+R
 hs.hotkey.bind({"cmd", "ctrl"}, "r", function()
     hs.reload()
 end)
 
-hs.notify.new({title="Hammerspoon", informativeText="Config loaded. Option+V=voice, Option+S=speak/pause, double Option+S=stop"}):send()
-print("Hammerspoon config loaded. Option+V=voice input, Option+S=speak/pause, double Option+S=stop")
+hs.notify.new({title="Hammerspoon", informativeText="Config loaded. Option+V=voice, Option+S=speak/pause, double Option+S=stop, Option+,/.=rewind/forward"}):send()
+print("Hammerspoon config loaded. Option+V=voice input, Option+S=speak/pause, double Option+S=stop, Option+,/.=seek")

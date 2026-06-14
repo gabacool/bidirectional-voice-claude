@@ -21,10 +21,11 @@ from pathlib import Path
 
 import yaml
 
-from tts_client import LocalTTS
+from tts_client import LocalTTS, SeekControl
 
 PID_FILE = Path('/tmp/tts_daemon.pid')
 DEFAULT_PORT = 8089
+SAMPLE_RATE = 24000  # playback rate; seek deltas are expressed in these samples
 
 
 class TTSHandler(BaseHTTPRequestHandler):
@@ -38,8 +39,27 @@ class TTSHandler(BaseHTTPRequestHandler):
             self.server.stop_event.set()
             self.server.pause_event.clear()
             self._respond(200, 'stopped')
+        elif self.path == '/seek/back':
+            self._handle_seek(-1)
+        elif self.path == '/seek/forward':
+            self._handle_seek(+1)
         else:
             self._respond(404, 'not found')
+
+    def _handle_seek(self, direction):
+        """Rewind (direction<0) or fast-forward (direction>0) the current
+        utterance by tts_seek_seconds. No-op when nothing is playing."""
+        if not self.server.playing.is_set():
+            self._respond(200, 'idle')
+            return
+        samples = int(direction * self.server.tts.seek_seconds * SAMPLE_RATE)
+        self.server.seek.request(samples)
+        # A seek while paused implies the user wants to keep listening from the
+        # new spot, so lift the pause too.
+        self.server.pause_event.clear()
+        print(f"[seek {'+' if direction > 0 else '-'}{self.server.tts.seek_seconds}s]",
+              flush=True)
+        self._respond(200, 'seeked')
 
     def _handle_speak_toggle(self):
         """Option+S is a toggle:
@@ -80,12 +100,14 @@ class TTSHandler(BaseHTTPRequestHandler):
             maybe_reload_config(self.server)
             self.server.stop_event.clear()
             self.server.pause_event.clear()
+            self.server.seek.pop()  # drop any stale seek from a prior utterance
             self.server.playing.set()
             try:
                 self.server.tts.synthesize_and_play(
                     text,
                     stop_event=self.server.stop_event,
                     pause_event=self.server.pause_event,
+                    seek=self.server.seek,
                 )
                 self._respond(200, 'ok')
             except Exception as e:
@@ -173,6 +195,7 @@ def main():
     server.speak_lock = threading.Lock()
     server.stop_event = threading.Event()
     server.pause_event = threading.Event()
+    server.seek = SeekControl()  # pending rewind/forward sample deltas
     server.playing = threading.Event()  # set while an utterance is in progress
     try:
         server.config_mtime = CONFIG_PATH.stat().st_mtime
