@@ -45,6 +45,51 @@ Works from any app — terminal, browser, editor, etc.
 
 ---
 
+## LAN Voice API (for remote agents)
+
+`voice_api.py` exposes the same local MLX STT/TTS as two plain HTTP endpoints so a
+remote agent (e.g. Hermes on the Origin GPU box) can use them over the LAN. It
+runs independently of the Option+S daemon, loads its own copy of both models, and
+never touches the Mac's mic or speakers — audio only flows in/out as bytes.
+
+Bound to `0.0.0.0:9900` (set `local.voice_api_port` in `config.yaml`). **LAN only,
+no auth** — don't expose it to the public internet.
+
+| Method | Path | Input | Output |
+|--------|------|-------|--------|
+| POST | `/transcribe` | `multipart/form-data`, field `audio` (ogg/mp3/wav/…) | JSON `{"text": "..."}` |
+| POST | `/synthesize` | JSON `{"text": "..."}` | WAV bytes, 24kHz mono 16-bit |
+| GET | `/health` | — | `ok` |
+
+```bash
+# Speech-to-text
+curl -X POST http://192.168.1.162:9900/transcribe -F "audio=@clip.ogg"
+# -> {"text": "transcribed text"}
+
+# Text-to-speech (save the WAV)
+curl -X POST http://192.168.1.162:9900/synthesize \
+     -H 'Content-Type: application/json' \
+     -d '{"text":"hello from the agent"}' -o out.wav
+```
+
+Uploads are decoded with `ffmpeg`, so any common container works. STT uses
+parakeet-mlx; TTS uses the configured Qwen3 voice (`tts_speaker`, etc.). GPU calls
+are serialized internally, so concurrent requests are safe (they queue).
+
+**Run it as an always-on service** (LaunchAgent — auto-starts at login, restarts on
+crash, runs in the user session so Metal/GPU is available):
+
+```bash
+cp client/launchd/com.gabagool.voiceapi.plist ~/Library/LaunchAgents/
+launchctl load -w ~/Library/LaunchAgents/com.gabagool.voiceapi.plist
+# logs: tail -f /tmp/voice_api.log
+# stop: launchctl unload -w ~/Library/LaunchAgents/com.gabagool.voiceapi.plist
+```
+
+Or run it by hand: `client/scripts/start_voice_api.sh`.
+
+---
+
 ## Backends
 
 ### Local (Apple Silicon)
@@ -324,16 +369,20 @@ nvidia_parakeet/
 │   ├── voice_client.py      # STT: Audio capture + transcription
 │   ├── tts_client.py        # TTS: Text cleanup + synthesis + playback
 │   ├── tts_daemon.py        # TTS: Persistent daemon (model stays loaded)
+│   ├── voice_api.py         # LAN HTTP API: /transcribe + /synthesize for remote agents
 │   ├── config.yaml          # Backend selection + settings
 │   ├── hammerspoon/
 │   │   └── init.lua         # Hotkey bindings (backup of ~/.hammerspoon/init.lua)
+│   ├── launchd/
+│   │   └── com.gabagool.voiceapi.plist  # LaunchAgent for the LAN voice API
 │   └── scripts/
 │       ├── start_voice.sh   # Option+V start
 │       ├── stop_voice.sh    # Option+V stop
 │       ├── speak_clipboard.sh  # Option+S handler (speak/pause/resume)
 │       ├── stop_tts.sh      # Double Option+S handler (stop)
 │       ├── seek_back.sh     # Option+< handler (rewind ~15s)
-│       └── seek_forward.sh  # Option+> handler (forward ~15s)
+│       ├── seek_forward.sh  # Option+> handler (forward ~15s)
+│       └── start_voice_api.sh  # Launches voice_api.py (used by the LaunchAgent)
 └── server/
     ├── server.py            # ASR WebSocket server (origin)
     ├── tts_server.py        # TTS WebSocket server (origin)

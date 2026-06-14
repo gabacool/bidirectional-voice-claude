@@ -48,24 +48,39 @@ class LocalTranscriber:
             sf.write(temp_path, audio_float32, sample_rate)
 
         try:
-            result = self._model.transcribe(temp_path)
-            # AlignedResult.text is already correctly spaced — parakeet tokens
-            # carry their own leading space, so the library joins them with "".
-            # Joining tokens with " " ourselves inserts spurious mid-word spaces
-            # ("H ello", "he ar"), so prefer .text and never space-join tokens.
-            if hasattr(result, 'text') and result.text:
-                return result.text.strip()
-            if hasattr(result, 'sentences') and result.sentences:
-                return ''.join(
-                    ''.join(t.text for t in s.tokens if hasattr(t, 'text'))
-                    for s in result.sentences
-                ).strip()
-            if isinstance(result, str):
-                return result.strip()
-            return str(result).strip()
+            return self._extract_text(self._model.transcribe(temp_path))
         finally:
             import os
             os.unlink(temp_path)
+
+    def transcribe_file(self, audio_path: str) -> str:
+        """Transcribe an audio file already on disk (any format parakeet reads).
+
+        Used by the LAN voice API, which decodes the uploaded audio to a 16kHz
+        mono WAV via ffmpeg and passes the path here.
+        """
+        self._ensure_model()
+        return self._extract_text(self._model.transcribe(audio_path))
+
+    @staticmethod
+    def _extract_text(result) -> str:
+        """Pull clean text out of a parakeet-mlx transcribe result.
+
+        AlignedResult.text is already correctly spaced — parakeet tokens carry
+        their own leading space, so the library joins them with "". Joining
+        tokens with " " ourselves inserts spurious mid-word spaces ("H ello",
+        "he ar"), so prefer .text and never space-join tokens.
+        """
+        if hasattr(result, 'text') and result.text:
+            return result.text.strip()
+        if hasattr(result, 'sentences') and result.sentences:
+            return ''.join(
+                ''.join(t.text for t in s.tokens if hasattr(t, 'text'))
+                for s in result.sentences
+            ).strip()
+        if isinstance(result, str):
+            return result.strip()
+        return str(result).strip()
 
 
 class VoiceClient:

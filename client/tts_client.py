@@ -159,6 +159,50 @@ class LocalTTS:
         self._model = load_model(self.model_name)
         print("TTS model loaded")
 
+    def synthesize_to_array(self, text: str) -> np.ndarray:
+        """Synthesize text and return the full mono float32 waveform at 24kHz.
+
+        No playback — used by the LAN voice API to hand raw audio back to a
+        remote caller. Reuses the same voice/temperature/speed config as
+        playback, just collected into one array instead of streamed to speakers.
+        """
+        self._ensure_model()
+
+        speech_text = _prepare_for_speech(text)
+        if not speech_text:
+            return np.zeros(0, dtype=np.float32)
+
+        kwargs = dict(
+            text=speech_text,
+            speaker=self.speaker,
+            language=self.language,
+            temperature=self.temperature,
+            top_k=self.top_k,
+            top_p=self.top_p,
+            repetition_penalty=self.repetition_penalty,
+            max_tokens=self.max_tokens,
+            stream=True,
+            streaming_interval=self.streaming_interval,
+        )
+        if self.instruct:
+            kwargs['instruct'] = self.instruct
+
+        chunks = []
+        for chunk in self._model.generate_custom_voice(**kwargs):
+            audio_np = np.array(chunk.audio, dtype=np.float32)
+            if audio_np.size == 0:
+                continue
+            if self.speed != 1.0:
+                import librosa
+                audio_np = librosa.effects.time_stretch(
+                    audio_np, rate=self.speed
+                ).astype(np.float32)
+            chunks.append(audio_np)
+
+        if not chunks:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(chunks)
+
     def synthesize_and_play(self, text: str, stop_event=None, pause_event=None,
                             seek=None):
         """Synthesize text to speech and play it, streaming chunks as they generate.

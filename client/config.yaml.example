@@ -38,3 +38,6 @@ local:
   tts_streaming_interval: 2.0       # Seconds of audio per chunk (lower = faster first sound)
   tts_speed: 1.0                    # Playback speed, pitch preserved (1.0 normal, 1.5 faster, 0.8 slower)
   tts_seek_seconds: 15              # Rewind/forward step for Option+< / Option+> while speaking
+
+  # LAN voice API (voice_api.py) — STT/TTS over HTTP for remote agents
+  voice_api_port: 9900              # POST /transcribe (audio->text), POST /synthesize (text->WAV)

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for the LAN voice API (STT/TTS for remote agents).
+  Install:
+    cp client/launchd/com.gabagool.voiceapi.plist ~/Library/LaunchAgents/
+    launchctl load -w ~/Library/LaunchAgents/com.gabagool.voiceapi.plist
+  Stop / uninstall:
+    launchctl unload -w ~/Library/LaunchAgents/com.gabagool.voiceapi.plist
+  It runs as a LaunchAgent (user session) so MLX/Metal has GPU access, and
+  KeepAlive restarts it if it crashes.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.gabagool.voiceapi</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/gabagool/Git/nvidia_parakeet/client/scripts/start_voice_api.sh</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/voice_api.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/voice_api.log</string>
+</dict>
+</plist>
