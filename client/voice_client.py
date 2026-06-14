@@ -70,17 +70,32 @@ class LocalTranscriber:
         their own leading space, so the library joins them with "". Joining
         tokens with " " ourselves inserts spurious mid-word spaces ("H ello",
         "he ar"), so prefer .text and never space-join tokens.
+
+        An AlignedResult with an EMPTY .text is valid — it means silence / no
+        speech — and must yield "" (so callers get {"text": ""}). We must never
+        fall through to str(result), which would leak the Python repr
+        ("AlignedResult(text='', sentences=[])") into the JSON response.
         """
-        if hasattr(result, 'text') and result.text:
+        # Some versions return a list of results for a single input; unwrap it.
+        if isinstance(result, (list, tuple)):
+            return LocalTranscriber._extract_text(result[0]) if result else ''
+
+        has_text = hasattr(result, 'text')
+        if has_text and result.text:
             return result.text.strip()
+        # .text was empty/missing — try reconstructing from sentence tokens.
         if hasattr(result, 'sentences') and result.sentences:
             return ''.join(
                 ''.join(t.text for t in s.tokens if hasattr(t, 'text'))
                 for s in result.sentences
             ).strip()
+        # A parakeet result that's simply empty (silence): return "".
+        if has_text or hasattr(result, 'sentences'):
+            return ''
         if isinstance(result, str):
             return result.strip()
-        return str(result).strip()
+        # Unknown type: empty string, never the repr.
+        return ''
 
 
 class VoiceClient:
