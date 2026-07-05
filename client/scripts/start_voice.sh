@@ -1,6 +1,14 @@
 #!/bin/bash
 # Start voice recording - called by Hammerspoon
 
+# Hammerspoon doesn't inherit the user's shell PATH — add Homebrew so the local
+# STT backend (parakeet-mlx) can find the ffmpeg binary it shells out to for
+# decoding recorded audio. Without this, transcription dies with "FFmpeg is not
+# installed or not in your PATH" and Option+V pastes nothing.
+export PATH="/opt/homebrew/bin:$PATH"
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLIENT_DIR="$(dirname "$SCRIPT_DIR")"
 PID_FILE="/tmp/parakeet_voice.pid"
