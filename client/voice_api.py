@@ -6,7 +6,7 @@ remote agent (e.g. Hermes on Origin) can use them over the network.
 Endpoints (bound to 0.0.0.0 — LAN only, no auth):
 
   POST /transcribe   multipart/form-data, field "audio" (ogg/mp3/wav/…)
-                     -> JSON {"text": "..."}      (parakeet-mlx STT)
+                     -> JSON {"text": "..."}      (Qwen3-ASR STT)
 
   POST /synthesize   JSON {"text": "..."}
                      -> WAV bytes, 24kHz mono 16-bit   (Qwen3-TTS)
@@ -255,12 +255,12 @@ def main():
     config = load_config()
     local_cfg = config.get('local', {})
     port = local_cfg.get('voice_api_port', DEFAULT_PORT)
-    stt_model = local_cfg.get('stt_model', 'mlx-community/parakeet-tdt-0.6b-v3')
+    stt_model = local_cfg.get('stt_model', 'Qwen/Qwen3-ASR-0.6B')
 
     print("Loading TTS model (Qwen3)...", flush=True)
     tts = LocalTTS(local_cfg)
     tts._ensure_model()
-    print("Loading STT model (parakeet)...", flush=True)
+    print("Loading STT model (Qwen3-ASR)...", flush=True)
     stt = LocalTranscriber(stt_model)
     stt._ensure_model()
     print("Models loaded", flush=True)

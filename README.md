@@ -73,8 +73,9 @@ curl -X POST http://192.168.1.162:9900/synthesize \
 ```
 
 Uploads are decoded with `ffmpeg`, so any common container works. STT uses
-parakeet-mlx; TTS uses the configured Qwen3 voice (`tts_speaker`, etc.). GPU calls
-are serialized internally, so concurrent requests are safe (they queue).
+Qwen3-ASR (multilingual — English, Chinese, and ~28 more, auto-detected); TTS uses
+the configured Qwen3 voice (`tts_speaker`, etc.). GPU calls are serialized
+internally, so concurrent requests are safe (they queue).
 
 **Run it as an always-on service** (LaunchAgent — auto-starts at login, restarts on
 crash, runs in the user session so Metal/GPU is available):
@@ -113,7 +114,7 @@ pip install -r client/requirements.txt
 ```
 
 On first use, models download automatically:
-- STT: `parakeet-tdt-0.6b-v3` (~1.2GB from HuggingFace)
+- STT: `Qwen/Qwen3-ASR-0.6B` (~1.2GB from HuggingFace; multilingual, incl. Chinese)
 - TTS: `en_US-lessac-medium` (~63MB from HuggingFace)
 
 ### Origin (GPU Server)
@@ -158,7 +159,7 @@ Option+V / Option+S
   voice_client.py / tts_client.py
         |
         v
-  parakeet-mlx (STT)    Qwen3-TTS (TTS)
+  Qwen3-ASR (STT)       Qwen3-TTS (TTS)
   In-process on Mac      In-process on Mac
 ```
 
@@ -189,7 +190,7 @@ origin:
   tts_server_url: "ws://YOUR_SERVER_IP:8088"
 
 local:
-  stt_model: "mlx-community/parakeet-tdt-0.6b-v3"
+  stt_model: "Qwen/Qwen3-ASR-0.6B"
   tts_model: "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit"
   tts_speaker: "aiden"
   tts_language: "english"
@@ -210,9 +211,9 @@ unless you change `tts_model` itself (then it reloads on the next press).
 
 | Model | Params | Notes |
 |-------|--------|-------|
-| `mlx-community/parakeet-tdt-0.6b-v3` | 600M | Best accuracy, #1 on OpenASR (default) |
-| `mlx-community/parakeet-tdt_ctc-110m` | 110M | Lightweight, faster startup |
-| `mlx-community/parakeet-tdt-1.1b` | 1.1B | Maximum accuracy |
+| `Qwen/Qwen3-ASR-0.6B` | 600M | Multilingual (English, Chinese +22 dialects, ~28 langs), auto-detect (default) |
+| `Qwen/Qwen3-ASR-1.7B` | 1.7B | Same, higher accuracy (~3.4GB RAM) |
+| `mlx-community/parakeet-tdt-0.6b-v3` | 600M | English + 24 European langs only (no Chinese); fast, needs `parakeet-mlx` |
 
 ### Hammerspoon (`~/.hammerspoon/init.lua`)
 - Option+V: Toggle voice recording (auto-types the transcription)
@@ -322,7 +323,7 @@ local:
 
 | | Local | Origin |
 |-|-------|--------|
-| **Model** | parakeet-tdt-0.6b-v3 (MLX) | parakeet_realtime_eou_120m-v1 (NeMo) |
+| **Model** | Qwen3-ASR-0.6B (MLX) | parakeet_realtime_eou_120m-v1 (NeMo) |
 | **Params** | 600M | 120M |
 | **Inference** | Apple Silicon (MLX) | CUDA (RTX) |
 | **Client** | `client/voice_client.py` | `client/voice_client.py` |
@@ -414,7 +415,7 @@ On local backend, text is cleaned up with regex (code blocks removed, markdown s
 
 | Component | Local (MLX) | Origin (CUDA) |
 |-----------|-------------|---------------|
-| STT | parakeet-tdt-0.6b-v3 (600M) | parakeet_realtime_eou_120m-v1 (120M) |
+| STT | Qwen3-ASR-0.6B (600M) | parakeet_realtime_eou_120m-v1 (120M) |
 | Summarizer | Regex cleanup | vLLM |
 | TTS | Qwen3-TTS 1.7B 8-bit (~3GB) | Piper lessac-medium (63MB) |
 

@@ -22,80 +22,53 @@ TRANSCRIPTION_FILE = "/tmp/parakeet_transcription.txt"
 
 
 class LocalTranscriber:
-    """Transcribe audio locally using parakeet-mlx on Apple Silicon."""
+    """Transcribe audio locally using Qwen3-ASR (mlx-qwen3-asr) on Apple Silicon.
+
+    Multilingual with automatic language detection — English, Mandarin Chinese
+    (plus 22 Chinese dialects), and ~28 other languages — so the same recorder
+    handles English and Chinese dictation with no mode switch.
+    """
 
     def __init__(self, model_name: str):
         self.model_name = model_name
-        self._model = None
+        self._session = None
 
     def _ensure_model(self):
         """Lazy-load the model on first use."""
-        if self._model is not None:
+        if self._session is not None:
             return
-        from parakeet_mlx import from_pretrained
+        from mlx_qwen3_asr import Session
         print(f"Loading STT model: {self.model_name}...")
-        self._model = from_pretrained(self.model_name)
+        self._session = Session(model=self.model_name)
         print("STT model loaded")
 
     def transcribe(self, audio_float32: np.ndarray, sample_rate: int) -> str:
-        """Transcribe audio buffer to text."""
+        """Transcribe an audio buffer to text (via a temp WAV file)."""
         self._ensure_model()
 
-        # Write audio to temp WAV file (parakeet-mlx expects a file path)
         import soundfile as sf
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
             temp_path = f.name
             sf.write(temp_path, audio_float32, sample_rate)
 
         try:
-            return self._extract_text(self._model.transcribe(temp_path))
+            return self.transcribe_file(temp_path)
         finally:
             import os
             os.unlink(temp_path)
 
     def transcribe_file(self, audio_path: str) -> str:
-        """Transcribe an audio file already on disk (any format parakeet reads).
+        """Transcribe an audio file already on disk.
 
-        Used by the LAN voice API, which decodes the uploaded audio to a 16kHz
-        mono WAV via ffmpeg and passes the path here.
+        Language is auto-detected, so English and Chinese both work without a
+        mode switch. WAV takes a native fast-path (no ffmpeg needed); other
+        formats — e.g. the LAN voice API's ffmpeg-decoded uploads — also work.
+
+        An empty string means silence / no speech, so callers get {"text": ""}.
         """
         self._ensure_model()
-        return self._extract_text(self._model.transcribe(audio_path))
-
-    @staticmethod
-    def _extract_text(result) -> str:
-        """Pull clean text out of a parakeet-mlx transcribe result.
-
-        AlignedResult.text is already correctly spaced — parakeet tokens carry
-        their own leading space, so the library joins them with "". Joining
-        tokens with " " ourselves inserts spurious mid-word spaces ("H ello",
-        "he ar"), so prefer .text and never space-join tokens.
-
-        An AlignedResult with an EMPTY .text is valid — it means silence / no
-        speech — and must yield "" (so callers get {"text": ""}). We must never
-        fall through to str(result), which would leak the Python repr
-        ("AlignedResult(text='', sentences=[])") into the JSON response.
-        """
-        # Some versions return a list of results for a single input; unwrap it.
-        if isinstance(result, (list, tuple)):
-            return LocalTranscriber._extract_text(result[0]) if result else ''
-
-        has_text = hasattr(result, 'text')
-        if has_text and result.text:
-            return result.text.strip()
-        # .text was empty/missing — try reconstructing from sentence tokens.
-        if hasattr(result, 'sentences') and result.sentences:
-            return ''.join(
-                ''.join(t.text for t in s.tokens if hasattr(t, 'text'))
-                for s in result.sentences
-            ).strip()
-        # A parakeet result that's simply empty (silence): return "".
-        if has_text or hasattr(result, 'sentences'):
-            return ''
-        if isinstance(result, str):
-            return result.strip()
-        # Unknown type: empty string, never the repr.
-        return ''
+        result = self._session.transcribe(audio_path)
+        return (getattr(result, "text", "") or "").strip()
 
 
 class VoiceClient:
@@ -123,7 +96,7 @@ class VoiceClient:
             self.websocket = None
         elif self.backend == 'local':
             local_cfg = self.config.get('local', {})
-            model_name = local_cfg.get('stt_model', 'mlx-community/parakeet-tdt-0.6b-v3')
+            model_name = local_cfg.get('stt_model', 'Qwen/Qwen3-ASR-0.6B')
             self.local_transcriber = LocalTranscriber(model_name)
         else:
             raise ValueError(f"Unknown backend: {self.backend}")
@@ -247,7 +220,7 @@ class VoiceClient:
     # --- Local backend methods ---
 
     async def _local_record_and_transcribe(self):
-        """Record audio locally and transcribe via parakeet-mlx."""
+        """Record audio locally and transcribe via Qwen3-ASR."""
         self.recording = True
         audio_buffer = []
         loop = asyncio.get_running_loop()

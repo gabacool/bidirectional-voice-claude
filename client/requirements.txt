@@ -6,6 +6,6 @@ numpy
 pyobjc-framework-Cocoa>=10.0
 
 # Local backend (Apple Silicon) - install these for backend: local
-parakeet-mlx>=0.3.0
+mlx-qwen3-asr>=0.3.5
 mlx-audio>=0.3.0
 soundfile>=0.12.0
