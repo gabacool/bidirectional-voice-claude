@@ -201,6 +201,7 @@ local:
   tts_repetition_penalty: 1.05
   tts_max_tokens: 4096
   tts_streaming_interval: 2.0
+  tts_max_pause_seconds: 0.2       # cap the model's inter-sentence silences (0 = off)
 ```
 
 **After changing config:** The TTS daemon watches `config.yaml` and auto-reloads

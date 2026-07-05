@@ -53,6 +53,40 @@ def _prepare_for_speech(text: str) -> str:
     return _manual_cleanup(text)
 
 
+def _squeeze_silence(audio: np.ndarray, sr: int = 24000, max_gap_s: float = 0.2,
+                     thresh: float = 0.01, win_s: float = 0.02) -> np.ndarray:
+    """Shorten the long silences the TTS model inserts between sentences so
+    speech doesn't drag. Any run of near-silence longer than max_gap_s is
+    clipped down to max_gap_s. Silence is detected on a short RMS window (a
+    per-sample test would trip on every zero-crossing inside normal speech).
+    max_gap_s <= 0 disables squeezing and returns the audio untouched.
+    """
+    n = audio.size
+    if n == 0 or max_gap_s <= 0:
+        return audio
+    win = max(1, int(win_s * sr))
+    nwin = n // win
+    if nwin < 2:
+        return audio
+    body = audio[:nwin * win].reshape(nwin, win)
+    silent = np.sqrt((body ** 2).mean(axis=1)) < thresh
+    max_run = max(1, round(max_gap_s / win_s))
+    keep = np.ones(nwin, dtype=bool)
+    i = 0
+    while i < nwin:
+        if silent[i]:
+            j = i
+            while j < nwin and silent[j]:
+                j += 1
+            if j - i > max_run:
+                keep[i + max_run:j] = False   # drop the excess pause windows
+            i = j
+        else:
+            i += 1
+    kept = body[keep].reshape(-1)
+    return np.concatenate([kept, audio[nwin * win:]]).astype(np.float32)
+
+
 class SeekControl:
     """Thread-safe accumulator for rewind/forward requests.
 
@@ -149,6 +183,8 @@ class LocalTTS:
         self.streaming_interval = config.get('tts_streaming_interval', 2.0)
         self.speed = config.get('tts_speed', 1.0)  # >1 faster, <1 slower (pitch preserved)
         self.seek_seconds = config.get('tts_seek_seconds', 15)  # rewind/forward step
+        # Cap the model's inter-sentence silences to this many seconds (0 = off).
+        self.max_pause = config.get('tts_max_pause_seconds', 0.2)
 
     def _ensure_model(self):
         """Lazy-load the TTS model on first use."""
@@ -201,7 +237,7 @@ class LocalTTS:
 
         if not chunks:
             return np.zeros(0, dtype=np.float32)
-        return np.concatenate(chunks)
+        return _squeeze_silence(np.concatenate(chunks), max_gap_s=self.max_pause)
 
     def synthesize_and_play(self, text: str, stop_event=None, pause_event=None,
                             seek=None):
@@ -265,6 +301,10 @@ class LocalTTS:
                         audio_np = librosa.effects.time_stretch(
                             audio_np, rate=self.speed
                         ).astype(np.float32)
+                    # Trim the model's long inter-sentence pauses so playback
+                    # doesn't drag. Generation already runs ahead of playback,
+                    # so this directly shortens the gap the listener hears.
+                    audio_np = _squeeze_silence(audio_np, max_gap_s=self.max_pause)
                     tape.append(audio_np)
             except Exception as e:
                 gen_error[0] = e
