@@ -8,6 +8,11 @@ Endpoints (bound to 0.0.0.0 — LAN only, no auth):
   POST /transcribe   multipart/form-data, field "audio" (ogg/mp3/wav/…)
                      -> JSON {"text": "..."}      (Qwen3-ASR STT)
 
+  POST /v1/audio/transcriptions
+                     multipart/form-data, field "file" (OpenAI STT shape;
+                     model/language/response_format accepted and ignored)
+                     -> JSON {"text": "..."}      (Qwen3-ASR STT)
+
   POST /synthesize   JSON {"text": "..."}
                      -> WAV bytes, 24kHz mono 16-bit   (Qwen3-TTS)
 
@@ -93,6 +98,36 @@ def parse_multipart(content_type: str, body: bytes) -> dict:
     return fields
 
 
+def extract_upload(fields: dict, field_name: str) -> tuple[bytes | None, str | None]:
+    """Pick the uploaded audio bytes out of parsed multipart fields.
+
+    Prefers the part named ``field_name`` (e.g. "audio" or "file"); if absent,
+    falls back to the only file part present. Returns ``(bytes, None)`` on
+    success or ``(None, kind)`` where ``kind`` is ``"missing"`` (no file part at
+    all) or ``"empty"`` (file part present but zero bytes).
+    """
+    part = fields.get(field_name)
+    if part is None:
+        # A file part is any part carrying a filename (v[0] is not None).
+        part = next((v for v in fields.values() if v[0] is not None), None)
+    if part is None:
+        return None, "missing"
+    if not part[1]:
+        return None, "empty"
+    return part[1], None
+
+
+def transcription_error_body(message: str, openai_shape: bool) -> dict:
+    """Wrap an error message in the route-appropriate JSON body.
+
+    ``openai_shape=True`` -> ``{"error": {"message": ...}}`` (OpenAI STT API);
+    ``openai_shape=False`` -> ``{"error": ...}`` (the legacy /transcribe shape).
+    """
+    if openai_shape:
+        return {"error": {"message": message}}
+    return {"error": message}
+
+
 def decode_to_wav16k(raw: bytes) -> str:
     """Decode arbitrary audio bytes to a 16kHz mono WAV file via ffmpeg.
 
@@ -141,6 +176,8 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == '/transcribe':
             self._handle_transcribe()
+        elif self.path == '/v1/audio/transcriptions':
+            self._handle_openai_transcribe()
         elif self.path == '/synthesize':
             self._handle_synthesize()
         else:
@@ -150,21 +187,48 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get('Content-Length', 0))
         return self.rfile.read(length) if length > 0 else b''
 
-    def _handle_transcribe(self):
+    def _handle_transcribe(self) -> None:
+        # Legacy endpoint: field "audio", flat {"error": "..."} shape. Behavior
+        # is unchanged — the shared implementation reproduces it exactly.
+        self._transcribe_request(field_name='audio', openai_shape=False)
+
+    def _handle_openai_transcribe(self) -> None:
+        # OpenAI-compatible endpoint: field "file", {"error": {"message": ...}}.
+        self._transcribe_request(field_name='file', openai_shape=True)
+
+    def _transcribe_request(self, field_name: str, openai_shape: bool) -> None:
+        """Shared decode+transcribe flow for both STT routes.
+
+        Parameterized only by the multipart file field name and the error body
+        shape (see ``transcription_error_body``). Success is identical for both
+        routes: HTTP 200, ``{"text": "..."}``.
+        """
         body = self._read_body()
         fields = parse_multipart(self.headers.get('Content-Type', ''), body)
-        # Prefer the documented "audio" field; fall back to the only file part.
-        audio = fields.get('audio')
-        if audio is None:
-            audio = next((v for v in fields.values() if v[0] is not None), None)
-        if audio is None or not audio[1]:
-            self._respond_json(400, {"error": "no 'audio' file in multipart body"})
+        audio_bytes, err = extract_upload(fields, field_name)
+        if err is not None:
+            if openai_shape:
+                message = (f"missing required '{field_name}' field"
+                           if err == 'missing' else 'uploaded file is empty')
+            else:
+                # Legacy collapses missing+empty into one message (unchanged).
+                message = f"no '{field_name}' file in multipart body"
+            self._respond_json(400, transcription_error_body(message, openai_shape))
             return
 
+        # Optional OpenAI form fields are accepted and ignored (logged once).
+        if openai_shape:
+            ignored = {k: v[1].decode('utf-8', 'replace')
+                       for k in ('model', 'language', 'response_format')
+                       if (v := fields.get(k)) is not None}
+            if ignored:
+                print(f"[v1/audio/transcriptions] ignoring params: {ignored}",
+                      file=sys.stderr, flush=True)
+
         try:
-            wav_path = decode_to_wav16k(audio[1])
+            wav_path = decode_to_wav16k(audio_bytes)
         except Exception as e:
-            self._respond_json(400, {"error": str(e)})
+            self._respond_json(400, transcription_error_body(str(e), openai_shape))
             return
 
         try:
@@ -173,7 +237,7 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             self._respond_json(200, {"text": text})
         except Exception as e:
             print(f"[transcribe error] {e}", file=sys.stderr, flush=True)
-            self._respond_json(500, {"error": str(e)})
+            self._respond_json(500, transcription_error_body(str(e), openai_shape))
         finally:
             try:
                 os.unlink(wav_path)
