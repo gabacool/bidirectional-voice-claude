@@ -7,5 +7,5 @@ pyobjc-framework-Cocoa>=10.0
 
 # Local backend (Apple Silicon) - install these for backend: local
 mlx-qwen3-asr>=0.3.5
-mlx-audio>=0.3.0
+mlx-audio>=0.4.5  # >=0.4.5 fixes intermittent full-utterance re-generation (missed EOS) in Qwen3-TTS
 soundfile>=0.12.0

@@ -229,6 +229,14 @@ class LocalTTS:
         if not speech_text:
             return
 
+        # Proportional token budget as a runaway backstop: the model's known
+        # failure mode is missing EOS and re-speaking the utterance (see
+        # tts_repetition_penalty in config — the primary fix). At 12 codec
+        # tokens/sec, budget ~4x a generous speech-duration estimate so normal
+        # renditions never truncate but a full second rendition cannot finish.
+        est_seconds = max(8.0, len(speech_text) / 6.0)
+        max_tokens = min(self.max_tokens, int(12 * est_seconds * 4))
+
         kwargs = dict(
             text=speech_text,
             speaker=self.speaker if voice is None else voice,
@@ -237,7 +245,7 @@ class LocalTTS:
             top_k=self.top_k,
             top_p=self.top_p,
             repetition_penalty=self.repetition_penalty,
-            max_tokens=self.max_tokens,
+            max_tokens=max_tokens,
             stream=True,
             streaming_interval=(self.streaming_interval
                                 if streaming_interval is None

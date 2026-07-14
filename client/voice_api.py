@@ -36,6 +36,7 @@ Run:  python voice_api.py            (port from config.yaml: local.voice_api_por
 import io
 import json
 import os
+import queue
 import re
 import struct
 import subprocess
@@ -43,6 +44,8 @@ import sys
 import tempfile
 import threading
 import wave
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
@@ -66,6 +69,11 @@ STREAMING_SIZE_SENTINEL = 0xFFFFFFFF
 # first audio byte reaches the client sooner (time-to-first-byte), at the cost
 # of slightly more chunks — the right trade for a latency-sensitive endpoint.
 SPEECH_STREAMING_INTERVAL = 0.5
+# Bounded hand-off queue between the single inference thread (producer) and the
+# HTTP handler thread (consumer) for streaming speech. Small on purpose: the
+# first chunk must flow straight through (low time-to-first-byte) and we must
+# NOT buffer the whole utterance ahead of the client.
+STREAM_QUEUE_MAXSIZE = 4
 
 
 def load_config() -> dict:
@@ -251,6 +259,103 @@ def pcm_to_wav_bytes(audio_float32: np.ndarray, sample_rate: int) -> bytes:
     return buf.getvalue()
 
 
+class _GeneratorError:
+    """Wrapper that carries a producer-side exception across the hand-off queue."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+
+
+# Distinct end-of-stream marker put on the queue when the producer finishes.
+_STREAM_SENTINEL = object()
+
+
+def run_generator_on(
+    executor: ThreadPoolExecutor,
+    gen_factory: Callable[[], Iterator[np.ndarray]],
+    maxsize: int = STREAM_QUEUE_MAXSIZE,
+) -> Iterator[np.ndarray]:
+    """Pump ``gen_factory()`` on ``executor``'s thread, yield chunks on the caller's.
+
+    mlx (>=0.31) GPU streams are thread-local, so every model call must run on the
+    one dedicated inference thread owned by ``executor``. A streaming generator,
+    however, must feed the HTTP handler thread that owns the client socket. This
+    bridge runs the generator on the inference thread (the producer) and hands its
+    chunks to the consuming caller through a small bounded ``queue.Queue``.
+
+    Guarantees:
+      * chunk order is preserved and no chunk is dropped, even for a slow consumer;
+      * a producer-side exception is re-raised in the consumer (not swallowed);
+      * the queue is bounded (``maxsize``) — the first chunk flows straight through
+        and generation never races far ahead of the client;
+      * if the consumer stops early (``close()`` / ``GeneratorExit`` on socket
+        disconnect) a stop flag is set that the producer checks between chunks, so
+        generation aborts instead of running to completion as an orphan.
+
+    Args:
+        executor: The single-worker inference executor to run the generator on.
+        gen_factory: Zero-arg callable that creates the underlying chunk iterator
+            (deferred so its lazy model work also runs on the inference thread).
+        maxsize: Bounded hand-off queue depth.
+
+    Yields:
+        The chunks produced by ``gen_factory()``, in order.
+    """
+    handoff: queue.Queue = queue.Queue(maxsize=maxsize)
+    stop = threading.Event()
+
+    def _put(item: object) -> bool:
+        # Block for space, but wake every 0.1s to honour an early-stop request so
+        # a full queue can never wedge the producer after the consumer is gone.
+        while not stop.is_set():
+            try:
+                handoff.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _produce() -> None:
+        gen: Iterator[np.ndarray] | None = None
+        try:
+            gen = gen_factory()
+            for chunk in gen:
+                if stop.is_set():
+                    break
+                if not _put(chunk):
+                    break
+        except BaseException as exc:  # noqa: BLE001 - relayed to the consumer
+            _put(_GeneratorError(exc))
+        finally:
+            # Abort the underlying generator (runs its own cleanup) if we bailed
+            # out early, then always signal end-of-stream (unless already stopped).
+            if gen is not None:
+                close = getattr(gen, "close", None)
+                if callable(close):
+                    close()
+            _put(_STREAM_SENTINEL)
+
+    future = executor.submit(_produce)
+    try:
+        while True:
+            item = handoff.get()
+            if item is _STREAM_SENTINEL:
+                break
+            if isinstance(item, _GeneratorError):
+                raise item.exc
+            yield item
+    finally:
+        # Consumer is done or was closed (disconnect): stop the producer and drain
+        # so a blocked _put wakes at once, then join so no orphan thread lingers.
+        stop.set()
+        try:
+            while True:
+                handoff.get_nowait()
+        except queue.Empty:
+            pass
+        future.result()
+
+
 class VoiceAPIHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
@@ -320,8 +425,10 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            with self.server.infer_lock:
-                text = self.server.stt.transcribe_file(wav_path)
+            # All model inference runs on the one dedicated inference thread
+            # (mlx GPU streams are thread-local); the single worker serializes it.
+            text = self.server.executor.submit(
+                self.server.stt.transcribe_file, wav_path).result()
             self._respond_json(200, {"text": text})
         except Exception as e:
             print(f"[transcribe error] {e}", file=sys.stderr, flush=True)
@@ -345,8 +452,8 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            with self.server.infer_lock:
-                audio = self.server.tts.synthesize_to_array(text)
+            audio = self.server.executor.submit(
+                self.server.tts.synthesize_to_array, text).result()
         except Exception as e:
             print(f"[synthesize error] {e}", file=sys.stderr, flush=True)
             self._respond_json(500, {"error": str(e)})
@@ -383,13 +490,17 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
         voice = params['voice']
         fmt = params['response_format']
 
-        # Hold the shared inference lock for the whole generation, released via
-        # finally even if the client disconnects or generation raises.
-        self.server.infer_lock.acquire()
+        # The model runs on the single inference thread; this handler thread owns
+        # the socket. run_generator_on bridges the two: chunks are pumped on the
+        # inference thread and handed here through a small bounded queue, and
+        # closing the returned generator aborts the producer (no orphan) — so we
+        # close it in every exit path below.
+        stream = run_generator_on(
+            self.server.executor,
+            lambda: self.server.tts.synthesize_stream(
+                text, voice=voice, streaming_interval=SPEECH_STREAMING_INTERVAL),
+        )
         try:
-            stream = self.server.tts.synthesize_stream(
-                text, voice=voice, streaming_interval=SPEECH_STREAMING_INTERVAL)
-
             # Pull the first chunk while no bytes are on the wire yet, so an
             # up-front generation failure (e.g. unknown voice) or empty-after-
             # cleanup text still becomes a clean 400 instead of a broken stream.
@@ -437,7 +548,8 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
                 print(f"[speech] generation error mid-stream: {e}",
                       file=sys.stderr, flush=True)
         finally:
-            self.server.infer_lock.release()
+            # Stop the producer (aborts generation if we exited early) and join it.
+            stream.close()
 
     def _respond_text(self, code: int, body: str):
         payload = body.encode()
@@ -485,20 +597,25 @@ def main():
     port = local_cfg.get('voice_api_port', DEFAULT_PORT)
     stt_model = local_cfg.get('stt_model', 'Qwen/Qwen3-ASR-0.6B')
 
-    print("Loading TTS model (Qwen3)...", flush=True)
+    # One dedicated inference thread. mlx (>=0.31) GPU streams are thread-local,
+    # so EVERY model call — load and generate — must run on this single thread;
+    # its single worker also serializes concurrent requests onto the shared GPU.
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="infer")
+
     tts = LocalTTS(local_cfg)
-    tts._ensure_model()
-    print("Loading STT model (Qwen3-ASR)...", flush=True)
     stt = LocalTranscriber(stt_model)
-    stt._ensure_model()
+    # Warm both models ON the inference thread so their thread-local mlx streams
+    # are created where inference will later run (not on the main thread).
+    print("Loading TTS model (Qwen3)...", flush=True)
+    executor.submit(tts._ensure_model).result()
+    print("Loading STT model (Qwen3-ASR)...", flush=True)
+    executor.submit(stt._ensure_model).result()
     print("Models loaded", flush=True)
 
     server = ThreadedHTTPServer(('0.0.0.0', port), VoiceAPIHandler)
     server.tts = tts
     server.stt = stt
-    # MLX/Metal calls are serialized — one shared GPU, and concurrent generation
-    # from multiple requests can clash. A single agent calls these serially anyway.
-    server.infer_lock = threading.Lock()
+    server.executor = executor
 
     print(f"Voice API ready on http://0.0.0.0:{port}  "
           f"(POST /transcribe, POST /synthesize, GET /health)", flush=True)
