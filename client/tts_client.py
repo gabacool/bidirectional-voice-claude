@@ -16,6 +16,7 @@ import threading
 import time
 import wave
 from pathlib import Path
+from typing import Iterator
 
 import numpy as np
 import sounddevice as sd
@@ -195,22 +196,42 @@ class LocalTTS:
         self._model = load_model(self.model_name)
         print("TTS model loaded")
 
-    def synthesize_to_array(self, text: str) -> np.ndarray:
-        """Synthesize text and return the full mono float32 waveform at 24kHz.
+    def synthesize_stream(self, text: str, voice: str | None = None,
+                          streaming_interval: float | None = None
+                          ) -> Iterator[np.ndarray]:
+        """Yield mono float32 24kHz audio chunks AS THE MODEL GENERATES THEM.
 
-        No playback — used by the LAN voice API to hand raw audio back to a
-        remote caller. Reuses the same voice/temperature/speed config as
-        playback, just collected into one array instead of streamed to speakers.
+        This is the single generation code path: the model is driven in
+        streaming mode and each non-empty chunk is handed back immediately, with
+        no buffering and no concatenation, so the first audio is available long
+        before the full utterance finishes.
+
+        NOTE: the whole-array batch post-processing — inter-sentence silence
+        squeezing (``_squeeze_silence``) and the ``tts_speed`` time-stretch —
+        needs the complete waveform and is therefore applied ONLY by the batch
+        path (``synthesize_to_array``). This streaming path yields the RAW model
+        chunks unmodified.
+
+        Args:
+            text: Text to speak. Cleaned via ``_prepare_for_speech`` first; an
+                empty result yields no chunks.
+            voice: Speaker name to pass to the model. ``None`` uses the
+                configured default speaker (``tts_speaker``).
+            streaming_interval: Seconds of audio per chunk. ``None`` uses the
+                configured ``tts_streaming_interval``.
+
+        Yields:
+            1-D float32 numpy arrays of 24kHz mono audio, one per model chunk.
         """
         self._ensure_model()
 
         speech_text = _prepare_for_speech(text)
         if not speech_text:
-            return np.zeros(0, dtype=np.float32)
+            return
 
         kwargs = dict(
             text=speech_text,
-            speaker=self.speaker,
+            speaker=self.speaker if voice is None else voice,
             language=self.language,
             temperature=self.temperature,
             top_k=self.top_k,
@@ -218,16 +239,34 @@ class LocalTTS:
             repetition_penalty=self.repetition_penalty,
             max_tokens=self.max_tokens,
             stream=True,
-            streaming_interval=self.streaming_interval,
+            streaming_interval=(self.streaming_interval
+                                if streaming_interval is None
+                                else streaming_interval),
         )
         if self.instruct:
             kwargs['instruct'] = self.instruct
 
-        chunks = []
         for chunk in self._model.generate_custom_voice(**kwargs):
             audio_np = np.array(chunk.audio, dtype=np.float32)
             if audio_np.size == 0:
                 continue
+            yield audio_np
+
+    def synthesize_to_array(self, text: str) -> np.ndarray:
+        """Synthesize text and return the full mono float32 waveform at 24kHz.
+
+        No playback — used by the LAN voice API to hand raw audio back to a
+        remote caller. Reuses the same voice/temperature/speed config as
+        playback, just collected into one array instead of streamed to speakers.
+
+        Consumes ``synthesize_stream`` (the one generation code path) and then
+        applies the whole-array batch post-processing that only makes sense on
+        the complete waveform: the per-chunk ``tts_speed`` time-stretch and the
+        inter-sentence ``_squeeze_silence``. The streaming generator itself
+        yields raw chunks without either.
+        """
+        chunks = []
+        for audio_np in self.synthesize_stream(text):
             if self.speed != 1.0:
                 import librosa
                 audio_np = librosa.effects.time_stretch(
