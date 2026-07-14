@@ -14,7 +14,15 @@ Endpoints (bound to 0.0.0.0 — LAN only, no auth):
                      -> JSON {"text": "..."}      (Qwen3-ASR STT)
 
   POST /synthesize   JSON {"text": "..."}
-                     -> WAV bytes, 24kHz mono 16-bit   (Qwen3-TTS)
+                     -> WAV bytes, 24kHz mono 16-bit   (Qwen3-TTS, one blob)
+
+  POST /v1/audio/speech
+                     JSON {"input", "voice"?, "response_format": "wav"|"pcm",
+                     "model"? (ignored)} (OpenAI TTS shape)
+                     -> audio streamed progressively as the model generates
+                        (unknown-length body, Connection: close), 24kHz mono
+                        16-bit; "wav" prepends a streaming WAV header, "pcm" is
+                        raw 16-bit LE PCM
 
   GET  /health       -> "ok"
 
@@ -29,6 +37,7 @@ import io
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -47,6 +56,16 @@ DEFAULT_PORT = 9900
 TTS_SAMPLE_RATE = 24000
 STT_SAMPLE_RATE = 16000
 CONFIG_PATH = Path(__file__).parent / 'config.yaml'
+
+# Unknown-length sentinel for the streaming WAV header's RIFF + data size
+# fields: a progressive player starts immediately and reads PCM until the
+# socket closes; a saved header+chunks blob still parses (players/`wave` read
+# the real audio to EOF). 0xFFFFFFFF is the widely-accepted streaming sentinel.
+STREAMING_SIZE_SENTINEL = 0xFFFFFFFF
+# Seconds of audio per streamed TTS chunk. Smaller than the batch default so the
+# first audio byte reaches the client sooner (time-to-first-byte), at the cost
+# of slightly more chunks — the right trade for a latency-sensitive endpoint.
+SPEECH_STREAMING_INTERVAL = 0.5
 
 
 def load_config() -> dict:
@@ -117,15 +136,84 @@ def extract_upload(fields: dict, field_name: str) -> tuple[bytes | None, str | N
     return part[1], None
 
 
-def transcription_error_body(message: str, openai_shape: bool) -> dict:
+def error_body(message: str, openai_shape: bool) -> dict:
     """Wrap an error message in the route-appropriate JSON body.
 
-    ``openai_shape=True`` -> ``{"error": {"message": ...}}`` (OpenAI STT API);
-    ``openai_shape=False`` -> ``{"error": ...}`` (the legacy /transcribe shape).
+    ``openai_shape=True`` -> ``{"error": {"message": ...}}`` (the OpenAI
+    ``/v1/audio/*`` shape); ``openai_shape=False`` -> ``{"error": ...}`` (the
+    legacy ``/transcribe`` flat shape). Shared by every endpoint's error paths.
     """
     if openai_shape:
         return {"error": {"message": message}}
     return {"error": message}
+
+
+def f32_to_pcm16(arr: np.ndarray) -> bytes:
+    """Convert a mono float32 [-1, 1] waveform to 16-bit little-endian PCM bytes.
+
+    Samples are clipped to [-1, 1] before scaling so out-of-range values saturate
+    at full scale instead of wrapping. This is the single float32->PCM16
+    conversion used by both the batch WAV path and the streaming speech path.
+    """
+    clipped = np.clip(arr, -1.0, 1.0)
+    int16 = (clipped * 32767.0).astype('<i2')
+    return int16.tobytes()
+
+
+def wav_streaming_header(sample_rate: int = TTS_SAMPLE_RATE, channels: int = 1,
+                         bits_per_sample: int = 16) -> bytes:
+    """Build a 44-byte WAV header with unknown-length (streaming) size fields.
+
+    The RIFF chunk size and data chunk size are both set to
+    ``STREAMING_SIZE_SENTINEL`` so the header can be written before the total
+    audio length is known: progressive players start playing at once, and a
+    saved header+PCM blob still parses (readers take the real length from EOF).
+    """
+    byte_rate = sample_rate * channels * bits_per_sample // 8
+    block_align = channels * bits_per_sample // 8
+    return b''.join([
+        b'RIFF',
+        struct.pack('<I', STREAMING_SIZE_SENTINEL),
+        b'WAVE',
+        b'fmt ',
+        struct.pack('<I', 16),              # fmt subchunk size (PCM)
+        struct.pack('<H', 1),               # audio format 1 = PCM
+        struct.pack('<H', channels),
+        struct.pack('<I', sample_rate),
+        struct.pack('<I', byte_rate),
+        struct.pack('<H', block_align),
+        struct.pack('<H', bits_per_sample),
+        b'data',
+        struct.pack('<I', STREAMING_SIZE_SENTINEL),
+    ])
+
+
+def parse_speech_request(body: bytes) -> tuple[dict | None, str | None]:
+    """Validate a ``/v1/audio/speech`` JSON body without doing any synthesis.
+
+    Returns ``(params, None)`` where ``params`` is
+    ``{"input", "voice", "response_format"}`` on success, or ``(None, message)``
+    with a client-facing error message. ``model`` is accepted and ignored;
+    ``voice=None`` means the configured default speaker. Pure/testable so request
+    validation runs without loading models or a socket.
+    """
+    try:
+        data = json.loads(body or b'{}')
+    except (json.JSONDecodeError, ValueError):
+        return None, "body must be valid JSON"
+    if not isinstance(data, dict):
+        return None, "body must be a JSON object"
+    raw_input = data.get('input')
+    text = raw_input.strip() if isinstance(raw_input, str) else ''
+    if not text:
+        return None, "missing required 'input' field"
+    response_format = data.get('response_format', 'wav')
+    if response_format not in ('wav', 'pcm'):
+        return None, "response_format must be 'wav' or 'pcm'"
+    voice = data.get('voice')
+    if voice is not None and not isinstance(voice, str):
+        return None, "voice must be a string"
+    return {"input": text, "voice": voice, "response_format": response_format}, None
 
 
 def decode_to_wav16k(raw: bytes) -> str:
@@ -153,15 +241,13 @@ def decode_to_wav16k(raw: bytes) -> str:
 
 
 def pcm_to_wav_bytes(audio_float32: np.ndarray, sample_rate: int) -> bytes:
-    """Pack a mono float32 [-1,1] waveform into 16-bit PCM WAV bytes."""
-    clipped = np.clip(audio_float32, -1.0, 1.0)
-    int16 = (clipped * 32767.0).astype('<i2')
+    """Pack a mono float32 [-1,1] waveform into a complete 16-bit PCM WAV blob."""
     buf = io.BytesIO()
     with wave.open(buf, 'wb') as wav_file:
         wav_file.setnchannels(1)
         wav_file.setsampwidth(2)
         wav_file.setframerate(sample_rate)
-        wav_file.writeframes(int16.tobytes())
+        wav_file.writeframes(f32_to_pcm16(audio_float32))
     return buf.getvalue()
 
 
@@ -180,6 +266,8 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             self._handle_openai_transcribe()
         elif self.path == '/synthesize':
             self._handle_synthesize()
+        elif self.path == '/v1/audio/speech':
+            self._handle_speech()
         else:
             self._respond_json(404, {"error": "not found"})
 
@@ -200,7 +288,7 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
         """Shared decode+transcribe flow for both STT routes.
 
         Parameterized only by the multipart file field name and the error body
-        shape (see ``transcription_error_body``). Success is identical for both
+        shape (see ``error_body``). Success is identical for both
         routes: HTTP 200, ``{"text": "..."}``.
         """
         body = self._read_body()
@@ -213,7 +301,7 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             else:
                 # Legacy collapses missing+empty into one message (unchanged).
                 message = f"no '{field_name}' file in multipart body"
-            self._respond_json(400, transcription_error_body(message, openai_shape))
+            self._respond_json(400, error_body(message, openai_shape))
             return
 
         # Optional OpenAI form fields are accepted and ignored (logged once).
@@ -228,7 +316,7 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
         try:
             wav_path = decode_to_wav16k(audio_bytes)
         except Exception as e:
-            self._respond_json(400, transcription_error_body(str(e), openai_shape))
+            self._respond_json(400, error_body(str(e), openai_shape))
             return
 
         try:
@@ -237,7 +325,7 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             self._respond_json(200, {"text": text})
         except Exception as e:
             print(f"[transcribe error] {e}", file=sys.stderr, flush=True)
-            self._respond_json(500, transcription_error_body(str(e), openai_shape))
+            self._respond_json(500, error_body(str(e), openai_shape))
         finally:
             try:
                 os.unlink(wav_path)
@@ -274,6 +362,82 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(wav)))
         self.end_headers()
         self.wfile.write(wav)
+
+    def _handle_speech(self) -> None:
+        """OpenAI-compatible ``/v1/audio/speech`` — stream TTS audio progressively.
+
+        The response body is delivered with no Content-Length and
+        ``Connection: close`` (HTTP/1.0 unknown-length semantics): the first
+        bytes hit the wire as soon as the first model chunk exists, and the
+        client reads until the socket closes. All validation happens *before* any
+        audio byte is sent so those failures can still be a proper 400; once
+        bytes are on the wire a mid-stream failure can only close the connection.
+        """
+        body = self._read_body()
+        params, err = parse_speech_request(body)
+        if err is not None:
+            self._respond_json(400, error_body(err, openai_shape=True))
+            return
+
+        text = params['input']
+        voice = params['voice']
+        fmt = params['response_format']
+
+        # Hold the shared inference lock for the whole generation, released via
+        # finally even if the client disconnects or generation raises.
+        self.server.infer_lock.acquire()
+        try:
+            stream = self.server.tts.synthesize_stream(
+                text, voice=voice, streaming_interval=SPEECH_STREAMING_INTERVAL)
+
+            # Pull the first chunk while no bytes are on the wire yet, so an
+            # up-front generation failure (e.g. unknown voice) or empty-after-
+            # cleanup text still becomes a clean 400 instead of a broken stream.
+            first = None
+            try:
+                for chunk in stream:
+                    first = chunk
+                    break
+            except Exception as e:
+                print(f"[speech] generation failed before audio: {e}",
+                      file=sys.stderr, flush=True)
+                self._respond_json(
+                    400, error_body(f"speech generation failed: {e}",
+                                    openai_shape=True))
+                return
+            if first is None:
+                self._respond_json(
+                    400, error_body("no speakable text after cleanup",
+                                    openai_shape=True))
+                return
+
+            # Commit to a streaming 200: unknown length, close on completion.
+            self.send_response(200)
+            self.send_header('Content-Type',
+                             'audio/wav' if fmt == 'wav' else 'audio/pcm')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            self.close_connection = True
+
+            try:
+                if fmt == 'wav':
+                    self.wfile.write(wav_streaming_header())
+                self.wfile.write(f32_to_pcm16(first))
+                self.wfile.flush()
+                for chunk in stream:
+                    self.wfile.write(f32_to_pcm16(chunk))
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError) as e:
+                # Client hung up mid-stream: not an error, just stop writing.
+                print(f"[speech] client disconnected mid-stream: {e}",
+                      file=sys.stderr, flush=True)
+            except Exception as e:
+                # Generation failed after audio was already sent — a 400 is no
+                # longer possible; log and let the connection close.
+                print(f"[speech] generation error mid-stream: {e}",
+                      file=sys.stderr, flush=True)
+        finally:
+            self.server.infer_lock.release()
 
     def _respond_text(self, code: int, body: str):
         payload = body.encode()
