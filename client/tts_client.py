@@ -187,6 +187,55 @@ class LocalTTS:
         # Cap the model's inter-sentence silences to this many seconds (0 = off).
         self.max_pause = config.get('tts_max_pause_seconds', 0.2)
 
+    def _generation_kwargs(self, text: str, voice: str | None = None,
+                           streaming_interval: float | None = None) -> dict | None:
+        """Build the model generation arguments for ``text``. The ONE source.
+
+        Every synthesis path goes through here so none can drift: previously the
+        runaway token budget below lived inline in ``synthesize_stream`` only,
+        which let ``synthesize_and_play`` pass the configured ceiling to the
+        model unclamped.
+
+        Args:
+            text: Text to speak. Cleaned via ``_prepare_for_speech``.
+            voice: Speaker override. ``None`` uses the configured ``tts_speaker``.
+            streaming_interval: Chunk size override in seconds. ``None`` uses the
+                configured ``tts_streaming_interval``.
+
+        Returns:
+            The kwargs for ``generate_custom_voice``, or ``None`` when the text
+            is empty after cleanup (nothing to speak — skip the generation).
+        """
+        speech_text = _prepare_for_speech(text)
+        if not speech_text:
+            return None
+
+        # Proportional token budget as a runaway backstop: the model's known
+        # failure mode is missing EOS and re-speaking the utterance (see
+        # tts_repetition_penalty in config — the primary fix). At ~12 codec
+        # tokens/sec, budget ~4x a generous speech-duration estimate so normal
+        # renditions never truncate but a full second rendition cannot finish.
+        # Derived from the CLEANED text so markup cannot inflate the window.
+        est_seconds = max(8.0, len(speech_text) / 6.0)
+
+        kwargs = dict(
+            text=speech_text,
+            speaker=self.speaker if voice is None else voice,
+            language=self.language,
+            temperature=self.temperature,
+            top_k=self.top_k,
+            top_p=self.top_p,
+            repetition_penalty=self.repetition_penalty,
+            max_tokens=min(self.max_tokens, int(12 * est_seconds * 4)),
+            stream=True,
+            streaming_interval=(self.streaming_interval
+                                if streaming_interval is None
+                                else streaming_interval),
+        )
+        if self.instruct:
+            kwargs['instruct'] = self.instruct
+        return kwargs
+
     def _ensure_model(self):
         """Lazy-load the TTS model on first use."""
         if self._model is not None:
@@ -225,34 +274,10 @@ class LocalTTS:
         """
         self._ensure_model()
 
-        speech_text = _prepare_for_speech(text)
-        if not speech_text:
+        kwargs = self._generation_kwargs(text, voice=voice,
+                                         streaming_interval=streaming_interval)
+        if kwargs is None:
             return
-
-        # Proportional token budget as a runaway backstop: the model's known
-        # failure mode is missing EOS and re-speaking the utterance (see
-        # tts_repetition_penalty in config — the primary fix). At 12 codec
-        # tokens/sec, budget ~4x a generous speech-duration estimate so normal
-        # renditions never truncate but a full second rendition cannot finish.
-        est_seconds = max(8.0, len(speech_text) / 6.0)
-        max_tokens = min(self.max_tokens, int(12 * est_seconds * 4))
-
-        kwargs = dict(
-            text=speech_text,
-            speaker=self.speaker if voice is None else voice,
-            language=self.language,
-            temperature=self.temperature,
-            top_k=self.top_k,
-            top_p=self.top_p,
-            repetition_penalty=self.repetition_penalty,
-            max_tokens=max_tokens,
-            stream=True,
-            streaming_interval=(self.streaming_interval
-                                if streaming_interval is None
-                                else streaming_interval),
-        )
-        if self.instruct:
-            kwargs['instruct'] = self.instruct
 
         for chunk in self._model.generate_custom_voice(**kwargs):
             audio_np = np.array(chunk.audio, dtype=np.float32)
@@ -301,27 +326,12 @@ class LocalTTS:
         """
         self._ensure_model()
 
-        speech_text = _prepare_for_speech(text)
-        if not speech_text:
+        kwargs = self._generation_kwargs(text)
+        if kwargs is None:
             print("No text to speak after cleanup")
             return
 
-        print(f"Speaking: {speech_text[:100]}...")
-
-        kwargs = dict(
-            text=speech_text,
-            speaker=self.speaker,
-            language=self.language,
-            temperature=self.temperature,
-            top_k=self.top_k,
-            top_p=self.top_p,
-            repetition_penalty=self.repetition_penalty,
-            max_tokens=self.max_tokens,
-            stream=True,
-            streaming_interval=self.streaming_interval,
-        )
-        if self.instruct:
-            kwargs['instruct'] = self.instruct
+        print(f"Speaking: {kwargs['text'][:100]}...")
 
         tape = AudioTape()
         gen_error = [None]
