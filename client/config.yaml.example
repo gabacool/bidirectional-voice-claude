@@ -17,9 +17,8 @@ origin:
 # Local backend - Apple Silicon (MLX)
 # First run downloads models automatically from HuggingFace
 local:
-  # STT (speech-to-text)
-  stt_model: "mlx-community/parakeet-tdt-0.6b-v3"   # 600M, best accuracy
-  # stt_model: "mlx-community/parakeet-tdt_ctc-110m" # 110M, lightweight
+  # STT (speech-to-text) - Qwen3-ASR via mlx-qwen3-asr
+  stt_model: "Qwen/Qwen3-ASR-0.6B"
 
   # TTS (text-to-speech) - Qwen3-TTS via mlx-audio
   tts_model: "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit"
@@ -27,18 +26,32 @@ local:
   # tts_model: "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit"   # ~2x faster
   # tts_model: "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit"   # smaller model, faster
   # tts_model: "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit"   # fastest
-  tts_speaker: "aiden"              # aiden, ryan, serena, vivian, dylan, eric, uncle_fu
+  tts_speaker: "aiden"              # aiden, ryan, serena, vivian, dylan, eric, uncle_fu,
+                                    # ono_anna (japanese), sohee (korean)
   tts_language: "english"           # auto, english, chinese, german, french, spanish, italian, portuguese, japanese, korean, russian
-  tts_instruct: null                # Emotion/style instruction, e.g. "excited", "calm and professional", "whispering"
-  tts_temperature: 0.9              # Randomness. Keep 0.7-1.0; below ~0.5 this model collapses to silence after the first word
+  tts_instruct: "calm, consistent conversational tone"  # Emotion/style anchor, e.g. "excited",
+                                    # "whispering". Keep it a real style description: a placeholder
+                                    # word invites the model to improvise tone per generation.
+  tts_temperature: 0.7              # Randomness. Keep 0.7-1.0; below ~0.5 this model collapses to
+                                    # silence after the first word. 0.7 holds tone steady across the
+                                    # per-sentence generations voice mode makes (0.9 varied audibly).
   tts_top_k: 50                     # Token sampling pool size
   tts_top_p: 1.0                    # Nucleus sampling threshold (0.0-1.0)
-  tts_repetition_penalty: 1.1     # Token-loop protection (upstream default 1.05). Requires mlx-audio>=0.4.5
-                                    # for correct EOS behavior (0.3.x intermittently re-spoke whole utterances).
-  tts_max_tokens: 4096              # Maximum generation length
+  tts_repetition_penalty: 1.1       # Token-loop protection (upstream default 1.05). Does NOT fix the
+                                    # intermittent whole-utterance re-generation — that was an
+                                    # mlx-audio 0.3.x bug, fixed by mlx-audio>=0.4.5.
+  tts_max_tokens: 4096              # Max codec tokens for ONE utterance = the runaway backstop.
+                                    # 12.5 tokens/sec of audio, so 4096 ~= 5.5 min. Raise it only if a
+                                    # single utterance is truly longer. HARD CEILING is the talker's
+                                    # max_position_embeddings (32768), shared with the text prompt —
+                                    # never set at or above it.
   tts_streaming_interval: 2.0       # Seconds of audio per chunk (lower = faster first sound)
   tts_speed: 1.0                    # Playback speed, pitch preserved (1.0 normal, 1.5 faster, 0.8 slower)
   tts_seek_seconds: 15              # Rewind/forward step for Option+< / Option+> while speaking
+  tts_max_pause_seconds: 0.2        # Cap the model's inter-sentence silence, in seconds (0 = off).
+                                    # Batch path only — the streaming path yields raw model chunks.
 
   # LAN voice API (voice_api.py) — STT/TTS over HTTP for remote agents
-  voice_api_port: 9900              # POST /transcribe (audio->text), POST /synthesize (text->WAV)
+  voice_api_port: 9900              # OpenAI-compatible: POST /v1/audio/transcriptions (audio->text),
+                                    # POST /v1/audio/speech (text->streaming pcm/wav).
+                                    # Legacy: POST /transcribe, POST /synthesize (text->whole WAV).
