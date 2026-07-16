@@ -125,7 +125,22 @@ def main() -> int:
     ap.add_argument("--threshold", type=float, default=None)
     ap.add_argument("--debug", action="store_true", help="print live RMS while listening")
     ap.add_argument("--quiet-tools", action="store_true", help="no spoken tool cue")
+    ap.add_argument("--cwd", type=str, default=None,
+                    help="working directory for the agent session (any agent)")
+    resume_group = ap.add_mutually_exclusive_group()
+    resume_group.add_argument(
+        "--continue", dest="continue_", action="store_true",
+        help="claude only: resume the most recent session in --cwd",
+    )
+    resume_group.add_argument(
+        "--resume", metavar="SESSION_ID", default=None,
+        help="claude only: resume a specific Claude Code session by id",
+    )
     args = ap.parse_args()
+
+    if args.cwd is not None and not os.path.isdir(os.path.expanduser(args.cwd)):
+        print(f"--cwd is not a directory: {args.cwd}")
+        return 2
 
     cfg = load_config()
     if args.voice:
@@ -142,14 +157,17 @@ def main() -> int:
 
     if args.agent == "claude":
         from agent_voice.backends.claude_code import ClaudeBackend
-        backend = ClaudeBackend()
+        backend = ClaudeBackend(cwd=args.cwd, resume=args.resume, continue_=args.continue_)
     else:
+        if args.continue_ or args.resume:
+            print("session resume is claude-only")
+            return 2
         try:
             from agent_voice.backends.hermes_acp import HermesBackend
         except ImportError:
             print("the hermes backend is not available yet (ships in a later PR); use --agent claude")
             return 2
-        backend = HermesBackend()
+        backend = HermesBackend(cwd=args.cwd)
     try:
         backend.start()
     except (RuntimeError, OSError) as err:

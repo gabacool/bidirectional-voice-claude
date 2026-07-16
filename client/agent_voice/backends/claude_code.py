@@ -63,9 +63,19 @@ def parse_claude_line(line: str) -> list[AgentEvent]:
 class ClaudeBackend(AgentBackend):
     """One long-lived `claude -p` process per voice session."""
 
-    def __init__(self, claude_bin: str = "~/.local/bin/claude", cwd: str | None = None) -> None:
+    def __init__(
+        self,
+        claude_bin: str = "~/.local/bin/claude",
+        cwd: str | None = None,
+        resume: str | None = None,
+        continue_: bool = False,
+    ) -> None:
+        if resume and continue_:
+            raise ValueError("resume and continue_ are mutually exclusive")
         self._bin = os.path.expanduser(claude_bin)
         self._cwd = cwd or os.path.expanduser("~")
+        self._resume = resume
+        self._continue = continue_
         self._proc: subprocess.Popen | None = None
         self._events: queue.Queue = queue.Queue()
         self._session_id = ""
@@ -75,7 +85,7 @@ class ClaudeBackend(AgentBackend):
         self._turn_done = threading.Event()
         self._turn_done.set()   # no turn in flight initially
 
-    def _spawn(self, resume: str | None = None) -> None:
+    def _spawn(self, resume: str | None = None, continue_: bool = False) -> None:
         cmd = [
             self._bin, "-p",
             "--input-format", "stream-json",
@@ -87,6 +97,12 @@ class ClaudeBackend(AgentBackend):
         ]
         if resume:
             cmd.extend(["--resume", resume])
+        elif continue_:
+            # `-c` reattaches the most recent session in this cwd. Live-verified
+            # in -p mode: recalls prior context and re-emits the SAME session_id
+            # on init, so the interrupt-fallback respawn (which --resumes that id)
+            # stays on the same conversation.
+            cmd.append("-c")
         try:
             self._proc = subprocess.Popen(
                 cmd, cwd=self._cwd,
@@ -108,7 +124,7 @@ class ClaudeBackend(AgentBackend):
                 self._stderr_lines.append(line)
 
     def start(self) -> None:
-        self._spawn()
+        self._spawn(resume=self._resume, continue_=self._continue)
         if self._proc is None or self._proc.poll() is not None:
             raise RuntimeError("claude process failed to start")
 
