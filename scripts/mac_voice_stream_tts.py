@@ -133,11 +133,18 @@ def _stream_play(text):
         return False
     with resp, sd.OutputStream(samplerate=SR, channels=1, dtype="int16") as out:
         try:
+            carry = b""   # an odd-length read is half an int16 sample: carry the byte
             while not _stop.is_set():
                 b = resp.read(4800)   # 0.1s blocks so SIGTERM stops fast
                 if not b:
                     break
-                out.write(np.frombuffer(b, dtype="<i2"))
+                b = carry + b
+                if len(b) % 2:
+                    carry, b = b[-1:], b[:-1]
+                else:
+                    carry = b""
+                if b:
+                    out.write(np.frombuffer(b, dtype="<i2"))
         except Exception as e:
             sys.stderr.write(f"stream aborted mid-play: {e}\n")
     return True
