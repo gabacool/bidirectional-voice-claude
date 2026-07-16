@@ -132,7 +132,8 @@ def main() -> int:
     ap.add_argument("--threshold", type=float, default=None)
     ap.add_argument("--debug", action="store_true", help="print live RMS while listening")
     ap.add_argument("--quiet-tools", action="store_true", help="no spoken tool cue")
-    ap.add_argument("--no-cue", action="store_true", help="no beep when the mic re-arms")
+    ap.add_argument("--cue", action="store_true",
+                    help="play a short beep when the mic re-arms (default: silent)")
     ap.add_argument("--cwd", type=str, default=None,
                     help="working directory for the agent session "
                          "(default: the directory you launch from, like `claude`)")
@@ -198,9 +199,9 @@ def main() -> int:
         out_stream.write(np.frombuffer(chunk, dtype="<i2"))
 
     def rearm() -> None:
-        """Signal the mic is live again: indicator (always) + beep (unless --no-cue)."""
+        """Signal the mic is live again: indicator (always) + beep (opt-in --cue)."""
         print("\n[listening]", flush=True)
-        if not args.no_cue:
+        if args.cue:
             out_stream.write(np.frombuffer(BEEP, dtype="<i2"))
 
     player = Player(
