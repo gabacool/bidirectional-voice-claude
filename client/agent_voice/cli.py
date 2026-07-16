@@ -43,26 +43,45 @@ DEFAULTS: dict = {
 }
 
 
+def merge_voice_config(defaults: dict, section: dict) -> tuple[dict, list[str]]:
+    """Merge a voice_chat config section over defaults, type-checked per key.
+
+    String-typed defaults (and None, meaning optional string) accept non-empty
+    strings; numeric defaults accept int/float (bool excluded). Returns the
+    merged config and a list of warnings for ignored keys/values.
+    """
+    cfg = dict(defaults)
+    warnings: list[str] = []
+    for k, v in section.items():
+        if k not in defaults:
+            warnings.append(f"ignoring unknown voice_chat key: {k}")
+            continue
+        default = defaults[k]
+        if default is None or isinstance(default, str):
+            if isinstance(v, str) and v:
+                cfg[k] = v
+            elif v is not None:
+                warnings.append(
+                    f"ignoring voice_chat.{k}: expected string, got {type(v).__name__}"
+                )
+        elif isinstance(v, (int, float)) and not isinstance(v, bool):
+            cfg[k] = v
+        else:
+            warnings.append(
+                f"ignoring voice_chat.{k}: expected number, got {type(v).__name__}"
+            )
+    return cfg, warnings
+
+
 def load_config() -> dict:
-    cfg = dict(DEFAULTS)
     path = Path(__file__).resolve().parent.parent / "config.yaml"
+    section: dict = {}
     if path.exists():
         with open(path, encoding="utf-8") as f:
             section = (yaml.safe_load(f) or {}).get("voice_chat") or {}
-        for k, v in section.items():
-            if k not in DEFAULTS:
-                print(f"[config] ignoring unknown voice_chat key: {k}")
-                continue
-            default = DEFAULTS[k]
-            if default is None:
-                if isinstance(v, str) and v:
-                    cfg[k] = v
-                elif v is not None:
-                    print(f"[config] ignoring voice_chat.{k}: expected string, got {type(v).__name__}")
-            elif isinstance(v, (int, float)) and not isinstance(v, bool):
-                cfg[k] = v
-            else:
-                print(f"[config] ignoring voice_chat.{k}: expected number, got {type(v).__name__}")
+    cfg, warnings = merge_voice_config(DEFAULTS, section)
+    for w in warnings:
+        print(f"[config] {w}")
     return cfg
 
 
