@@ -3,12 +3,13 @@
 import json
 from pathlib import Path
 
+from agent_voice.backends.base import AgentEvent
 from agent_voice.backends.claude_code import parse_claude_line
 
 FIXTURE = Path(__file__).parent / "fixtures" / "claude_stream_session.jsonl"
 
 
-def load_events() -> list:
+def load_events() -> list[AgentEvent]:
     events = []
     for line in FIXTURE.read_text().splitlines():
         events.extend(parse_claude_line(line))
@@ -59,3 +60,23 @@ def test_garbage_and_blank_lines_yield_nothing() -> None:
     assert parse_claude_line("   ") == []
     assert parse_claude_line("not json at all") == []
     assert parse_claude_line('{"type":"control_response","response":{}}') == []
+
+
+def test_valid_json_that_is_not_an_object_yields_nothing() -> None:
+    # parse_claude_line must never raise: valid JSON scalars/arrays are not dicts.
+    assert parse_claude_line("42") == []
+    assert parse_claude_line("[]") == []
+    assert parse_claude_line("true") == []
+    assert parse_claude_line("null") == []
+    assert parse_claude_line('"hi"') == []
+
+
+def test_nested_nulls_yield_nothing() -> None:
+    # Explicit nulls on the nested access chain must not crash the parser.
+    assert parse_claude_line('{"type":"stream_event","event":null}') == []
+    assert parse_claude_line(
+        '{"type":"stream_event","event":{"type":"content_block_delta","delta":null}}'
+    ) == []
+    assert parse_claude_line(
+        '{"type":"stream_event","event":{"type":"content_block_start","content_block":null}}'
+    ) == []

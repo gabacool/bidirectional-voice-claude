@@ -22,19 +22,21 @@ def parse_claude_line(line: str) -> list[AgentEvent]:
         obj = json.loads(line)
     except ValueError:
         return []
+    if not isinstance(obj, dict):
+        return []   # valid JSON that isn't an object (42, [], true, "hi")
     t = obj.get("type")
 
     if t == "system" and obj.get("subtype") == "init":
         return [AgentEvent("init", obj.get("session_id", ""))]
 
     if t == "stream_event":
-        ev = obj.get("event", {})
+        ev = obj.get("event") or {}
         if ev.get("type") == "content_block_delta":
-            delta = ev.get("delta", {})
+            delta = ev.get("delta") or {}
             if delta.get("type") == "text_delta" and delta.get("text"):
                 return [AgentEvent("delta", delta["text"])]
         elif ev.get("type") == "content_block_start":
-            block = ev.get("content_block", {})
+            block = ev.get("content_block") or {}
             if block.get("type") == "tool_use":
                 return [AgentEvent("tool", block.get("name", "tool"))]
         return []
