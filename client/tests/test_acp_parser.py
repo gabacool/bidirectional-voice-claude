@@ -63,3 +63,36 @@ def test_error_response_is_fatal() -> None:
            "error": {"code": -32000, "message": "boom"}}
     events = parse_acp_message(obj, PROMPT_ID)
     assert [e.kind for e in events] == ["fatal"]
+
+
+def test_error_field_null_or_string_is_still_fatal() -> None:
+    # error present but null -> fatal with a sensible fallback message.
+    null_err = {"jsonrpc": "2.0", "id": PROMPT_ID, "error": None}
+    events = parse_acp_message(null_err, PROMPT_ID)
+    assert [e.kind for e in events] == ["fatal"]
+    assert events[0].text == "ACP error"
+    # error present as a bare string -> fatal carrying that string.
+    str_err = {"jsonrpc": "2.0", "id": PROMPT_ID, "error": "boom"}
+    events = parse_acp_message(str_err, PROMPT_ID)
+    assert [e.kind for e in events] == ["fatal"]
+    assert events[0].text == "boom"
+
+
+def test_malformed_update_shapes_never_raise() -> None:
+    # params null, update null, update wrong-typed — all yield nothing, no raise.
+    assert parse_acp_message(
+        {"jsonrpc": "2.0", "method": "session/update", "params": None}, PROMPT_ID) == []
+    assert parse_acp_message(
+        {"jsonrpc": "2.0", "method": "session/update",
+         "params": {"update": None}}, PROMPT_ID) == []
+    assert parse_acp_message(
+        {"jsonrpc": "2.0", "method": "session/update",
+         "params": {"update": "garbage"}}, PROMPT_ID) == []
+    # agent_message_chunk with a non-dict content -> no delta.
+    assert parse_acp_message(
+        {"jsonrpc": "2.0", "method": "session/update",
+         "params": {"update": {"sessionUpdate": "agent_message_chunk",
+                               "content": "oops"}}}, PROMPT_ID) == []
+    # Non-dict top-level message (the reader guards this by construction; the
+    # pure parser mirrors that guard for its own contract).
+    assert parse_acp_message([], PROMPT_ID) == []  # type: ignore[arg-type]
