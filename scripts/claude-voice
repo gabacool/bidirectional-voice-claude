@@ -1,0 +1,3 @@
+#!/bin/zsh
+PYTHONPATH=/Users/gabagool/Git/nvidia_parakeet/client \
+exec /Users/gabagool/Git/nvidia_parakeet/venv/bin/python -m agent_voice.cli --agent claude "$@"
