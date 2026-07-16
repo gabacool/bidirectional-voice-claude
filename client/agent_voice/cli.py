@@ -25,11 +25,18 @@ from agent_voice.chunker import SentenceChunker, SentenceGrouper
 from agent_voice.loop import consume_turn
 from agent_voice.net import VoiceService
 from agent_voice.player import Player
-from agent_voice.vad import VadStateMachine
+from agent_voice.vad import SilenceGate, VadStateMachine
 
 MIC_SR = 16000
 TTS_SR = 24000
 BLOCK = 1600   # 0.1 s mic blocks
+
+# 50 ms, 880 Hz, low-volume re-arm cue. With no AEC the mic hears it, but 50 ms
+# is well under the VAD's speech-confirm so it reads as a blip; if it trips the
+# gate, the 300 ms quiet requirement just delays opening slightly. Accepted.
+BEEP = (
+    0.12 * np.sin(2 * np.pi * 880 * np.arange(int(0.05 * TTS_SR)) / TTS_SR) * 32767
+).astype("<i2").tobytes()
 
 DEFAULTS: dict = {
     "endpoint": "http://127.0.0.1:9900",
@@ -125,6 +132,7 @@ def main() -> int:
     ap.add_argument("--threshold", type=float, default=None)
     ap.add_argument("--debug", action="store_true", help="print live RMS while listening")
     ap.add_argument("--quiet-tools", action="store_true", help="no spoken tool cue")
+    ap.add_argument("--no-cue", action="store_true", help="no beep when the mic re-arms")
     ap.add_argument("--cwd", type=str, default=None,
                     help="working directory for the agent session "
                          "(default: the directory you launch from, like `claude`)")
@@ -189,6 +197,12 @@ def main() -> int:
     def write_pcm(chunk: bytes) -> None:
         out_stream.write(np.frombuffer(chunk, dtype="<i2"))
 
+    def rearm() -> None:
+        """Signal the mic is live again: indicator (always) + beep (unless --no-cue)."""
+        print("\n[listening]", flush=True)
+        if not args.no_cue:
+            out_stream.write(np.frombuffer(BEEP, dtype="<i2"))
+
     player = Player(
         fetch_pcm=lambda text: svc.stream_tts(text, voice=cfg["voice"]),
         write_pcm=write_pcm,
@@ -202,6 +216,8 @@ def main() -> int:
         silence_confirm_ms=cfg["silence_confirm_ms"],
         max_utterance_ms=cfg["max_utterance_ms"],
     )
+    # Same --threshold override flows in (cfg["rms_threshold"] already merged).
+    gate = SilenceGate(cfg["rms_threshold"], quiet_ms=300)
     chunker = SentenceChunker()
     grouper = SentenceGrouper(per_call=cfg["sentences_per_call"])
 
@@ -221,9 +237,11 @@ def main() -> int:
 
     events = backend.events()
     print(f"agent-voice ({args.agent}) ready — speak, Enter interrupts, Ctrl+C exits.")
+    rearm()   # first-ever listen gets the indicator + beep too
 
     with Keyboard() as kb:
         capture: list[np.ndarray] = []
+        hinted = False
         try:
             while not kb.exit.is_set():
                 kb.interrupt.clear()   # Enter while listening is a no-op
@@ -235,7 +253,15 @@ def main() -> int:
                 rms = float(np.sqrt(np.mean(block * block))) if block.size else 0.0
                 if args.debug and vad.state == "idle":
                     print(f"\rRMS {rms:.4f}  (threshold {cfg['rms_threshold']})", end="")
-                event = vad.feed(rms, time.monotonic() * 1000)
+                now_ms = time.monotonic() * 1000
+                # Discard stale audio chopped by the muted-mic window: while the
+                # gate is closed, do not feed the VAD or capture the block.
+                if not gate.feed(rms, now_ms):
+                    if gate.tripped and not hinted:
+                        print("\n[you started before I was listening — say that again]")
+                        hinted = True
+                    continue
+                event = vad.feed(rms, now_ms)
                 if vad.state != "idle":
                     capture.append(block)   # buffer from the threshold crossing
                 elif event is None:
@@ -290,10 +316,14 @@ def main() -> int:
                         time.sleep(0.05)
                     print()
 
-                # Mic was muted the whole turn: discard everything captured.
+                # Mic was muted the whole turn: discard everything captured, then
+                # re-arm: reset VAD + gate, print the indicator, play the beep.
                 while not audio_q.empty():
                     audio_q.get_nowait()
                 vad.reset()
+                gate.reset()
+                hinted = False
+                rearm()
         except KeyboardInterrupt:
             kb.exit.set()   # stop the reader thread; single shutdown flag
         finally:
