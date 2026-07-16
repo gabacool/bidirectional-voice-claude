@@ -1,6 +1,6 @@
 """VAD state machine unit tests (pure, synthetic timelines)."""
 
-from agent_voice.vad import VadStateMachine
+from agent_voice.vad import SilenceGate, VadStateMachine
 
 
 def make() -> VadStateMachine:
@@ -88,3 +88,38 @@ def test_reset_clears_clocks_and_accepts_fresh_timeline() -> None:
     assert v.state == "idle"
     v.feed(0.02, 10)                         # much earlier timestamp OK after reset
     assert v.feed(0.02, 310) == "speech_start"
+
+
+def test_gate_opens_immediately_when_first_sample_is_quiet() -> None:
+    g = SilenceGate(rms_threshold=0.015, quiet_ms=300)
+    assert g.feed(0.001, 0) is True
+    assert g.tripped is False
+
+
+def test_gate_holds_while_mid_sentence_then_opens_after_quiet() -> None:
+    g = SilenceGate(rms_threshold=0.015, quiet_ms=300)
+    assert g.feed(0.02, 0) is False        # user already talking: chopped speech
+    assert g.feed(0.02, 100) is False
+    assert g.tripped is True
+    assert g.feed(0.001, 200) is False     # quiet begins
+    assert g.feed(0.001, 400) is False     # 200ms quiet: not yet
+    assert g.feed(0.001, 500) is True      # 300ms continuous quiet: open
+    assert g.feed(0.02, 600) is True       # once open, stays open (fresh speech is legit)
+
+
+def test_gate_quiet_run_resets_on_speech_blip() -> None:
+    g = SilenceGate(rms_threshold=0.015, quiet_ms=300)
+    g.feed(0.02, 0)
+    g.feed(0.001, 100)                     # quiet run starts
+    g.feed(0.02, 250)                      # still talking: run resets
+    assert g.feed(0.001, 300) is False
+    assert g.feed(0.001, 550) is False     # only 250ms since new quiet start
+    assert g.feed(0.001, 600) is True
+
+
+def test_gate_reset_rearms() -> None:
+    g = SilenceGate(rms_threshold=0.015, quiet_ms=300)
+    g.feed(0.001, 0)
+    g.reset()
+    assert g.feed(0.02, 1000) is False     # closed again after reset
+    assert g.tripped is True
