@@ -24,6 +24,26 @@ def test_encode_wav_roundtrip() -> None:
     assert np.allclose(decoded, np.clip(audio, -1.0, 32767 / 32768), atol=1e-3)
 
 
+def test_even_chunks_carries_odd_tail_across_reads() -> None:
+    from agent_voice.net import _even_chunks
+
+    class FakeReader:
+        def __init__(self, pieces: list[bytes]) -> None:
+            self._pieces = pieces
+
+        def read(self, n: int) -> bytes:
+            return self._pieces.pop(0) if self._pieces else b""
+
+    # Odd-length reads must never surface: the tail byte carries forward.
+    out = list(_even_chunks(FakeReader([b"abc", b"de", b"f"]), 4800))
+    assert all(len(c) % 2 == 0 for c in out)
+    assert b"".join(out) == b"abcdef"
+
+    # A truncated final sample (lone trailing byte) is dropped, not yielded.
+    out = list(_even_chunks(FakeReader([b"abc"]), 4800))
+    assert b"".join(out) == b"ab"
+
+
 def test_multipart_wav_shape() -> None:
     body, ctype = multipart_wav("file", "u.wav", b"RIFFxxxx")
     assert ctype.startswith("multipart/form-data; boundary=")

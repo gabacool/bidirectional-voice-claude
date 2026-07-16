@@ -77,8 +77,29 @@ class VoiceService:
             headers={"Content-Type": "application/json"},
         )
         with urllib.request.urlopen(req, timeout=300) as r:
-            while True:
-                chunk = r.read(chunk_bytes)
-                if not chunk:
-                    return
-                yield chunk
+            yield from _even_chunks(r, chunk_bytes)
+
+
+def _even_chunks(reader, chunk_bytes: int) -> Iterator[bytes]:
+    """Re-chunk a byte stream so every yield has even length.
+
+    TCP delivery can split the body anywhere, so a raw read may return an odd
+    number of bytes — which is half an int16 sample and would crash the
+    playback layer's frombuffer. Carry the odd tail byte into the next read.
+    """
+    carry = b""
+    while True:
+        chunk = reader.read(chunk_bytes)
+        if not chunk:
+            if carry:
+                # A trailing lone byte means a truncated final sample; drop it.
+                return
+            return
+        chunk = carry + chunk
+        if len(chunk) % 2:
+            carry = chunk[-1:]
+            chunk = chunk[:-1]
+        else:
+            carry = b""
+        if chunk:
+            yield chunk

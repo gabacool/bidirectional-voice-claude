@@ -69,6 +69,7 @@ class ClaudeBackend(AgentBackend):
         self._proc: subprocess.Popen | None = None
         self._events: queue.Queue = queue.Queue()
         self._session_id = ""
+        self._stderr_tail = ""
         self._req_n = 0
         self._turn_open = False
 
@@ -89,7 +90,17 @@ class ClaudeBackend(AgentBackend):
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1,
         )
+        self._stderr_tail = ""
         threading.Thread(target=self._read_stdout, args=(self._proc,), daemon=True).start()
+        threading.Thread(target=self._drain_stderr, args=(self._proc,), daemon=True).start()
+
+    def _drain_stderr(self, proc: subprocess.Popen) -> None:
+        """Keep the stderr pipe drained so a chatty process can never block on a
+        full pipe buffer; retain only a short tail for the fatal message."""
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            if proc is self._proc:
+                self._stderr_tail = (self._stderr_tail + line)[-2000:]
 
     def start(self) -> None:
         self._spawn()
@@ -99,6 +110,8 @@ class ClaudeBackend(AgentBackend):
     def _read_stdout(self, proc: subprocess.Popen) -> None:
         assert proc.stdout is not None
         for line in proc.stdout:
+            if proc is not self._proc:
+                return   # replaced by a respawn: stale lines must not leak events
             for ev in parse_claude_line(line):
                 if ev.kind == "init":
                     self._session_id = ev.text
@@ -109,13 +122,7 @@ class ClaudeBackend(AgentBackend):
         # EOF: process exited. Only fatal if this proc is still current
         # (a respawn during interrupt-fallback replaces it deliberately).
         if proc is self._proc:
-            tail = ""
-            if proc.stderr is not None:
-                try:
-                    tail = proc.stderr.read()[-2000:]
-                except Exception:   # noqa: BLE001
-                    tail = ""
-            self._events.put(AgentEvent("fatal", f"claude exited: {tail}"))
+            self._events.put(AgentEvent("fatal", f"claude exited: {self._stderr_tail}"))
 
     def send(self, text: str) -> None:
         assert self._proc is not None and self._proc.stdin is not None
