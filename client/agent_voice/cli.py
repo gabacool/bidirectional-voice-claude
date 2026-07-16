@@ -138,9 +138,11 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    if args.cwd is not None and not os.path.isdir(os.path.expanduser(args.cwd)):
-        print(f"--cwd is not a directory: {args.cwd}")
-        return 2
+    if args.cwd is not None:
+        args.cwd = os.path.expanduser(args.cwd)
+        if not os.path.isdir(args.cwd):
+            print(f"--cwd is not a directory: {args.cwd}")
+            return 2
 
     cfg = load_config()
     if args.voice:
