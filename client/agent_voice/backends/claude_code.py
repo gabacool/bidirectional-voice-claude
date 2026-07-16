@@ -13,6 +13,12 @@ import json
 from agent_voice.backends.base import AgentEvent
 
 
+def _dict_or_empty(value: object) -> dict:
+    """Collapse a missing, null, or wrong-typed field to {} so chained
+    .get() access can never raise on malformed input."""
+    return value if isinstance(value, dict) else {}
+
+
 def parse_claude_line(line: str) -> list[AgentEvent]:
     """Parse one stdout line into zero or more events. Never raises."""
     line = line.strip()
@@ -30,13 +36,13 @@ def parse_claude_line(line: str) -> list[AgentEvent]:
         return [AgentEvent("init", obj.get("session_id", ""))]
 
     if t == "stream_event":
-        ev = obj.get("event") or {}
+        ev = _dict_or_empty(obj.get("event"))
         if ev.get("type") == "content_block_delta":
-            delta = ev.get("delta") or {}
+            delta = _dict_or_empty(ev.get("delta"))
             if delta.get("type") == "text_delta" and delta.get("text"):
                 return [AgentEvent("delta", delta["text"])]
         elif ev.get("type") == "content_block_start":
-            block = ev.get("content_block") or {}
+            block = _dict_or_empty(ev.get("content_block"))
             if block.get("type") == "tool_use":
                 return [AgentEvent("tool", block.get("name", "tool"))]
         return []

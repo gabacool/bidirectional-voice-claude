@@ -80,3 +80,16 @@ def test_nested_nulls_yield_nothing() -> None:
     assert parse_claude_line(
         '{"type":"stream_event","event":{"type":"content_block_start","content_block":null}}'
     ) == []
+
+
+def test_truthy_non_dict_nested_values_yield_nothing() -> None:
+    # Wrong-typed but truthy nested fields must not crash the parser either.
+    assert parse_claude_line('{"type":"stream_event","event":"garbage"}') == []
+    assert parse_claude_line('{"type":"stream_event","event":42}') == []
+    assert parse_claude_line('{"type":"stream_event","event":[1,2]}') == []
+    assert parse_claude_line(
+        '{"type":"stream_event","event":{"type":"content_block_delta","delta":"x"}}'
+    ) == []
+    assert parse_claude_line(
+        '{"type":"stream_event","event":{"type":"content_block_start","content_block":[1]}}'
+    ) == []
