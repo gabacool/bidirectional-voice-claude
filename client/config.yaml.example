@@ -55,3 +55,14 @@ local:
   voice_api_port: 9900              # OpenAI-compatible: POST /v1/audio/transcriptions (audio->text),
                                     # POST /v1/audio/speech (text->streaming pcm/wav).
                                     # Legacy: POST /transcribe, POST /synthesize (text->whole WAV).
+
+# Optional terminal voice-chat overrides (agent_voice: claude-voice / hermes-voice)
+#voice_chat:
+#  endpoint: "http://127.0.0.1:9900"
+#  rms_threshold: 0.015        # calibrate with claude-voice --debug
+#  speech_confirm_ms: 300
+#  silence_confirm_ms: 2000
+#  max_utterance_ms: 120000
+#  sentences_per_call: 2
+#  inter_clip_pause_ms: 200
+#  voice: ryan
