@@ -140,3 +140,47 @@ class SentenceChunker:
             i += 1
         self._scan_reached = len(buf)
         return -1
+
+
+class SentenceGrouper:
+    """Group chunker output into N-sentence TTS calls.
+
+    Dashboard semantics: the first sentence of a turn ships solo so first audio
+    is fast; later sentences buffer into groups of ``per_call``. The loop calls
+    ``take_partial()`` when the player drains (anti-gap: don't strand a
+    buffered sentence waiting for a sibling) and ``flush()`` at turn end.
+    """
+
+    def __init__(self, per_call: int = 2) -> None:
+        self._per_call = max(1, per_call)
+        self._buf: list[str] = []
+        self._first_sent = False
+
+    def push(self, sentence: str) -> str | None:
+        if not self._first_sent:
+            self._first_sent = True
+            return sentence
+        self._buf.append(sentence)
+        if len(self._buf) >= self._per_call:
+            group = " ".join(self._buf)
+            self._buf = []
+            return group
+        return None
+
+    def take_partial(self) -> str | None:
+        """Ship whatever is buffered right now (player-drain anti-gap)."""
+        if not self._buf:
+            return None
+        group = " ".join(self._buf)
+        self._buf = []
+        return group
+
+    def flush(self) -> str | None:
+        """Ship the remainder and reset the per-turn first-solo latch."""
+        group = self.take_partial()
+        self._first_sent = False
+        return group
+
+    def reset(self) -> None:
+        self._buf = []
+        self._first_sent = False
