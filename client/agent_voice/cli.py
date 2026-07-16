@@ -126,7 +126,8 @@ def main() -> int:
     ap.add_argument("--debug", action="store_true", help="print live RMS while listening")
     ap.add_argument("--quiet-tools", action="store_true", help="no spoken tool cue")
     ap.add_argument("--cwd", type=str, default=None,
-                    help="working directory for the agent session (any agent)")
+                    help="working directory for the agent session "
+                         "(default: the directory you launch from, like `claude`)")
     resume_group = ap.add_mutually_exclusive_group()
     resume_group.add_argument(
         "--continue", dest="continue_", action="store_true",
@@ -138,7 +139,11 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    if args.cwd is not None:
+    if args.cwd is None:
+        # Behave like `claude`: sessions are scoped per directory, so resume
+        # and continue must look where the user actually is, not in ~.
+        args.cwd = os.getcwd()
+    else:
         args.cwd = os.path.expanduser(args.cwd)
         if not os.path.isdir(args.cwd):
             print(f"--cwd is not a directory: {args.cwd}")
