@@ -1,3 +1,4 @@
 #!/bin/zsh
-PYTHONPATH=/Users/gabagool/Git/nvidia_parakeet/client \
-exec /Users/gabagool/Git/nvidia_parakeet/venv/bin/python -m agent_voice.cli --agent claude "$@"
+# ${0:A} resolves symlinks, so an ~/bin symlink still finds the repo checkout.
+ROOT="${0:A:h:h}"
+PYTHONPATH="$ROOT/client" exec "$ROOT/venv/bin/python" -m agent_voice.cli --agent claude "$@"

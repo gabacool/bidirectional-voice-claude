@@ -49,7 +49,20 @@ def load_config() -> dict:
     if path.exists():
         with open(path, encoding="utf-8") as f:
             section = (yaml.safe_load(f) or {}).get("voice_chat") or {}
-        cfg.update({k: v for k, v in section.items() if k in DEFAULTS})
+        for k, v in section.items():
+            if k not in DEFAULTS:
+                print(f"[config] ignoring unknown voice_chat key: {k}")
+                continue
+            default = DEFAULTS[k]
+            if default is None:
+                if isinstance(v, str) and v:
+                    cfg[k] = v
+                elif v is not None:
+                    print(f"[config] ignoring voice_chat.{k}: expected string, got {type(v).__name__}")
+            elif isinstance(v, (int, float)) and not isinstance(v, bool):
+                cfg[k] = v
+            else:
+                print(f"[config] ignoring voice_chat.{k}: expected number, got {type(v).__name__}")
     return cfg
 
 
@@ -112,11 +125,15 @@ def main() -> int:
         from agent_voice.backends.claude_code import ClaudeBackend
         backend = ClaudeBackend()
     else:
-        from agent_voice.backends.hermes_acp import HermesBackend
+        try:
+            from agent_voice.backends.hermes_acp import HermesBackend
+        except ImportError:
+            print("the hermes backend is not available yet (ships in a later PR); use --agent claude")
+            return 2
         backend = HermesBackend()
     try:
         backend.start()
-    except RuntimeError as err:
+    except (RuntimeError, OSError) as err:
         print(f"agent failed to start: {err}")
         return 2
 
@@ -144,10 +161,13 @@ def main() -> int:
     chunker = SentenceChunker()
     grouper = SentenceGrouper(per_call=cfg["sentences_per_call"])
 
-    audio_q: queue.Queue = queue.Queue()
+    audio_q: queue.Queue = queue.Queue(maxsize=50)
 
     def mic_cb(indata, frames, t, status) -> None:   # noqa: ANN001 — sounddevice signature
-        audio_q.put(bytes(indata))
+        try:
+            audio_q.put_nowait(bytes(indata))
+        except queue.Full:
+            pass   # drop: this audio is discarded post-turn anyway
 
     in_stream = sd.RawInputStream(
         samplerate=MIC_SR, blocksize=BLOCK, channels=1, dtype="float32",

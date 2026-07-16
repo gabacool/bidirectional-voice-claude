@@ -11,6 +11,7 @@ class FakePlayer:
     def __init__(self) -> None:
         self.enqueued: list[str] = []
         self.stopped = False
+        self.busy = True   # audio playing by default; anti-gap fires only on drain
         self.on_idle: Callable[[], None] | None = None
 
     def enqueue(self, text: str) -> None:
@@ -87,3 +88,41 @@ def test_fatal_event_returns_fatal() -> None:
     events = [AgentEvent("fatal", "process died")]
     status, _, _, _ = run(events)
     assert status == "fatal"
+
+
+def test_tick_is_inert() -> None:
+    """A 'tick' echoes/enqueues nothing: output matches the tick-free stream."""
+    delta = AgentEvent("delta", "A complete spoken sentence here.")
+    s_tick, p_tick, e_tick, _ = run([AgentEvent("tick"), delta, AgentEvent("turn_end")])
+    s_plain, p_plain, e_plain, _ = run([delta, AgentEvent("turn_end")])
+    assert s_tick == s_plain == "ok"
+    assert p_tick.enqueued == p_plain.enqueued   # the tick added no audio
+    assert e_tick == e_plain                     # the tick echoed nothing
+
+
+def test_tick_ships_buffered_sentence_when_player_drained() -> None:
+    """Anti-gap: a sentence buffered while the player was busy ships on the next
+    tick once the player has drained, before turn_end (no audible dead air)."""
+    player = FakePlayer()   # busy=True: audio is playing while the delta streams
+    grouper = SentenceGrouper(per_call=2)
+    echoes: list[str] = []
+
+    def events():   # noqa: ANN202 — local test generator
+        # First sentence ships solo; second buffers because the player is busy.
+        yield AgentEvent("delta", "First sentence here. Second one buffers here.")
+        player.busy = False   # player drained between events
+        yield AgentEvent("tick")
+        yield AgentEvent("turn_end")
+
+    status = consume_turn(
+        backend_events=events(),
+        chunker=SentenceChunker(min_chars=5),
+        grouper=grouper,
+        player=player,
+        echo=echoes.append,
+        tool_cue=lambda s: None,
+        interrupted=lambda: False,
+    )
+    assert status == "ok"
+    # Second sentence shipped by the tick's anti-gap; turn_end flushed nothing extra.
+    assert player.enqueued == ["First sentence here.", "Second one buffers here."]

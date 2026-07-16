@@ -10,7 +10,9 @@ class AgentEvent:
     """One event from the agent.
 
     kind: 'init' (text = session id; backend-internal), 'delta' (text to
-    speak), 'tool' (text = tool name), 'turn_end', 'fatal' (text = reason).
+    speak), 'tool' (text = tool name), 'turn_end', 'fatal' (text = reason),
+    'tick' — periodic heartbeat while idle; consumers use it to poll flags
+    and MUST otherwise ignore it.
     """
 
     kind: str
@@ -34,7 +36,12 @@ class AgentBackend(ABC):
 
     @abstractmethod
     def cancel(self) -> None:
-        """Interrupt the in-flight turn (best effort)."""
+        """Interrupt the in-flight turn (best effort).
+
+        After cancel(), the backend MUST still deliver a terminal 'turn_end'
+        (or 'fatal') through events() — the loop blocks draining until one
+        arrives.
+        """
 
     @abstractmethod
     def stop(self) -> None:

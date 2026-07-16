@@ -3,6 +3,9 @@
 Mirrors model-management's _VOICE_CLI_PROMPT plus the pipeline self-awareness
 line (the model undersold its own voice capabilities without it), adapted to
 the CLI loop's actual mechanics (Enter interrupt, muted mic while speaking).
+
+Source of the shared body: model-management backend/src/routers/chat_prompts.py
+`_VOICE_CLI_PROMPT` — check it for upstream hardening when editing here.
 """
 
 VOICE_PROMPT_CLI = (

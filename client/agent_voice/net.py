@@ -17,7 +17,7 @@ import numpy as np
 
 def encode_wav(audio_f32: np.ndarray, sample_rate: int) -> bytes:
     """Encode float32 mono [-1, 1] audio to an in-memory 16-bit WAV."""
-    pcm = np.clip(audio_f32 * 32768.0, -32768, 32767).astype("<i2").tobytes()
+    pcm = np.clip(audio_f32 * 32767.0, -32768, 32767).astype("<i2").tobytes()
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
         w.setnchannels(1)
@@ -91,10 +91,7 @@ def _even_chunks(reader, chunk_bytes: int) -> Iterator[bytes]:
     while True:
         chunk = reader.read(chunk_bytes)
         if not chunk:
-            if carry:
-                # A trailing lone byte means a truncated final sample; drop it.
-                return
-            return
+            return   # EOF; a leftover carry byte is a truncated final sample — dropped.
         chunk = carry + chunk
         if len(chunk) % 2:
             carry = chunk[-1:]

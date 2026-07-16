@@ -8,12 +8,12 @@ Wire format (pinned by tests/fixtures/claude_stream_session.jsonl):
   {"type":"control_response",...}                            -> ignored
 """
 
+import collections
 import json
 import os
 import queue
 import subprocess
 import threading
-import time
 from collections.abc import Iterator
 
 from agent_voice.backends.base import AgentBackend, AgentEvent
@@ -69,9 +69,11 @@ class ClaudeBackend(AgentBackend):
         self._proc: subprocess.Popen | None = None
         self._events: queue.Queue = queue.Queue()
         self._session_id = ""
-        self._stderr_tail = ""
+        self._stderr_lines: collections.deque = collections.deque(maxlen=40)
         self._req_n = 0
         self._turn_open = False
+        self._turn_done = threading.Event()
+        self._turn_done.set()   # no turn in flight initially
 
     def _spawn(self, resume: str | None = None) -> None:
         cmd = [
@@ -85,12 +87,15 @@ class ClaudeBackend(AgentBackend):
         ]
         if resume:
             cmd.extend(["--resume", resume])
-        self._proc = subprocess.Popen(
-            cmd, cwd=self._cwd,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1,
-        )
-        self._stderr_tail = ""
+        try:
+            self._proc = subprocess.Popen(
+                cmd, cwd=self._cwd,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, bufsize=1,
+            )
+        except FileNotFoundError as err:
+            raise RuntimeError(f"claude binary not found at {self._bin}") from err
+        self._stderr_lines.clear()
         threading.Thread(target=self._read_stdout, args=(self._proc,), daemon=True).start()
         threading.Thread(target=self._drain_stderr, args=(self._proc,), daemon=True).start()
 
@@ -100,7 +105,7 @@ class ClaudeBackend(AgentBackend):
         assert proc.stderr is not None
         for line in proc.stderr:
             if proc is self._proc:
-                self._stderr_tail = (self._stderr_tail + line)[-2000:]
+                self._stderr_lines.append(line)
 
     def start(self) -> None:
         self._spawn()
@@ -118,11 +123,13 @@ class ClaudeBackend(AgentBackend):
                     continue   # backend-internal; the loop never sees init
                 if ev.kind == "turn_end":
                     self._turn_open = False
+                    self._turn_done.set()
                 self._events.put(ev)
         # EOF: process exited. Only fatal if this proc is still current
         # (a respawn during interrupt-fallback replaces it deliberately).
         if proc is self._proc:
-            self._events.put(AgentEvent("fatal", f"claude exited: {self._stderr_tail}"))
+            tail = "".join(self._stderr_lines)[-2000:]
+            self._events.put(AgentEvent("fatal", f"claude exited: {tail}"))
 
     def send(self, text: str) -> None:
         assert self._proc is not None and self._proc.stdin is not None
@@ -130,15 +137,21 @@ class ClaudeBackend(AgentBackend):
                "message": {"role": "user",
                            "content": [{"type": "text", "text": text}]}}
         self._turn_open = True
-        self._proc.stdin.write(json.dumps(msg) + "\n")
-        self._proc.stdin.flush()
+        self._turn_done.clear()
+        try:
+            self._proc.stdin.write(json.dumps(msg) + "\n")
+            self._proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass   # reader thread's EOF -> 'fatal' surfaces the death to the loop
 
     def events(self) -> Iterator[AgentEvent]:
+        """Yield backend events; emit a 'tick' heartbeat every 0.2 s while idle
+        so consumers can poll interrupt/deadline flags between real events."""
         while True:
             try:
                 yield self._events.get(timeout=0.2)
             except queue.Empty:
-                continue
+                yield AgentEvent("tick")
 
     def cancel(self) -> None:
         """Interrupt the in-flight turn: control_request, then kill+resume fallback."""
@@ -153,10 +166,7 @@ class ClaudeBackend(AgentBackend):
             self._proc.stdin.flush()
         except (BrokenPipeError, OSError):
             pass
-        deadline = time.monotonic() + 5.0
-        while self._turn_open and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if self._turn_open:
+        if not self._turn_done.wait(5.0):
             # Fallback (spec): kill and respawn resuming the same conversation.
             old = self._proc
             self._proc = None   # mark old proc non-current before terminate
@@ -164,6 +174,7 @@ class ClaudeBackend(AgentBackend):
             threading.Thread(target=old.wait, daemon=True).start()   # reap, no zombie
             self._spawn(resume=self._session_id or None)
             self._turn_open = False
+            self._turn_done.set()
             self._events.put(AgentEvent("turn_end"))
 
     def stop(self) -> None:
@@ -176,3 +187,4 @@ class ClaudeBackend(AgentBackend):
             proc.wait(timeout=3)
         except Exception:   # noqa: BLE001
             proc.terminate()
+            threading.Thread(target=proc.wait, daemon=True).start()   # reap, no zombie
