@@ -161,6 +161,7 @@ class ClaudeBackend(AgentBackend):
             old = self._proc
             self._proc = None   # mark old proc non-current before terminate
             old.terminate()
+            threading.Thread(target=old.wait, daemon=True).start()   # reap, no zombie
             self._spawn(resume=self._session_id or None)
             self._turn_open = False
             self._events.put(AgentEvent("turn_end"))

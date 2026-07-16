@@ -54,7 +54,12 @@ def load_config() -> dict:
 
 
 class Keyboard:
-    """Raw-mode stdin reader: Enter -> interrupt event, Ctrl+C -> exit event."""
+    """cbreak-mode stdin reader: Enter -> interrupt event.
+
+    cbreak keeps ISIG enabled, so Ctrl+C never arrives as a byte here — it
+    raises KeyboardInterrupt in the main thread, whose handler sets `exit`
+    (which also stops this reader). `exit` is the single shutdown flag.
+    """
 
     def __init__(self) -> None:
         self.interrupt = threading.Event()
@@ -79,8 +84,6 @@ class Keyboard:
             ch = os.read(sys.stdin.fileno(), 1)
             if ch in (b"\r", b"\n"):
                 self.interrupt.set()
-            elif ch == b"\x03":   # Ctrl+C arrives as a byte in cbreak mode
-                self.exit.set()
 
 
 def main() -> int:
@@ -228,7 +231,7 @@ def main() -> int:
                     audio_q.get_nowait()
                 vad.reset()
         except KeyboardInterrupt:
-            pass
+            kb.exit.set()   # stop the reader thread; single shutdown flag
         finally:
             player.stop_all()
             backend.stop()
