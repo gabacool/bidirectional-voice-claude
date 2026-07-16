@@ -123,3 +123,31 @@ def test_gate_reset_rearms() -> None:
     g.reset()
     assert g.feed(0.02, 1000) is False     # closed again after reset
     assert g.tripped is True
+
+
+def test_preroll_keeps_only_last_n_blocks() -> None:
+    from agent_voice.vad import PrerollBuffer
+
+    p = PrerollBuffer(max_blocks=3)
+    for b in (b"a", b"b", b"c", b"d"):
+        p.push(b)
+    assert p.drain() == [b"b", b"c", b"d"]
+
+
+def test_preroll_drain_empties_and_preserves_order() -> None:
+    from agent_voice.vad import PrerollBuffer
+
+    p = PrerollBuffer(max_blocks=5)
+    p.push(b"x")
+    p.push(b"y")
+    assert p.drain() == [b"x", b"y"]
+    assert p.drain() == []
+
+
+def test_preroll_clear() -> None:
+    from agent_voice.vad import PrerollBuffer
+
+    p = PrerollBuffer(max_blocks=5)
+    p.push(b"x")
+    p.clear()
+    assert p.drain() == []

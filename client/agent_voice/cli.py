@@ -25,7 +25,7 @@ from agent_voice.chunker import SentenceChunker, SentenceGrouper
 from agent_voice.loop import consume_turn
 from agent_voice.net import VoiceService
 from agent_voice.player import Player
-from agent_voice.vad import SilenceGate, VadStateMachine
+from agent_voice.vad import PrerollBuffer, SilenceGate, VadStateMachine
 
 MIC_SR = 16000
 TTS_SR = 24000
@@ -132,7 +132,8 @@ def main() -> int:
     ap.add_argument("--threshold", type=float, default=None)
     ap.add_argument("--debug", action="store_true", help="print live RMS while listening")
     ap.add_argument("--quiet-tools", action="store_true", help="no spoken tool cue")
-    ap.add_argument("--no-cue", action="store_true", help="no beep when the mic re-arms")
+    ap.add_argument("--cue", action="store_true",
+                    help="play a short beep when the mic re-arms (default: silent)")
     ap.add_argument("--cwd", type=str, default=None,
                     help="working directory for the agent session "
                          "(default: the directory you launch from, like `claude`)")
@@ -198,9 +199,9 @@ def main() -> int:
         out_stream.write(np.frombuffer(chunk, dtype="<i2"))
 
     def rearm() -> None:
-        """Signal the mic is live again: indicator (always) + beep (unless --no-cue)."""
+        """Signal the mic is live again: indicator (always) + beep (opt-in --cue)."""
         print("\n[listening]", flush=True)
-        if not args.no_cue:
+        if args.cue:
             out_stream.write(np.frombuffer(BEEP, dtype="<i2"))
 
     player = Player(
@@ -218,6 +219,7 @@ def main() -> int:
     )
     # Same --threshold override flows in (cfg["rms_threshold"] already merged).
     gate = SilenceGate(cfg["rms_threshold"], quiet_ms=300)
+    preroll = PrerollBuffer(max_blocks=5)   # ~500ms of pre-speech audio
     chunker = SentenceChunker()
     grouper = SentenceGrouper(per_call=cfg["sentences_per_call"])
 
@@ -263,9 +265,14 @@ def main() -> int:
                     continue
                 event = vad.feed(rms, now_ms)
                 if vad.state != "idle":
-                    capture.append(block)   # buffer from the threshold crossing
+                    if not capture:
+                        # Soft speech onset sits below the threshold: prepend
+                        # the pre-roll so the first words aren't chopped.
+                        capture.extend(preroll.drain())
+                    capture.append(block)
                 elif event is None:
                     capture = []            # blip: dropped before confirm
+                    preroll.push(block)     # keep rolling the last ~500ms
 
                 if event not in ("utterance_end", "utterance_timeout"):
                     continue
@@ -322,6 +329,7 @@ def main() -> int:
                     audio_q.get_nowait()
                 vad.reset()
                 gate.reset()
+                preroll.clear()   # anything buffered pre-turn is stale now
                 hinted = False
                 rearm()
         except KeyboardInterrupt:

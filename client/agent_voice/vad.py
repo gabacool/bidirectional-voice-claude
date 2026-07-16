@@ -7,6 +7,34 @@ Port of the dashboard's ``vadStateMachine.ts`` (model-management
 no echo cancellation, so acoustic barge-in is out of scope by design.
 """
 
+import collections
+
+
+class PrerollBuffer:
+    """Rolling pre-speech buffer.
+
+    The first words of an utterance are usually the softest and sit below the
+    RMS threshold, so capture-from-crossing chops them ("what is…" lost, user-
+    verified). Keep the last N idle blocks and prepend them when speech starts.
+    Blocks are opaque objects; the buffer never inspects them.
+    """
+
+    def __init__(self, max_blocks: int = 5) -> None:
+        self._blocks: collections.deque = collections.deque(maxlen=max_blocks)
+
+    def push(self, block: object) -> None:
+        """Record one idle (below-threshold) block."""
+        self._blocks.append(block)
+
+    def drain(self) -> list:
+        """Return the buffered blocks in arrival order and empty the buffer."""
+        blocks = list(self._blocks)
+        self._blocks.clear()
+        return blocks
+
+    def clear(self) -> None:
+        self._blocks.clear()
+
 
 class VadStateMachine:
     """Feed RMS samples; emits utterance boundary events.
