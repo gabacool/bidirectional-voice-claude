@@ -49,3 +49,25 @@ def test_two_turns_share_memory_and_interrupt_works() -> None:
         print(f"\ninterrupt path: {'control_request' if cancel_took < 5.0 else 'kill+resume fallback'} ({cancel_took:.2f}s)")
     finally:
         b.stop()
+
+
+def test_continue_resumes_prior_session() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        first = ClaudeBackend(cwd=tmpdir)
+        first.start()
+        try:
+            first.send("Remember the codeword 'kumquat'. Reply with one short sentence.")
+            assert collect_turn(first)[-1].kind == "turn_end"
+        finally:
+            first.stop()
+        second = ClaudeBackend(cwd=tmpdir, continue_=True)
+        second.start()
+        try:
+            second.send("What was the codeword? One short sentence.")
+            events = collect_turn(second)
+            text = "".join(e.text for e in events if e.kind == "delta").lower()
+            assert "kumquat" in text
+        finally:
+            second.stop()

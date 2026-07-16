@@ -60,8 +60,9 @@ class HermesBackend(AgentBackend):
     INIT_TIMEOUT_S = 30
     CANCEL_GRACE_S = 5.0
 
-    def __init__(self, hermes_bin: str = "hermes") -> None:
+    def __init__(self, hermes_bin: str = "hermes", cwd: str | None = None) -> None:
         self._bin = hermes_bin
+        self._cwd = cwd
         self._proc: subprocess.Popen | None = None
         self._events: queue.Queue = queue.Queue()
         self._responses: queue.Queue = queue.Queue()
@@ -117,7 +118,8 @@ class HermesBackend(AgentBackend):
                                        "terminal": False},
             })
             result = self._request("session/new",
-                                   {"cwd": os.path.expanduser("~"), "mcpServers": []})
+                                   {"cwd": os.path.expanduser(self._cwd or "~"),
+                                    "mcpServers": []})
             self._session_id = result["sessionId"]
         except (queue.Empty, RuntimeError, KeyError) as err:
             self.stop()
