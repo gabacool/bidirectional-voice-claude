@@ -69,6 +69,7 @@ class ClaudeBackend(AgentBackend):
         cwd: str | None = None,
         resume: str | None = None,
         continue_: bool = False,
+        model: str | None = None,
     ) -> None:
         if resume and continue_:
             raise ValueError("resume and continue_ are mutually exclusive")
@@ -76,6 +77,7 @@ class ClaudeBackend(AgentBackend):
         self._cwd = cwd or os.path.expanduser("~")
         self._resume = resume
         self._continue = continue_
+        self._model = model
         self._proc: subprocess.Popen | None = None
         self._events: queue.Queue = queue.Queue()
         self._session_id = ""
@@ -95,6 +97,10 @@ class ClaudeBackend(AgentBackend):
             "--dangerously-skip-permissions",
             "--append-system-prompt", VOICE_PROMPT_CLI,
         ]
+        if self._model:
+            # Applies to fresh AND resumed sessions (claude switches a resumed
+            # conversation's model when --model accompanies --resume/-c).
+            cmd.extend(["--model", self._model])
         if resume:
             cmd.extend(["--resume", resume])
         elif continue_:
