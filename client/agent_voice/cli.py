@@ -247,8 +247,14 @@ def main() -> int:
 
     with Keyboard() as kb:
         capture: list[np.ndarray] = []
+        model_printed = False
         try:
             while not kb.exit.is_set():
+                # Ground-truth model from the init event — never ask the model
+                # itself (a resumed conversation makes it parrot old context).
+                if not model_printed and getattr(backend, "model_id", ""):
+                    print(f"[model: {backend.model_id}]")
+                    model_printed = True
                 kb.interrupt.clear()   # Enter while listening is a no-op
                 try:
                     raw = audio_q.get(timeout=0.2)

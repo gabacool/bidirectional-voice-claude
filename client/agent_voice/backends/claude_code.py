@@ -40,7 +40,10 @@ def parse_claude_line(line: str) -> list[AgentEvent]:
     t = obj.get("type")
 
     if t == "system" and obj.get("subtype") == "init":
-        return [AgentEvent("init", obj.get("session_id", ""))]
+        return [
+            AgentEvent("init", obj.get("session_id", "")),
+            AgentEvent("model", obj.get("model", "")),
+        ]
 
     if t == "stream_event":
         ev = _dict_or_empty(obj.get("event"))
@@ -81,6 +84,7 @@ class ClaudeBackend(AgentBackend):
         self._proc: subprocess.Popen | None = None
         self._events: queue.Queue = queue.Queue()
         self._session_id = ""
+        self.model_id = ""   # actual model from the init event (never self-reported)
         self._stderr_lines: collections.deque = collections.deque(maxlen=40)
         self._req_n = 0
         self._turn_open = False
@@ -143,6 +147,9 @@ class ClaudeBackend(AgentBackend):
                 if ev.kind == "init":
                     self._session_id = ev.text
                     continue   # backend-internal; the loop never sees init
+                if ev.kind == "model":
+                    self.model_id = ev.text   # ground truth from the init event
+                    continue
                 if ev.kind == "turn_end":
                     self._turn_open = False
                     self._turn_done.set()
