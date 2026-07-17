@@ -185,11 +185,11 @@ def main() -> int:
             print("session resume and --model are claude-only")
             return 2
         try:
-            from agent_voice.backends.hermes_acp import HermesBackend
+            from agent_voice.backends.acp import hermes_backend
         except ImportError:
-            print("the hermes backend is not available yet (ships in a later PR); use --agent claude")
+            print("the acp backend is not available yet (ships in a later PR); use --agent claude")
             return 2
-        backend = HermesBackend(cwd=args.cwd)
+        backend = hermes_backend(cwd=args.cwd)
     try:
         backend.start()
     except (RuntimeError, OSError) as err:

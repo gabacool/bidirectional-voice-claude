@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 
-from agent_voice.backends.hermes_acp import parse_acp_message
+from agent_voice.backends.acp import parse_acp_message
 
 FIXTURE = Path(__file__).parent / "fixtures" / "acp_session.jsonl"
 PROMPT_ID = 3   # the capture script's session/prompt request id
