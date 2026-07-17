@@ -56,14 +56,16 @@ local:
                                     # POST /v1/audio/speech (text->streaming pcm/wav).
                                     # Legacy: POST /transcribe, POST /synthesize (text->whole WAV).
 
-# Optional terminal voice-chat overrides (agent_voice: claude-voice / hermes-voice)
+# Optional terminal voice-chat overrides (agent_voice: claude-voice / hermes-voice / grok-voice)
 #
-# Session bridging (hop between the interactive Claude Code TUI and voice on the
+# Session bridging (hop between the interactive agent TUI and voice on the
 # SAME conversation) is done via CLI flags, NOT this config:
 #   --cwd DIR            pin the agent's working directory (any agent)
-#   --continue           claude only: resume the most recent session in --cwd
-#   --resume SESSION_ID  claude only: resume a specific session by id
-# --continue and --resume are mutually exclusive and claude-only.
+#   --continue           claude/grok: resume the most recent session in --cwd
+#   --resume SESSION_ID  claude/grok: resume a specific session by id
+#   --model MODEL        claude/grok: model for the session
+#   --effort {low,medium,high}   grok only: reasoning effort
+# --continue and --resume are mutually exclusive; hermes supports neither.
 #voice_chat:
 #  endpoint: "http://127.0.0.1:9900"
 #  rms_threshold: 0.015        # calibrate with claude-voice --debug

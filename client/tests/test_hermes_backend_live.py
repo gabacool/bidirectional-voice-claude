@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from agent_voice.backends.hermes_acp import HermesBackend
+from agent_voice.backends.acp import hermes_backend
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_AGENT_TESTS") != "1",
@@ -14,7 +14,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_one_turn_and_cancel() -> None:
-    b = HermesBackend()
+    b = hermes_backend()
     b.start()
     try:
         b.send("Reply with exactly one short sentence.")

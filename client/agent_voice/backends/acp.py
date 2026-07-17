@@ -1,4 +1,6 @@
-"""Hermes ACP backend: long-lived `hermes acp` JSON-RPC 2.0 over stdio.
+"""Generic ACP backend: a long-lived agent process speaking JSON-RPC 2.0 over stdio.
+
+Agents: hermes (`hermes acp`), grok (`grok agent --always-approve stdio`) — see factories at bottom.
 
 Protocol (probed live on Hermes 0.18.2, pinned by tests/fixtures/acp_session.jsonl):
   initialize -> session/new -> session/prompt per utterance.
@@ -9,17 +11,23 @@ Protocol (probed live on Hermes 0.18.2, pinned by tests/fixtures/acp_session.jso
     usage_update / available_commands_update / tool_call_update -> ignore
   The response to the prompt request (any stopReason, incl. 'cancelled') ends
   the turn. Interrupt = session/cancel notification.
-No system-prompt flag exists over ACP, so a bracketed voice preamble is
-prepended to the FIRST prompt only.
+  session/load (resume) REPLAYS history as session/update notifications before
+  its response — the _loading flag drops them so they are never spoken.
+No system-prompt flag exists over ACP (grok's `--rules` was probed and is
+rejected on 0.2.102), so a bracketed voice preamble is prepended to the
+FIRST prompt only.
 """
 
 import collections
 import json
 import os
 import queue
+import re
 import subprocess
 import threading
 from collections.abc import Iterator
+from pathlib import Path
+from urllib.parse import quote
 
 from agent_voice.backends.base import AgentBackend, AgentEvent
 from agent_voice.prompts import VOICE_PREAMBLE_ACP
@@ -54,15 +62,27 @@ def parse_acp_message(obj: dict, prompt_id: int) -> list[AgentEvent]:
     return []
 
 
-class HermesBackend(AgentBackend):
-    """One long-lived `hermes acp` process per voice session."""
+class AcpBackend(AgentBackend):
+    """One long-lived ACP agent process per voice session."""
 
     INIT_TIMEOUT_S = 30
     CANCEL_GRACE_S = 5.0
 
-    def __init__(self, hermes_bin: str = "hermes", cwd: str | None = None) -> None:
-        self._bin = hermes_bin
+    def __init__(
+        self,
+        argv: list[str],
+        name: str,
+        cwd: str | None = None,
+        preamble: str | None = VOICE_PREAMBLE_ACP,
+        load_session_id: str | None = None,
+    ) -> None:
+        self._argv = argv
+        self._name = name
         self._cwd = cwd
+        self._preamble = preamble
+        self._load_session_id = load_session_id
+        self._loading = False   # True while session/load replays history
+        self.model_id = ""      # ground truth from initialize (never self-reported)
         self._proc: subprocess.Popen | None = None
         self._events: queue.Queue = queue.Queue()
         self._responses: queue.Queue = queue.Queue()
@@ -101,29 +121,47 @@ class HermesBackend(AgentBackend):
     def start(self) -> None:
         try:
             self._proc = subprocess.Popen(
-                [self._bin, "acp"],
+                self._argv,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, bufsize=1,
             )
         except FileNotFoundError as err:
-            raise RuntimeError(f"hermes binary not found: {self._bin}") from err
+            raise RuntimeError(f"{self._name} binary not found: {self._argv[0]}") from err
         self._stderr_lines.clear()
         threading.Thread(target=self._read_stdout, args=(self._proc,), daemon=True).start()
         threading.Thread(target=self._drain_stderr, args=(self._proc,), daemon=True).start()
         try:
-            self._request("initialize", {
+            init = self._request("initialize", {
                 "protocolVersion": 1,
                 "clientCapabilities": {"fs": {"readTextFile": False,
                                               "writeTextFile": False},
                                        "terminal": False},
             })
-            result = self._request("session/new",
-                                   {"cwd": os.path.expanduser(self._cwd or "~"),
-                                    "mcpServers": []})
-            self._session_id = result["sessionId"]
+            meta = init.get("_meta") if isinstance(init, dict) else None
+            state = meta.get("modelState") if isinstance(meta, dict) else None
+            if isinstance(state, dict):
+                self.model_id = str(state.get("currentModelId") or "")
+            if self._load_session_id:
+                self._loading = True
+                try:
+                    result = self._request("session/load",
+                                           {"sessionId": self._load_session_id,
+                                            "cwd": os.path.expanduser(self._cwd or "~"),
+                                            "mcpServers": []})
+                finally:
+                    self._loading = False
+                # Some agents return the id in the result, some don't; keep ours.
+                self._session_id = str(
+                    (result or {}).get("sessionId") or self._load_session_id
+                )
+            else:
+                result = self._request("session/new",
+                                       {"cwd": os.path.expanduser(self._cwd or "~"),
+                                        "mcpServers": []})
+                self._session_id = result["sessionId"]
         except (queue.Empty, RuntimeError, KeyError) as err:
             self.stop()
-            raise RuntimeError(f"hermes acp failed to initialize: {err}") from err
+            raise RuntimeError(f"{self._name} acp failed to initialize: {err}") from err
 
     def _drain_stderr(self, proc: subprocess.Popen) -> None:
         """Keep the stderr pipe drained so a chatty process can never block on a
@@ -132,6 +170,21 @@ class HermesBackend(AgentBackend):
         for line in proc.stderr:
             if proc is self._proc:
                 self._stderr_lines.append(line)
+
+    def _route(self, obj: dict) -> None:
+        """Route one parsed JSON-RPC message. Runs under no lock itself; takes
+        _turn_lock exactly as the inline code did."""
+        with self._turn_lock:
+            if obj.get("id") is not None and obj.get("id") != self._prompt_id \
+                    and "method" not in obj:
+                self._responses.put(obj)
+                return
+            if self._loading and obj.get("method") == "session/update":
+                return   # session/load history replay: must never be spoken
+            for ev in parse_acp_message(obj, self._prompt_id):
+                if ev.kind in ("turn_end", "fatal"):
+                    self._turn_done.set()
+                self._events.put(ev)
 
     def _read_stdout(self, proc: subprocess.Popen) -> None:
         assert proc.stdout is not None
@@ -146,26 +199,17 @@ class HermesBackend(AgentBackend):
             except ValueError:
                 continue
             if not isinstance(obj, dict):
-                continue   # valid JSON that isn't an object — never emits events
-            with self._turn_lock:
-                # Setup responses (initialize / session/new) route to _request().
-                if obj.get("id") is not None and obj.get("id") != self._prompt_id \
-                        and "method" not in obj:
-                    self._responses.put(obj)
-                    continue
-                for ev in parse_acp_message(obj, self._prompt_id):
-                    if ev.kind in ("turn_end", "fatal"):
-                        self._turn_done.set()
-                    self._events.put(ev)
+                continue
+            self._route(obj)
         if proc is self._proc:
             tail = "".join(self._stderr_lines)[-2000:]
             self._turn_done.set()
-            self._events.put(AgentEvent("fatal", f"hermes acp exited: {tail}"))
+            self._events.put(AgentEvent("fatal", f"{self._name} acp exited: {tail}"))
 
     def send(self, text: str) -> None:
-        if self._first_prompt:
-            text = VOICE_PREAMBLE_ACP + text
-            self._first_prompt = False
+        if self._first_prompt and self._preamble:
+            text = self._preamble + text
+        self._first_prompt = False
         self._turn_done.clear()
         self._prompt_id = self._rpc_id()
         self._send({"jsonrpc": "2.0", "id": self._prompt_id,
@@ -214,3 +258,52 @@ class HermesBackend(AgentBackend):
         except Exception:   # noqa: BLE001
             proc.terminate()
             threading.Thread(target=proc.wait, daemon=True).start()   # reap, no zombie
+
+
+def hermes_backend(cwd: str | None = None) -> AcpBackend:
+    """Hermes over `hermes acp` (probed live on 0.18.2)."""
+    return AcpBackend(["hermes", "acp"], name="hermes", cwd=cwd)
+
+
+GROK_BIN = os.path.expanduser("~/.grok/bin/grok")
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def resolve_grok_session(cwd: str, store_root: Path | None = None) -> str | None:
+    """Most recent Grok session id for a cwd, from the on-disk store.
+
+    Grok stores sessions under ~/.grok/sessions/<percent-encoded-cwd>/<uuid>/;
+    `grok sessions list` has no machine-readable output, so the store is the
+    resolution source.
+    """
+    root = store_root or Path(os.path.expanduser("~/.grok/sessions"))
+    store = root / quote(cwd, safe="")
+    if not store.is_dir():
+        return None
+    sessions = [p for p in store.iterdir()
+                if p.is_dir() and _UUID_RE.match(p.name)]
+    if not sessions:
+        return None
+    return max(sessions, key=lambda p: p.stat().st_mtime).name
+
+
+def grok_backend(
+    cwd: str | None = None,
+    model: str | None = None,
+    effort: str | None = None,
+    load_session_id: str | None = None,
+) -> AcpBackend:
+    """Grok Build over `grok agent stdio` (probed live on 0.2.102).
+
+    Full autonomy (--always-approve) is the user-locked stance: voice has no
+    UI for per-tool approval prompts. The `--rules` flag was probed and is
+    rejected by 0.2.102, so the shared bracketed voice preamble is the
+    voice-prompt mechanism (same as hermes).
+    """
+    argv = [GROK_BIN, "agent", "--always-approve"]
+    if model:
+        argv += ["-m", model]
+    if effort:
+        argv += ["--reasoning-effort", effort]
+    argv.append("stdio")
+    return AcpBackend(argv, name="grok", cwd=cwd, load_session_id=load_session_id)
