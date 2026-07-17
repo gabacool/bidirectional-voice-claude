@@ -25,15 +25,14 @@ from agent_voice.chunker import SentenceChunker, SentenceGrouper
 from agent_voice.loop import consume_turn
 from agent_voice.net import VoiceService
 from agent_voice.player import Player
-from agent_voice.vad import PrerollBuffer, SilenceGate, VadStateMachine
+from agent_voice.vad import PrerollBuffer, VadStateMachine
 
 MIC_SR = 16000
 TTS_SR = 24000
 BLOCK = 1600   # 0.1 s mic blocks
 
-# 50 ms, 880 Hz, low-volume re-arm cue. With no AEC the mic hears it, but 50 ms
-# is well under the VAD's speech-confirm so it reads as a blip; if it trips the
-# gate, the 300 ms quiet requirement just delays opening slightly. Accepted.
+# 50 ms, 880 Hz, low-volume re-arm cue (opt-in --cue). With no AEC the mic
+# hears it, but 50 ms is well under the VAD's speech-confirm: reads as a blip.
 BEEP = (
     0.12 * np.sin(2 * np.pi * 880 * np.arange(int(0.05 * TTS_SR)) / TTS_SR) * 32767
 ).astype("<i2").tobytes()
@@ -217,8 +216,6 @@ def main() -> int:
         silence_confirm_ms=cfg["silence_confirm_ms"],
         max_utterance_ms=cfg["max_utterance_ms"],
     )
-    # Same --threshold override flows in (cfg["rms_threshold"] already merged).
-    gate = SilenceGate(cfg["rms_threshold"], quiet_ms=300)
     preroll = PrerollBuffer(max_blocks=5)   # ~500ms of pre-speech audio
     chunker = SentenceChunker()
     grouper = SentenceGrouper(per_call=cfg["sentences_per_call"])
@@ -243,7 +240,6 @@ def main() -> int:
 
     with Keyboard() as kb:
         capture: list[np.ndarray] = []
-        hinted = False
         try:
             while not kb.exit.is_set():
                 kb.interrupt.clear()   # Enter while listening is a no-op
@@ -255,15 +251,7 @@ def main() -> int:
                 rms = float(np.sqrt(np.mean(block * block))) if block.size else 0.0
                 if args.debug and vad.state == "idle":
                     print(f"\rRMS {rms:.4f}  (threshold {cfg['rms_threshold']})", end="")
-                now_ms = time.monotonic() * 1000
-                # Discard stale audio chopped by the muted-mic window: while the
-                # gate is closed, do not feed the VAD or capture the block.
-                if not gate.feed(rms, now_ms):
-                    if gate.tripped and not hinted:
-                        print("\n[you started before I was listening — say that again]")
-                        hinted = True
-                    continue
-                event = vad.feed(rms, now_ms)
+                event = vad.feed(rms, time.monotonic() * 1000)
                 if vad.state != "idle":
                     if not capture:
                         # Soft speech onset sits below the threshold: prepend
@@ -323,14 +311,16 @@ def main() -> int:
                         time.sleep(0.05)
                     print()
 
-                # Mic was muted the whole turn: discard everything captured, then
-                # re-arm: reset VAD + gate, print the indicator, play the beep.
+                # Mic was muted the whole turn. Brief guard so the speaker's
+                # trailing audio (output latency + room reverb, no AEC) can't
+                # be captured as speech, then discard everything queued during
+                # the turn and re-arm. Speech that starts right after the
+                # guard is caught whole via the pre-roll.
+                time.sleep(0.25)
                 while not audio_q.empty():
                     audio_q.get_nowait()
                 vad.reset()
-                gate.reset()
                 preroll.clear()   # anything buffered pre-turn is stale now
-                hinted = False
                 rearm()
         except KeyboardInterrupt:
             kb.exit.set()   # stop the reader thread; single shutdown flag
