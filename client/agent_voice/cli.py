@@ -126,7 +126,7 @@ class Keyboard:
 
 def main() -> int:
     ap = argparse.ArgumentParser(prog="agent-voice")
-    ap.add_argument("--agent", choices=["claude", "hermes"], default="claude")
+    ap.add_argument("--agent", choices=["claude", "hermes", "grok"], default="claude")
     ap.add_argument("--voice", default=None)
     ap.add_argument("--threshold", type=float, default=None)
     ap.add_argument("--debug", action="store_true", help="print live RMS while listening")
@@ -139,16 +139,20 @@ def main() -> int:
     resume_group = ap.add_mutually_exclusive_group()
     resume_group.add_argument(
         "--continue", dest="continue_", action="store_true",
-        help="claude only: resume the most recent session in --cwd",
+        help="claude/grok: resume the most recent session in --cwd",
     )
     resume_group.add_argument(
         "--resume", metavar="SESSION_ID", default=None,
-        help="claude only: resume a specific Claude Code session by id",
+        help="claude/grok: resume a specific session by id",
     )
     ap.add_argument(
         "--model", default=None,
-        help="claude only: model for the session (e.g. sonnet, opus, fable; "
-             "default: your claude config — a resumed session keeps its own model)",
+        help="claude/grok: model for the session (e.g. sonnet, opus, fable; "
+             "default: your agent config — a resumed session keeps its own model)",
+    )
+    ap.add_argument(
+        "--effort", choices=["low", "medium", "high"], default=None,
+        help="grok only: reasoning effort",
     )
     args = ap.parse_args()
 
@@ -176,19 +180,28 @@ def main() -> int:
         return 1
 
     if args.agent == "claude":
+        if args.effort:
+            print("--effort is grok-only")
+            return 2
         from agent_voice.backends.claude_code import ClaudeBackend
         backend = ClaudeBackend(
             cwd=args.cwd, resume=args.resume, continue_=args.continue_, model=args.model
         )
+    elif args.agent == "grok":
+        from agent_voice.backends.acp import grok_backend, resolve_grok_session
+        load_id = args.resume
+        if args.continue_:
+            load_id = resolve_grok_session(args.cwd)
+            if not load_id:
+                print(f"no previous grok session found for {args.cwd}")
+                return 2
+        backend = grok_backend(cwd=args.cwd, model=args.model,
+                               effort=args.effort, load_session_id=load_id)
     else:
-        if args.continue_ or args.resume or args.model:
-            print("session resume and --model are claude-only")
+        if args.continue_ or args.resume or args.model or args.effort:
+            print("session resume, --model, and --effort are not available for hermes")
             return 2
-        try:
-            from agent_voice.backends.acp import hermes_backend
-        except ImportError:
-            print("the acp backend is not available yet (ships in a later PR); use --agent claude")
-            return 2
+        from agent_voice.backends.acp import hermes_backend
         backend = hermes_backend(cwd=args.cwd)
     try:
         backend.start()

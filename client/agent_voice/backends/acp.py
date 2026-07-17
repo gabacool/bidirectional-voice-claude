@@ -13,17 +13,21 @@ Protocol (probed live on Hermes 0.18.2, pinned by tests/fixtures/acp_session.jso
   the turn. Interrupt = session/cancel notification.
   session/load (resume) REPLAYS history as session/update notifications before
   its response — the _loading flag drops them so they are never spoken.
-No system-prompt flag exists over ACP, so a bracketed voice preamble is
-prepended to the FIRST prompt only.
+No system-prompt flag exists over ACP (grok's `--rules` was probed and is
+rejected on 0.2.102), so a bracketed voice preamble is prepended to the
+FIRST prompt only.
 """
 
 import collections
 import json
 import os
 import queue
+import re
 import subprocess
 import threading
 from collections.abc import Iterator
+from pathlib import Path
+from urllib.parse import quote
 
 from agent_voice.backends.base import AgentBackend, AgentEvent
 from agent_voice.prompts import VOICE_PREAMBLE_ACP
@@ -259,3 +263,47 @@ class AcpBackend(AgentBackend):
 def hermes_backend(cwd: str | None = None) -> AcpBackend:
     """Hermes over `hermes acp` (probed live on 0.18.2)."""
     return AcpBackend(["hermes", "acp"], name="hermes", cwd=cwd)
+
+
+GROK_BIN = os.path.expanduser("~/.grok/bin/grok")
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def resolve_grok_session(cwd: str, store_root: Path | None = None) -> str | None:
+    """Most recent Grok session id for a cwd, from the on-disk store.
+
+    Grok stores sessions under ~/.grok/sessions/<percent-encoded-cwd>/<uuid>/;
+    `grok sessions list` has no machine-readable output, so the store is the
+    resolution source.
+    """
+    root = store_root or Path(os.path.expanduser("~/.grok/sessions"))
+    store = root / quote(cwd, safe="")
+    if not store.is_dir():
+        return None
+    sessions = [p for p in store.iterdir()
+                if p.is_dir() and _UUID_RE.match(p.name)]
+    if not sessions:
+        return None
+    return max(sessions, key=lambda p: p.stat().st_mtime).name
+
+
+def grok_backend(
+    cwd: str | None = None,
+    model: str | None = None,
+    effort: str | None = None,
+    load_session_id: str | None = None,
+) -> AcpBackend:
+    """Grok Build over `grok agent stdio` (probed live on 0.2.102).
+
+    Full autonomy (--always-approve) is the user-locked stance: voice has no
+    UI for per-tool approval prompts. The `--rules` flag was probed and is
+    rejected by 0.2.102, so the shared bracketed voice preamble is the
+    voice-prompt mechanism (same as hermes).
+    """
+    argv = [GROK_BIN, "agent", "--always-approve"]
+    if model:
+        argv += ["-m", model]
+    if effort:
+        argv += ["--reasoning-effort", effort]
+    argv.append("stdio")
+    return AcpBackend(argv, name="grok", cwd=cwd, load_session_id=load_session_id)
