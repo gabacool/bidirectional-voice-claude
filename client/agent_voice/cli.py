@@ -145,6 +145,11 @@ def main() -> int:
         "--resume", metavar="SESSION_ID", default=None,
         help="claude only: resume a specific Claude Code session by id",
     )
+    ap.add_argument(
+        "--model", default=None,
+        help="claude only: model for the session (e.g. sonnet, opus, fable; "
+             "default: your claude config — a resumed session keeps its own model)",
+    )
     args = ap.parse_args()
 
     if args.cwd is None:
@@ -172,10 +177,12 @@ def main() -> int:
 
     if args.agent == "claude":
         from agent_voice.backends.claude_code import ClaudeBackend
-        backend = ClaudeBackend(cwd=args.cwd, resume=args.resume, continue_=args.continue_)
+        backend = ClaudeBackend(
+            cwd=args.cwd, resume=args.resume, continue_=args.continue_, model=args.model
+        )
     else:
-        if args.continue_ or args.resume:
-            print("session resume is claude-only")
+        if args.continue_ or args.resume or args.model:
+            print("session resume and --model are claude-only")
             return 2
         try:
             from agent_voice.backends.hermes_acp import HermesBackend
