@@ -93,3 +93,10 @@ def test_truthy_non_dict_nested_values_yield_nothing() -> None:
     assert parse_claude_line(
         '{"type":"stream_event","event":{"type":"content_block_start","content_block":[1]}}'
     ) == []
+
+
+def test_init_line_also_emits_ground_truth_model() -> None:
+    line = '{"type":"system","subtype":"init","session_id":"abc-123","model":"claude-haiku-4-5"}'
+    events = parse_claude_line(line)
+    assert [e.kind for e in events] == ["init", "model"]
+    assert events[1].text == "claude-haiku-4-5"
