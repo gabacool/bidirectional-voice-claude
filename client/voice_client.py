@@ -11,6 +11,7 @@ import subprocess
 import sys
 import signal
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -98,6 +99,13 @@ class VoiceClient:
             local_cfg = self.config.get('local', {})
             model_name = local_cfg.get('stt_model', 'Qwen/Qwen3-ASR-0.6B')
             self.local_transcriber = LocalTranscriber(model_name)
+            # One dedicated inference thread. mlx (>=0.31) GPU streams are
+            # thread-local, so EVERY model call — load and transcribe — must run
+            # on this single thread; loading on the main thread and inferring on
+            # a pool thread dies with "There is no Stream(gpu, N) in current
+            # thread" and pastes nothing. Same convention as voice_api.py.
+            self.infer_pool = ThreadPoolExecutor(max_workers=1,
+                                                 thread_name_prefix="infer")
         else:
             raise ValueError(f"Unknown backend: {self.backend}")
 
@@ -277,9 +285,11 @@ class VoiceClient:
 
         print(f"\n[Transcribing {chunks_captured[0]} chunks locally...]")
 
-        # Run transcription in executor to avoid blocking the event loop
+        # On the dedicated inference thread — the same one that loaded the model
+        # (see __init__) — so mlx's thread-local GPU stream is available here.
         transcription = await loop.run_in_executor(
-            None, self.local_transcriber.transcribe, audio_float32, self.sample_rate
+            self.infer_pool, self.local_transcriber.transcribe,
+            audio_float32, self.sample_rate
         )
 
         if transcription:
@@ -287,6 +297,24 @@ class VoiceClient:
         return transcription
 
     # --- Public API ---
+
+    async def warm_model(self):
+        """Preload the STT model so transcription is fast after stop.
+
+        Runs ON the inference thread, never the caller's: mlx binds the model's
+        GPU stream to whichever thread loads it (see __init__).
+        """
+        if self.backend != 'local':
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self.infer_pool,
+                                   self.local_transcriber._ensure_model)
+
+    def close(self):
+        """Release the inference thread (no-op for the origin backend)."""
+        pool = getattr(self, 'infer_pool', None)
+        if pool is not None:
+            pool.shutdown(wait=False)
 
     async def connect(self):
         """Connect to backend (only needed for origin)."""
@@ -361,20 +389,19 @@ async def main():
     signal.signal(signal.SIGINT, client.stop_recording)
     signal.signal(signal.SIGUSR1, client.stop_recording)
 
-    # If stop was requested during init, exit cleanly
-    if stop_flag[0]:
-        print("Stop requested during startup")
-        return
-
-    # Load model before recording so transcription is fast after stop
-    if client.backend == 'local':
-        client.local_transcriber._ensure_model()
-
-    if stop_flag[0]:
-        print("Stop requested during model load")
-        return
-
     try:
+        # If stop was requested during init, exit cleanly
+        if stop_flag[0]:
+            print("Stop requested during startup")
+            return
+
+        # Load model before recording so transcription is fast after stop
+        await client.warm_model()
+
+        if stop_flag[0]:
+            print("Stop requested during model load")
+            return
+
         await client.connect()
         transcription = await client.record_and_transcribe()
 
@@ -388,6 +415,7 @@ async def main():
         sys.exit(1)
     finally:
         await client.disconnect()
+        client.close()
 
 
 if __name__ == "__main__":
