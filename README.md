@@ -373,6 +373,30 @@ local:
 | **Client** | `client/tts_client.py` |
 | **Daemon** | `client/tts_daemon.py` (model stays resident) |
 
+### MLX threading rule
+
+MLX (>=0.31) GPU streams are **thread-local**: a model is bound to a stream when
+it loads, and calling it from a different thread fails with
+
+```
+RuntimeError: There is no Stream(gpu, 1) in current thread.
+```
+
+This fails *quietly* on the Option+V path — the recorder catches the exception,
+exits 1, and leaves `/tmp/parakeet_transcription.txt` empty, so Hammerspoon
+announces "Transcribing & pasting…" and pastes nothing.
+
+| Process | Where model work runs |
+|---------|-----------------------|
+| `voice_api.py` | one `ThreadPoolExecutor(max_workers=1, thread_name_prefix="infer")`; both models are warmed on it via `executor.submit(...).result()`. Doubles as the GPU serializer for concurrent requests |
+| `voice_client.py` | `VoiceClient.infer_pool`, warmed by `warm_model()` |
+| `tts_daemon.py` | loads on the main thread, generates on per-request threads — safe only because Qwen3-TTS uses the default stream. Qwen3-ASR creates its own, which is why the recorder needed a dedicated thread |
+
+Adding model work? Submit it to that process's pool. Never
+`run_in_executor(None, ...)` — it picks an arbitrary pool thread, which is
+exactly the bug above. `client/tests/test_voice_client_threading.py` guards the
+recorder (asserts load thread == inference thread, no mic or model needed).
+
 ---
 
 ## File Structure
@@ -393,6 +417,7 @@ nvidia_parakeet/
 │   │   ├── player.py        #   audio playback
 │   │   ├── chunker.py       #   sentence chunking for streamed TTS
 │   │   └── backends/        #   pluggable agents (ACP, claude_code)
+│   ├── tests/               # pytest suite (no mic, no models, no network)
 │   ├── hammerspoon/
 │   │   └── init.lua         # Hotkey bindings (backup of ~/.hammerspoon/init.lua)
 │   ├── launchd/
@@ -424,6 +449,7 @@ nvidia_parakeet/
 |-------|----------|
 | Config edit ignored by dashboard / Hermes / voice-chat | Restart the LAN API: `launchctl kickstart -k gui/$(id -u)/com.gabagool.voiceapi` (it reads config only at startup) |
 | Option+V does nothing / STT silently fails | `ffmpeg` not on the GUI `PATH` — the scripts export `/opt/homebrew/bin`; confirm `which ffmpeg` works and Hammerspoon is loaded |
+| Option+V says "Transcribing & pasting…" but pastes nothing | Read `/tmp/parakeet_voice.log` — the recorder's errors go to stderr and never reach Hammerspoon. `There is no Stream(gpu, N) in current thread` means the [MLX threading rule](#mlx-threading-rule) was broken; an empty `/tmp/parakeet_transcription.txt` is the fingerprint |
 | No audio captured | Check mic permissions in System Settings → Privacy → Microphone |
 | STT model download slow | First run downloads ~1.2GB; later runs are instant |
 | Option+S no sound | Check speaker volume; confirm the daemon is up (`pgrep -f tts_daemon.py`) |
