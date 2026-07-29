@@ -425,9 +425,12 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            # All model inference runs on the one dedicated inference thread
-            # (mlx GPU streams are thread-local); the single worker serializes it.
-            text = self.server.executor.submit(
+            # STT owns its OWN single-worker thread, so a transcription never
+            # queues behind speech synthesis. mlx GPU streams are thread-local,
+            # and this model is only ever loaded and called on that one thread —
+            # the invariant #21 established, now held per model instead of
+            # globally.
+            text = self.server.stt_executor.submit(
                 self.server.stt.transcribe_file, wav_path).result()
             self._respond_json(200, {"text": text})
         except Exception as e:
@@ -452,7 +455,7 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            audio = self.server.executor.submit(
+            audio = self.server.tts_executor.submit(
                 self.server.tts.synthesize_to_array, text).result()
         except Exception as e:
             print(f"[synthesize error] {e}", file=sys.stderr, flush=True)
@@ -490,13 +493,13 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
         voice = params['voice']
         fmt = params['response_format']
 
-        # The model runs on the single inference thread; this handler thread owns
+        # The model runs on the TTS inference thread; this handler thread owns
         # the socket. run_generator_on bridges the two: chunks are pumped on the
         # inference thread and handed here through a small bounded queue, and
         # closing the returned generator aborts the producer (no orphan) — so we
         # close it in every exit path below.
         stream = run_generator_on(
-            self.server.executor,
+            self.server.tts_executor,
             lambda: self.server.tts.synthesize_stream(
                 text, voice=voice, streaming_interval=SPEECH_STREAMING_INTERVAL),
         )
@@ -597,25 +600,43 @@ def main():
     port = local_cfg.get('voice_api_port', DEFAULT_PORT)
     stt_model = local_cfg.get('stt_model', 'Qwen/Qwen3-ASR-0.6B')
 
-    # One dedicated inference thread. mlx (>=0.31) GPU streams are thread-local,
-    # so EVERY model call — load and generate — must run on this single thread;
-    # its single worker also serializes concurrent requests onto the shared GPU.
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="infer")
+    # ONE dedicated inference thread PER MODEL. mlx (>=0.31) GPU streams are
+    # thread-local, so every call for a given model — load and generate — must
+    # run on that model's own single thread (the invariant from #21); each
+    # executor's single worker still serializes requests for its own model.
+    #
+    # Two executors rather than one shared: with a single worker, a transcription
+    # queued behind speech synthesis waited for it to finish — measured at 8.8s
+    # against a 0.33s solo latency, and 1.5-3s in normal dashboard use because
+    # the queue is FIFO and TTS prefetches one clip ahead. That is precisely the
+    # barge-in path, where the user is talking over the assistant and needs to be
+    # heard NOW. Split, transcription stays at 0.33s while TTS generates.
+    #
+    # The two threads do contend for the one GPU, so an overlapping synthesis can
+    # slow down or stall. That is an acceptable trade here and not a reason to
+    # use separate processes: the contention is at the GPU, so a second process
+    # would suffer it identically while also costing another copy of the models.
+    # The only time the two overlap is a barge-in — and a barge-in cancels
+    # playback, so the clip that loses time is one being discarded anyway.
+    tts_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts-infer")
+    stt_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stt-infer")
 
     tts = LocalTTS(local_cfg)
     stt = LocalTranscriber(stt_model)
-    # Warm both models ON the inference thread so their thread-local mlx streams
-    # are created where inference will later run (not on the main thread).
+    # Warm each model ON its own inference thread so its thread-local mlx stream
+    # is created where that model's inference will later run (not on the main
+    # thread, and not on the other model's thread).
     print("Loading TTS model (Qwen3)...", flush=True)
-    executor.submit(tts._ensure_model).result()
+    tts_executor.submit(tts._ensure_model).result()
     print("Loading STT model (Qwen3-ASR)...", flush=True)
-    executor.submit(stt._ensure_model).result()
+    stt_executor.submit(stt._ensure_model).result()
     print("Models loaded", flush=True)
 
     server = ThreadedHTTPServer(('0.0.0.0', port), VoiceAPIHandler)
     server.tts = tts
     server.stt = stt
-    server.executor = executor
+    server.tts_executor = tts_executor
+    server.stt_executor = stt_executor
 
     print(f"Voice API ready on http://0.0.0.0:{port}  "
           f"(POST /transcribe, POST /synthesize, GET /health)", flush=True)
