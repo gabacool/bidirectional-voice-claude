@@ -7,5 +7,7 @@ pyobjc-framework-Cocoa>=10.0
 
 # Local backend (Apple Silicon) - install these for backend: local
 mlx-qwen3-asr>=0.3.5
-mlx-audio>=0.4.5  # >=0.4.5 fixes intermittent full-utterance re-generation (missed EOS) in Qwen3-TTS
+mlx-audio>=0.5.4  # 0.5.4+ ships breeze_tts (Breeze TTS 2 MLX); 0.4.5+ fixed Qwen3 missed-EOS
+huggingface_hub>=0.26.0  # Vireo gated bundle (mchen04/Vireo-TTS-3B-MLX-mixed4bit)
+edge-tts>=7.0.0   # Microsoft Edge online TTS (default local engine; no API key)
 soundfile>=0.12.0

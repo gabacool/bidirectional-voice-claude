@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LAN voice API — exposes the local MLX STT/TTS as two simple HTTP endpoints so a
+LAN voice API — exposes the local STT/TTS as two simple HTTP endpoints so a
 remote agent (e.g. Hermes on Origin) can use them over the network.
 
 Endpoints (bound to 0.0.0.0 — LAN only, no auth):
@@ -14,7 +14,7 @@ Endpoints (bound to 0.0.0.0 — LAN only, no auth):
                      -> JSON {"text": "..."}      (Qwen3-ASR STT)
 
   POST /synthesize   JSON {"text": "..."}
-                     -> WAV bytes, 24kHz mono 16-bit   (Qwen3-TTS, one blob)
+                     -> WAV bytes, 24kHz mono 16-bit   (configured TTS engine, one blob)
 
   POST /v1/audio/speech
                      JSON {"input", "voice"?, "response_format": "wav"|"pcm",
@@ -24,11 +24,18 @@ Endpoints (bound to 0.0.0.0 — LAN only, no auth):
                         16-bit; "wav" prepends a streaming WAV header, "pcm" is
                         raw 16-bit LE PCM
 
-  GET  /health       -> "ok"
+  GET  /health       -> "ok tts=<engine> voice=<name>"
 
-This is independent of tts_daemon.py (the Option+S local-speaker daemon). It
-loads its own copy of both models and never touches the Mac's mic or speakers —
-audio only flows in/out as bytes.
+Local-speaker control (Option+S). Same process, but localhost-only — LAN
+clients get 403. Toggle/pause/seek behavior is unchanged from tts_daemon.py:
+
+  POST /speak        body = text (or clipboard if empty) → play / pause / resume
+  POST /stop         hard-stop current utterance
+  POST /seek/back    rewind tts_seek_seconds
+  POST /seek/forward fast-forward tts_seek_seconds
+  POST /save         body = text (or clipboard if empty) → WAV in ~/Downloads
+
+LAN byte endpoints are unchanged. Option+S scripts post to this port (9900).
 
 Run:  python voice_api.py            (port from config.yaml: local.voice_api_port, default 9900)
 """
@@ -43,16 +50,23 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import wave
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
 import numpy as np
 import yaml
 
-from tts_client import LocalTTS
+from tts_client import (
+    BREEZE_PLAY_PRIME_SAMPLES,
+    SeekControl,
+    create_local_tts,
+    replace_or_reconfigure_tts,
+)
 from voice_client import LocalTranscriber
 
 DEFAULT_PORT = 9900
@@ -74,6 +88,52 @@ SPEECH_STREAMING_INTERVAL = 0.5
 # first chunk must flow straight through (low time-to-first-byte) and we must
 # NOT buffer the whole utterance ahead of the client.
 STREAM_QUEUE_MAXSIZE = 4
+# Playback seek step is in samples at the local TTS rate (24 kHz).
+SPEAK_SAMPLE_RATE = 24000
+SPEAKER_PATHS = ('/speak', '/stop', '/seek/back', '/seek/forward', '/save')
+DEFAULT_TTS_DOWNLOADS = Path.home() / 'Downloads'
+
+
+def tts_download_path(engine: str, now: datetime | None = None,
+                      downloads: Path | None = None) -> Path:
+    """``~/Downloads/{engine}-YYYYMMDD-HHMMSS.wav``, unique within the second."""
+    folder = Path(downloads) if downloads is not None else DEFAULT_TTS_DOWNLOADS
+    stamp = (now or datetime.now()).strftime('%Y%m%d-%H%M%S')
+    safe = ''.join(c for c in (engine or 'tts') if c.isalnum() or c in '-_') or 'tts'
+    path = folder / f'{safe}-{stamp}.wav'
+    n = 2
+    while path.exists():
+        path = folder / f'{safe}-{stamp}-{n}.wav'
+        n += 1
+    return path
+
+
+def is_loopback_host(host: str) -> bool:
+    """True for IPv4/IPv6 localhost, including IPv4-mapped IPv6."""
+    h = (host or '').lower().strip()
+    if h in ('127.0.0.1', '::1', 'localhost'):
+        return True
+    return h.startswith('::ffff:') and h.endswith('127.0.0.1')
+
+
+def maybe_reload_config(server) -> None:
+    """Re-apply config.yaml if it changed. Engine swaps replace the TTS object."""
+    try:
+        mtime = CONFIG_PATH.stat().st_mtime
+    except OSError:
+        return
+    if mtime == getattr(server, 'config_mtime', None):
+        return
+    server.config_mtime = mtime
+    local_cfg = load_config().get('local', {})
+    server.tts, swapped = replace_or_reconfigure_tts(server.tts, local_cfg)
+    if swapped:
+        server.tts_executor.submit(server.tts._ensure_model).result()
+        print(f"Switched TTS engine to {server.tts.engine} "
+              f"(speaker={server.tts.speaker})", flush=True)
+    else:
+        print(f"Reloaded config (speaker={server.tts.speaker}, "
+              f"speed={server.tts.speed})", flush=True)
 
 
 def load_config() -> dict:
@@ -268,6 +328,43 @@ class _GeneratorError:
 
 # Distinct end-of-stream marker put on the queue when the producer finishes.
 _STREAM_SENTINEL = object()
+# Origin's per-read timeout is 30s. Hold Breeze body bytes until 15s of audio
+# (or EOS), but start draining by ~22s wall so the first body byte still lands
+# inside that budget after clone prefill.
+BREEZE_SPEECH_PRIME_MAX_WAIT_S = 22.0
+
+
+def prime_chunks(
+    chunks: Iterator[np.ndarray],
+    prime_samples: int,
+    *,
+    max_wait_s: float | None = None,
+    clock_fn=None,
+) -> Iterator[np.ndarray]:
+    """Hold PCM until ``prime_samples`` (or source EOF), then yield the buffer.
+
+    Breeze is slower than realtime. Origin plays bytes as they arrive, so a
+    short clip hitch-steps unless the first body byte waits for the whole
+    utterance (or a 15s cushion on a long one). HTTP headers must already be
+    on the wire — this only delays the body.
+    """
+    if prime_samples <= 0:
+        yield from chunks
+        return
+    clock = clock_fn or time.monotonic
+    t0 = clock()
+    buf: list[np.ndarray] = []
+    n = 0
+    src = iter(chunks)
+    for chunk in src:
+        buf.append(chunk)
+        n += int(np.asarray(chunk).size)
+        if n >= prime_samples:
+            break
+        if max_wait_s is not None and clock() - t0 >= max_wait_s:
+            break
+    yield from buf
+    yield from src
 
 
 def run_generator_on(
@@ -360,11 +457,31 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == '/health':
-            self._respond_text(200, 'ok')
+            tts = getattr(self.server, 'tts', None)
+            engine = getattr(tts, 'engine', '?') if tts else '?'
+            speaker = getattr(tts, 'speaker', '?') if tts else '?'
+            self._respond_text(200, f'ok tts={engine} voice={speaker}')
         else:
             self._respond_json(404, {"error": "not found"})
 
     def do_POST(self):
+        if self.path in SPEAKER_PATHS:
+            if not is_loopback_host(self.client_address[0]):
+                self._respond_text(403, 'localhost only')
+                return
+            if self.path == '/speak':
+                self._handle_speak_toggle()
+            elif self.path == '/stop':
+                self.server.stop_event.set()
+                self.server.pause_event.clear()
+                self._respond_text(200, 'stopped')
+            elif self.path == '/seek/back':
+                self._handle_seek(-1)
+            elif self.path == '/save':
+                self._handle_save()
+            else:
+                self._handle_seek(+1)
+            return
         if self.path == '/transcribe':
             self._handle_transcribe()
         elif self.path == '/v1/audio/transcriptions':
@@ -375,6 +492,113 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             self._handle_speech()
         else:
             self._respond_json(404, {"error": "not found"})
+
+    def _handle_seek(self, direction: int) -> None:
+        """Rewind (direction<0) or fast-forward while something is playing."""
+        if not self.server.playing.is_set():
+            self._respond_text(200, 'idle')
+            return
+        samples = int(direction * self.server.tts.seek_seconds * SPEAK_SAMPLE_RATE)
+        self.server.seek.request(samples)
+        self.server.pause_event.clear()
+        print(f"[seek {'+' if direction > 0 else '-'}{self.server.tts.seek_seconds}s]",
+              flush=True)
+        self._respond_text(200, 'seeked')
+
+    def _handle_speak_toggle(self) -> None:
+        """Option+S: idle→speak, speaking→pause, paused→resume. Same as tts_daemon."""
+        if self.server.playing.is_set():
+            # Buffering before first sound: a second Option+S is cancel, not
+            # pause. Pause used to freeze Breeze generate so the wait-for-clip
+            # never finished and Option+S looked dead.
+            if not self.server.audible.is_set():
+                self.server.stop_event.set()
+                self.server.pause_event.clear()
+                print("[stop-before-play]", flush=True)
+                self._respond_text(200, 'stopped')
+                return
+            if self.server.pause_event.is_set():
+                self.server.pause_event.clear()
+                print("[resume]", flush=True)
+                self._respond_text(200, 'resumed')
+            else:
+                self.server.pause_event.set()
+                print("[pause]", flush=True)
+                self._respond_text(200, 'paused')
+            return
+
+        content_length = int(self.headers.get('Content-Length', 0))
+        if content_length > 0:
+            text = self.rfile.read(content_length).decode('utf-8')
+        else:
+            text = subprocess.run(
+                ['pbpaste'], capture_output=True, text=True
+            ).stdout
+        text = text.strip()
+        if not text:
+            self._respond_text(400, 'empty')
+            return
+
+        with self.server.speak_lock:
+            maybe_reload_config(self.server)
+            self.server.stop_event.clear()
+            self.server.pause_event.clear()
+            self.server.audible.clear()
+            self.server.seek.pop()
+            self.server.playing.set()
+            try:
+                # Qwen must generate on the TTS infer thread (mlx stream affinity).
+                self.server.tts_executor.submit(
+                    self.server.tts.synthesize_and_play,
+                    text,
+                    self.server.stop_event,
+                    self.server.pause_event,
+                    self.server.seek,
+                    self.server.audible,
+                ).result()
+                self._respond_text(200, 'ok')
+            except Exception as e:
+                print(f"TTS error: {e}", file=sys.stderr, flush=True)
+                self._respond_text(500, str(e))
+            finally:
+                self.server.playing.clear()
+                self.server.pause_event.clear()
+
+    def _handle_save(self) -> None:
+        """Option+Shift+S: clipboard (or POST body) → WAV in ~/Downloads."""
+        content_length = int(self.headers.get('Content-Length', 0))
+        if content_length > 0:
+            text = self.rfile.read(content_length).decode('utf-8')
+        else:
+            text = subprocess.run(
+                ['pbpaste'], capture_output=True, text=True
+            ).stdout
+        text = text.strip()
+        if not text:
+            self._respond_text(400, 'empty')
+            return
+
+        with self.server.speak_lock:
+            maybe_reload_config(self.server)
+
+        try:
+            audio = self.server.tts_executor.submit(
+                self.server.tts.synthesize_to_array, text).result()
+        except Exception as e:
+            print(f"[save error] {e}", file=sys.stderr, flush=True)
+            self._respond_text(500, str(e))
+            return
+        if audio.size == 0:
+            self._respond_text(400, 'no speakable text after cleanup')
+            return
+
+        folder = getattr(self.server, 'tts_downloads', DEFAULT_TTS_DOWNLOADS)
+        folder.mkdir(parents=True, exist_ok=True)
+        engine = getattr(self.server.tts, 'engine', 'tts')
+        path = tts_download_path(engine, downloads=folder)
+        path.write_bytes(pcm_to_wav_bytes(audio, TTS_SAMPLE_RATE))
+        print(f"[save] {path}", flush=True)
+        self._respond_text(200, str(path))
 
     def _read_body(self) -> bytes:
         length = int(self.headers.get('Content-Length', 0))
@@ -476,12 +700,13 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
     def _handle_speech(self) -> None:
         """OpenAI-compatible ``/v1/audio/speech`` — stream TTS audio progressively.
 
-        The response body is delivered with no Content-Length and
-        ``Connection: close`` (HTTP/1.0 unknown-length semantics): the first
-        bytes hit the wire as soon as the first model chunk exists, and the
-        client reads until the socket closes. All validation happens *before* any
-        audio byte is sent so those failures can still be a proper 400; once
-        bytes are on the wire a mid-stream failure can only close the connection.
+        HTTP 200 headers go out as soon as the request is valid, *before* the
+        first PCM chunk exists. Origin's chat proxy treats a stall before
+        headers (30s ReadTimeout) as 502 "voice service unreachable" and fails
+        over; Breeze clone prefill is often 5–15s and can exceed that, while
+        Vireo TTFB is ~0.2s and never trips it. Validation still 400s before
+        any headers. The body stays unknown-length ``Connection: close``; a
+        mid-stream failure can only close the socket.
         """
         body = self._read_body()
         params, err = parse_speech_request(body)
@@ -497,48 +722,42 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
         # the socket. run_generator_on bridges the two: chunks are pumped on the
         # inference thread and handed here through a small bounded queue, and
         # closing the returned generator aborts the producer (no orphan) — so we
-        # close it in every exit path below.
+        # close it in every exit path below. Submit generation *before* writing
+        # headers so clone prefill overlaps the round-trip.
         stream = run_generator_on(
             self.server.tts_executor,
             lambda: self.server.tts.synthesize_stream(
                 text, voice=voice, streaming_interval=SPEECH_STREAMING_INTERVAL),
         )
         try:
-            # Pull the first chunk while no bytes are on the wire yet, so an
-            # up-front generation failure (e.g. unknown voice) or empty-after-
-            # cleanup text still becomes a clean 400 instead of a broken stream.
-            first = None
-            try:
-                for chunk in stream:
-                    first = chunk
-                    break
-            except Exception as e:
-                print(f"[speech] generation failed before audio: {e}",
-                      file=sys.stderr, flush=True)
-                self._respond_json(
-                    400, error_body(f"speech generation failed: {e}",
-                                    openai_shape=True))
-                return
-            if first is None:
-                self._respond_json(
-                    400, error_body("no speakable text after cleanup",
-                                    openai_shape=True))
-                return
-
-            # Commit to a streaming 200: unknown length, close on completion.
             self.send_response(200)
             self.send_header('Content-Type',
                              'audio/wav' if fmt == 'wav' else 'audio/pcm')
             self.send_header('Connection', 'close')
             self.end_headers()
             self.close_connection = True
+            self.wfile.flush()
 
             try:
+                engine = getattr(self.server.tts, 'engine', '')
+                primed = stream
+                if engine == 'breeze':
+                    primed = prime_chunks(
+                        stream,
+                        BREEZE_PLAY_PRIME_SAMPLES,
+                        max_wait_s=BREEZE_SPEECH_PRIME_MAX_WAIT_S,
+                    )
+                first = None
+                for chunk in primed:
+                    first = chunk
+                    break
+                if first is None:
+                    return
                 if fmt == 'wav':
                     self.wfile.write(wav_streaming_header())
                 self.wfile.write(f32_to_pcm16(first))
                 self.wfile.flush()
-                for chunk in stream:
+                for chunk in primed:
                     self.wfile.write(f32_to_pcm16(chunk))
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError) as e:
@@ -546,8 +765,8 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
                 print(f"[speech] client disconnected mid-stream: {e}",
                       file=sys.stderr, flush=True)
             except Exception as e:
-                # Generation failed after audio was already sent — a 400 is no
-                # longer possible; log and let the connection close.
+                # Generation failed after headers were already sent — a 400 is
+                # no longer possible; log and let the connection close.
                 print(f"[speech] generation error mid-stream: {e}",
                       file=sys.stderr, flush=True)
         finally:
@@ -621,12 +840,12 @@ def main():
     tts_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts-infer")
     stt_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stt-infer")
 
-    tts = LocalTTS(local_cfg)
+    tts = create_local_tts(local_cfg)
     stt = LocalTranscriber(stt_model)
     # Warm each model ON its own inference thread so its thread-local mlx stream
     # is created where that model's inference will later run (not on the main
-    # thread, and not on the other model's thread).
-    print("Loading TTS model (Qwen3)...", flush=True)
+    # thread, and not on the other model's thread). Edge TTS has no local model.
+    print(f"Loading TTS ({tts.engine}, {tts.speaker})...", flush=True)
     tts_executor.submit(tts._ensure_model).result()
     print("Loading STT model (Qwen3-ASR)...", flush=True)
     stt_executor.submit(stt._ensure_model).result()
@@ -637,9 +856,21 @@ def main():
     server.stt = stt
     server.tts_executor = tts_executor
     server.stt_executor = stt_executor
+    server.speak_lock = threading.Lock()
+    server.stop_event = threading.Event()
+    server.pause_event = threading.Event()
+    server.audible = threading.Event()
+    server.seek = SeekControl()
+    server.playing = threading.Event()
+    server.tts_downloads = DEFAULT_TTS_DOWNLOADS
+    try:
+        server.config_mtime = CONFIG_PATH.stat().st_mtime
+    except OSError:
+        server.config_mtime = 0
 
     print(f"Voice API ready on http://0.0.0.0:{port}  "
-          f"(POST /transcribe, POST /synthesize, GET /health)", flush=True)
+          f"(LAN: /transcribe /synthesize ; localhost: /speak /stop /seek /save)",
+          flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -1,5 +1,9 @@
 # Voice client configuration
-# Copy this file to config.yaml and update settings
+# Copy this file to config.yaml and update settings.
+#
+# Switch TTS with local.tts_engine only. Each engine keeps its own block so
+# unused engines stay configured and do not leak speaker/instruct/model into
+# the active one. Shared playback (speed, seek, pause) lives at local top-level.
 
 # Backend: "origin" (GPU server via WebSocket) or "local" (Apple Silicon via MLX)
 backend: local
@@ -14,47 +18,81 @@ origin:
   server_url: "ws://YOUR_SERVER_IP:8087"
   tts_server_url: "ws://YOUR_SERVER_IP:8088"
 
-# Local backend - Apple Silicon (MLX)
-# First run downloads models automatically from HuggingFace
+# Local backend - Apple Silicon (MLX) for STT; TTS engine is chosen below
+# First run of Qwen STT/TTS downloads models automatically from HuggingFace
 local:
   # STT (speech-to-text) - Qwen3-ASR via mlx-qwen3-asr
   stt_model: "Qwen/Qwen3-ASR-0.6B"
 
-  # TTS (text-to-speech) - Qwen3-TTS via mlx-audio
-  tts_model: "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit"
-  # Faster alternatives (trade quality for speed):
-  # tts_model: "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit"   # ~2x faster
-  # tts_model: "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit"   # smaller model, faster
-  # tts_model: "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit"   # fastest
-  tts_speaker: "aiden"              # aiden, ryan, serena, vivian, dylan, eric, uncle_fu,
-                                    # ono_anna (japanese), sohee (korean)
-  tts_language: "english"           # auto, english, chinese, german, french, spanish, italian, portuguese, japanese, korean, russian
-  tts_instruct: "calm, consistent conversational tone"  # Emotion/style anchor, e.g. "excited",
-                                    # "whispering". Keep it a real style description: a placeholder
-                                    # word invites the model to improvise tone per generation.
-  tts_temperature: 0.7              # Randomness. Keep 0.7-1.0; below ~0.5 this model collapses to
-                                    # silence after the first word. 0.7 holds tone steady across the
-                                    # per-sentence generations voice mode makes (0.9 varied audibly).
-  tts_top_k: 50                     # Token sampling pool size
-  tts_top_p: 1.0                    # Nucleus sampling threshold (0.0-1.0)
-  tts_repetition_penalty: 1.1       # Token-loop protection (upstream default 1.05). Does NOT fix the
-                                    # intermittent whole-utterance re-generation — that was an
-                                    # mlx-audio 0.3.x bug, fixed by mlx-audio>=0.4.5.
-  tts_max_tokens: 4096              # Max codec tokens for ONE utterance = the runaway backstop.
-                                    # 12.5 tokens/sec of audio, so 4096 ~= 5.5 min. Raise it only if a
-                                    # single utterance is truly longer. HARD CEILING is the talker's
-                                    # max_position_embeddings (32768), shared with the text prompt —
-                                    # never set at or above it.
-  tts_streaming_interval: 2.0       # Seconds of audio per chunk (lower = faster first sound)
-  tts_speed: 1.0                    # Playback speed, pitch preserved (1.0 normal, 1.5 faster, 0.8 slower)
-  tts_seek_seconds: 15              # Rewind/forward step for Option+< / Option+> while speaking
-  tts_max_pause_seconds: 0.2        # Cap the model's inter-sentence silence, in seconds (0 = off).
-                                    # Batch path only — the streaming path yields raw model chunks.
+  # LAN voice API (voice_api.py)
+  voice_api_port: 9900              # OpenAI-compatible: POST /v1/audio/transcriptions,
+                                    # POST /v1/audio/speech. Legacy: /transcribe, /synthesize.
 
-  # LAN voice API (voice_api.py) — STT/TTS over HTTP for remote agents
-  voice_api_port: 9900              # OpenAI-compatible: POST /v1/audio/transcriptions (audio->text),
-                                    # POST /v1/audio/speech (text->streaming pcm/wav).
-                                    # Legacy: POST /transcribe, POST /synthesize (text->whole WAV).
+  # Playback shared by every TTS engine
+  tts_speed: 1.0                    # Playback speed, pitch preserved (1.0 normal, 1.5 faster)
+  tts_seek_seconds: 15              # Option+< / Option+> step while speaking
+  tts_max_pause_seconds: 0.2        # Cap inter-sentence silence on the batch path (0 = off)
+
+  # Active TTS engine: edge | qwen | breeze | vireo
+  tts_engine: edge
+
+  # --- edge (internet, no GPU) ---
+  # List voices: edge-tts --list-voices
+  edge:
+    voice: "en-US-EmmaMultilingualNeural"
+    rate: "+0%"                     # if omitted, derived from tts_speed (1.2 -> +20%)
+    volume: "+0%"
+    pitch: "+0Hz"
+
+  # --- qwen (on-device Qwen3-TTS via mlx-audio) ---
+  # Speakers: aiden, ryan (EN male); serena, vivian (ZH female);
+  # dylan, eric, uncle_fu (ZH male); ono_anna (JA); sohee (KO).
+  # Keep temperature in 0.7–1.0 or the model collapses to silence.
+  qwen:
+    model: "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit"
+    # model: "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit"   # ~2x faster
+    # model: "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit"   # fastest
+    speaker: aiden
+    language: english               # auto, english, chinese, german, french, spanish, ...
+    instruct: "calm, consistent conversational tone"
+    temperature: 0.7
+    top_k: 50
+    top_p: 1.0
+    repetition_penalty: 1.1
+    max_tokens: 4096                # ~12.5 tokens/s of audio; ceiling is 32768
+    streaming_interval: 2.0         # seconds of audio per chunk
+
+  # --- breeze (on-device Breeze TTS 2 via mlx-audio, ~3GB). Research/non-commercial. ---
+  # Slower than realtime on this Mac. Auto-builds client/voices/breeze_lock.wav
+  # from instruct, then clones it. Optional ref_audio + ref_text skips the lock.
+  breeze:
+    model: "mlx-community/Breeze-TTS-2-mlx-4bit"
+    # model: "mlx-community/Breeze-TTS-2-mlx-8bit"
+    # model: "mlx-community/Breeze-TTS-2-mlx"
+    instruct: "A warm, thoughtful young American woman with a clear voice."
+    cfg_scale: 4                    # lock-clip design strength
+    seed: 42
+    # Clone a wav instead of the auto lock. BOTH keys are required: mlx-audio
+    # raises if ref_audio is set without the exact transcript of that clip.
+    # ~5–15s, mono, quiet room. Uncomment both, or leave both commented.
+    # ref_audio: "/Users/gabagool/Git/nvidia_parakeet/client/voices/breeze_lock.wav"
+    # ref_text: "Hello. This is a calm American woman speaking clearly, like a podcast host."
+    # ref_audio: "/Users/gabagool/Git/nvidia_parakeet/client/voices/my_voice.wav"
+    # ref_text: "The exact sentence you spoke in that recording."
+
+  # --- vireo (pruned mixed-4-bit Breeze via breeze_mlx, ~2.1GB, gated HF). ---
+  # Faster than realtime at cfg_scale 1. Default clones breeze_lock.wav.
+  # Empty ref_audio falls back to voice design. Clone needs exact ref_text.
+  # Clips longer than 8s (English+Chinese stitches) are packed to ~4s of
+  # each language so the 2048 context does not go analog-radio.
+  vireo:
+    model: "mchen04/Vireo-TTS-3B-MLX-mixed4bit"
+    speaker: S0
+    instruct: "A warm, thoughtful young American woman with a clear voice."
+    cfg_scale: 1                    # 1.0 = realtime clone; 4.0 is the slow two-branch
+    seed: 42
+    # ref_audio: "/Users/you/Git/nvidia_parakeet/client/voices/my_voice.wav"
+    # ref_text: "The exact sentence spoken in that wav."
 
 # Optional terminal voice-chat overrides (agent_voice: claude-voice / hermes-voice / grok-voice)
 #

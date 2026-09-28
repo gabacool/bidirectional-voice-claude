@@ -19,16 +19,19 @@ Two layers throughout:
     ``VOICE_API_URL`` is set, since they need the live models.
 """
 
+import http.client
 import io
 import json
 import os
 import struct
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
 import wave
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
@@ -377,6 +380,137 @@ def test_parse_speech_request_non_string_voice() -> None:
     assert err and "voice" in err
 
 
+class _SlowFakeTTS:
+    """Yields one PCM chunk after ``delay`` seconds — Breeze clone-prefill stand-in."""
+
+    engine = "breeze"
+    speaker = "lock"
+
+    def __init__(self, delay: float = 1.2):
+        self.delay = delay
+
+    def synthesize_stream(self, text, voice=None, streaming_interval=None):
+        del text, voice, streaming_interval
+        time.sleep(self.delay)
+        yield np.full(2400, 0.1, dtype=np.float32)
+
+
+def _serve_speech(tts) -> tuple[voice_api.ThreadedHTTPServer, int, ThreadPoolExecutor]:
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts-infer")
+    server = voice_api.ThreadedHTTPServer(("127.0.0.1", 0), voice_api.VoiceAPIHandler)
+    server.tts = tts
+    server.tts_executor = executor
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, server.server_address[1], executor
+
+
+def test_speech_sends_headers_before_first_audio_chunk() -> None:
+    """Origin's chat proxy fails over with 502 "voice service unreachable" when
+    9900 accepts TCP but withholds HTTP headers until the first PCM chunk.
+
+    Breeze clone prefill is often 5–15s and can exceed Origin's 30s header-stage
+    read timeout under GPU contention. Vireo TTFB is ~0.2s so it never trips.
+    Headers must leave the socket before audio exists; first body byte can wait.
+    """
+    delay = 1.2
+    server, port, executor = _serve_speech(_SlowFakeTTS(delay=delay))
+    try:
+        body = json.dumps(
+            {"input": "Hello there.", "response_format": "pcm"}
+        ).encode()
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=delay + 2.0)
+        t0 = time.monotonic()
+        conn.request(
+            "POST",
+            "/v1/audio/speech",
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+        resp = conn.getresponse()
+        header_s = time.monotonic() - t0
+        assert resp.status == 200
+        assert header_s < 0.8, (
+            f"headers waited {header_s:.2f}s for first audio "
+            f"(Origin would 502 this as unreachable)"
+        )
+        payload = resp.read()
+        assert len(payload) == 2400 * 2
+    finally:
+        server.shutdown()
+        executor.shutdown(wait=False)
+
+
+def test_prime_chunks_holds_until_eos_when_clip_is_short() -> None:
+    """A 0.3s clip must not leak the first chunk before the generator ends."""
+    chunks = [
+        np.ones(2400, dtype=np.float32),
+        np.ones(2400, dtype=np.float32),
+        np.ones(2400, dtype=np.float32),
+    ]
+    got = list(voice_api.prime_chunks(iter(chunks), prime_samples=15 * 24000))
+    assert len(got) == 3
+    assert all(g.size == 2400 for g in got)
+
+
+def test_prime_chunks_releases_after_fifteen_seconds() -> None:
+    def gen():
+        for i in range(40):
+            yield np.full(24000, float(i), dtype=np.float32)  # 1s each
+
+    it = voice_api.prime_chunks(gen(), prime_samples=15 * 24000)
+    first = next(it)
+    assert first[0] == 0.0
+    rest = list(it)
+    assert len(rest) == 39
+
+
+class _StagedFakeTTS:
+    """Three 0.1s chunks, 0.15s apart — a short Breeze clip stand-in."""
+
+    engine = "breeze"
+    speaker = "lock"
+
+    def synthesize_stream(self, text, voice=None, streaming_interval=None):
+        del text, voice, streaming_interval
+        for _ in range(3):
+            time.sleep(0.15)
+            yield np.full(2400, 0.1, dtype=np.float32)
+
+
+def test_speech_breeze_holds_body_until_short_clip_done() -> None:
+    """Origin plays PCM as it arrives. For Breeze, first body byte must wait
+    until the short clip is fully generated (or 15s of audio), or the player
+    hitch-steps even a 0.3s utterance."""
+    server, port, executor = _serve_speech(_StagedFakeTTS())
+    try:
+        payload = json.dumps(
+            {"input": "Hello there.", "response_format": "pcm"}
+        ).encode()
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3.0)
+        t0 = time.monotonic()
+        conn.request(
+            "POST",
+            "/v1/audio/speech",
+            body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        resp = conn.getresponse()
+        header_s = time.monotonic() - t0
+        assert resp.status == 200
+        assert header_s < 0.4, f"headers stalled {header_s:.2f}s"
+        first = resp.read(1)
+        ttfb = time.monotonic() - t0
+        rest = resp.read()
+        assert len(first + rest) == 3 * 2400 * 2
+        # Without a 15s/EOS prime, the first PCM byte leaves after chunk 1
+        # (~0.15s) and Origin's player hitch-steps. Hold until the short clip
+        # is done (~0.45s).
+        assert ttfb >= 0.40, f"first body byte at {ttfb:.2f}s, clip still generating"
+    finally:
+        server.shutdown()
+        executor.shutdown(wait=False)
+
+
 # --------------------------------------------------------------------------- #
 # Live integration tests — /v1/audio/speech against the running service.
 # --------------------------------------------------------------------------- #
@@ -390,9 +524,10 @@ _SPEECH_TEXT = (
 def _post_json_stream(url: str, obj: dict, timeout: int = 120):
     """POST JSON, streaming the response. Returns (status, ttfb, total, body).
 
-    ``ttfb`` is measured from just-before the request to the first body byte;
-    because the server only sends headers after the first audio chunk exists,
-    this reflects real time-to-first-audio. ``total`` covers reading to EOF.
+    ``ttfb`` is measured from just-before the request to the first body byte.
+    HTTP headers leave before audio (Origin's 30s header-stage budget), but the
+    body still starts at the first PCM chunk, so this remains time-to-first-audio.
+    ``total`` covers reading to EOF.
     """
     data = json.dumps(obj).encode()
     req = urllib.request.Request(

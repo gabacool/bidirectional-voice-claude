@@ -73,10 +73,14 @@ def test_squeeze_silence_empty() -> None:
 # Live integration test — needs the real MLX model (RUN_MLX_TESTS=1).
 # --------------------------------------------------------------------------- #
 def _local_config() -> dict:
-    """The real ``local`` section from client/config.yaml — the live service's config."""
+    """The real ``local`` section, flattened for the Qwen engine under test."""
+    from tts_client import flatten_local_tts_config
     cfg_path = Path(__file__).resolve().parent.parent / "config.yaml"
     with open(cfg_path) as f:
-        return (yaml.safe_load(f) or {}).get("local", {})
+        local = (yaml.safe_load(f) or {}).get("local", {})
+    local = dict(local)
+    local["tts_engine"] = "qwen"
+    return flatten_local_tts_config(local)
 
 
 @pytest.mark.skipif(
