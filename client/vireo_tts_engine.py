@@ -18,6 +18,7 @@ from typing import Iterator
 import numpy as np
 
 from breeze_tts_engine import DEFAULT_LOCK_PATH, LOCK_TEXT
+from speech_normalize import normalize_for_speech
 from tts_client import (
     AudioTape,
     _play_tape,
@@ -54,6 +55,50 @@ _BLOCKED_REF_NAMES = frozenset({"scarlett_johansson.wav"})
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _EN_WORDS_PER_SEC = 3.4
 _ZH_CHARS_PER_SEC = 4.5
+
+
+_SPELLED_RE = re.compile(r"[A-Z0-9]")
+_PAUSE_RE = re.compile(r"[.,;:!?—–()]")
+
+
+def _spoken_seconds(text: str) -> float:
+    """Estimated seconds to say ``text`` aloud.
+
+    Characters per second is a poor ruler: ``GGUF`` or ``155GB`` is said
+    letter by letter and takes several times longer than its length suggests.
+    Plain words cost ~0.29s; a word with capitals or digits costs per
+    capital/digit instead; CJK costs per character; punctuation adds a pause.
+    """
+    src = text or ""
+    cjk = len(_CJK_RE.findall(src))
+    seconds = cjk / _ZH_CHARS_PER_SEC
+    for word in _CJK_RE.sub(" ", src).split():
+        spelled = len(_SPELLED_RE.findall(word))
+        if spelled >= 2 or any(c.isdigit() for c in word):
+            seconds += 0.3 * spelled + 0.08 * sum(c.islower() for c in word)
+        elif any(c.isalpha() for c in word):
+            seconds += 1.0 / _EN_WORDS_PER_SEC
+    seconds += 0.15 * len(_PAUSE_RE.findall(src))
+    return seconds
+
+
+# Runaway guard. A generate can lose its place in the text: it never emits
+# end-of-speech and murmurs (or drifts into the clone clip's Chinese) until
+# max_new_tokens — 60–140s of babble for a 20s line. Measured on 40 real
+# generates: clean audio ran 0.9–1.7x _spoken_seconds, garbled/runaway ones
+# 2.2–7x. It is a per-seed sampling failure, so a fresh seed usually fixes it.
+# The packed bilingual stitch clip is what makes it common: on hard table
+# rows it ran away 5/12 times vs 0/12 for an English-only clip of the same
+# voice. The guard is the safety net, not the cure — clone a clean clip.
+RUNAWAY_FACTOR = 2.0
+MIN_RUNAWAY_SECONDS = 5.0
+RUNAWAY_RETRIES = 2
+RETRY_SEED_STRIDE = 1000
+
+
+def _runaway_seconds(text: str) -> float:
+    """Audio length past which a generate for ``text`` is treated as lost."""
+    return max(MIN_RUNAWAY_SECONDS, RUNAWAY_FACTOR * _spoken_seconds(text))
 
 
 def _token_budget(text: str, ceiling: int = MAX_TOKENS_CEILING) -> int:
@@ -599,8 +644,13 @@ class VireoTTS:
             kwargs["audio_codes"] = self._audio_codes
         return kwargs
 
-    def _stream_one(self, kwargs: dict, *, segment: int, segments: int
-                    ) -> Iterator[np.ndarray]:
+    def _stream_one(self, kwargs: dict, *, segment: int, segments: int,
+                    limit_seconds: float | None = None,
+                    status: dict | None = None) -> Iterator[np.ndarray]:
+        """Yield one generate's audio; stop it once it passes ``limit_seconds``.
+
+        Sets ``status["runaway"]`` when the limit cut the generate short.
+        """
         clone = kwargs["template"] == "ref_edit_tata"
         print(
             f"[vireo] generate {segment}/{segments} "
@@ -617,35 +667,90 @@ class VireoTTS:
         t0 = time.monotonic()
         n = 0
         ttfb = None
-        for chunk in self._runtime.stream(**kwargs):
-            audio_np = np.array(chunk.audio, dtype=np.float32).reshape(-1)
-            if audio_np.size == 0:
-                continue
-            n += 1
-            now = time.monotonic()
-            if ttfb is None:
-                ttfb = now - t0
-                extra = chunk.timing.get("ttfa_ms")
+        produced = 0.0
+        stream = self._runtime.stream(**kwargs)
+        try:
+            for chunk in stream:
+                audio_np = np.array(chunk.audio, dtype=np.float32).reshape(-1)
+                if audio_np.size == 0:
+                    continue
+                if limit_seconds is not None and produced >= limit_seconds:
+                    if status is not None:
+                        status["runaway"] = True
+                    print(
+                        f"[vireo] runaway segment={segment}/{segments} "
+                        f"seed={kwargs.get('seed')}: past {limit_seconds:.1f}s "
+                        f"for {len(kwargs['request']['text'])} chars — cut",
+                        flush=True,
+                    )
+                    return
+                produced += audio_np.size / SAMPLE_RATE
+                n += 1
+                now = time.monotonic()
+                if ttfb is None:
+                    ttfb = now - t0
+                    extra = chunk.timing.get("ttfa_ms")
+                    print(
+                        f"[vireo] ttfb={ttfb:.3f}s segment={segment}/{segments}"
+                        + (f" runtime_ttfa_ms={extra:.0f}" if extra else ""),
+                        flush=True,
+                    )
+                dur = audio_np.size / SAMPLE_RATE
+                rms = float(np.sqrt(np.mean(np.square(audio_np))))
                 print(
-                    f"[vireo] ttfb={ttfb:.3f}s segment={segment}/{segments}"
-                    + (f" runtime_ttfa_ms={extra:.0f}" if extra else ""),
+                    f"[vireo] chunk#{n} +{dur:.2f}s rms={rms:.4f} "
+                    f"wall={now-t0:.1f}s",
                     flush=True,
                 )
-            dur = audio_np.size / SAMPLE_RATE
-            rms = float(np.sqrt(np.mean(np.square(audio_np)))) if audio_np.size else 0.0
+                t0 = now
+                yield audio_np
+        finally:
+            # Closing the runtime generator stops generating the cut tail.
+            close = getattr(stream, "close", None)
+            if close is not None:
+                close()
+
+    def _guarded_segment(self, kwargs: dict, *, segment: int, segments: int,
+                         live: bool) -> Iterator[np.ndarray]:
+        """One segment under the runaway guard.
+
+        ``live`` streams chunks as they are generated (the first segment, so
+        time-to-first-audio stays low); a runaway there can only be cut.
+        Otherwise the segment is held until it finishes — playback is still
+        draining earlier segments, since generation runs ~3x realtime — and a
+        runaway attempt is discarded unheard and regenerated on a new seed.
+        """
+        limit = _runaway_seconds(kwargs["request"]["text"])
+        if live:
+            yield from self._stream_one(
+                kwargs, segment=segment, segments=segments, limit_seconds=limit,
+            )
+            return
+        base_seed = kwargs["seed"]
+        held: list[np.ndarray] = []
+        for attempt in range(RUNAWAY_RETRIES + 1):
+            kwargs["seed"] = base_seed + attempt * RETRY_SEED_STRIDE
+            status: dict = {}
+            held = list(self._stream_one(
+                kwargs, segment=segment, segments=segments,
+                limit_seconds=limit, status=status,
+            ))
+            if not status.get("runaway"):
+                break
+        else:
             print(
-                f"[vireo] chunk#{n} +{dur:.2f}s rms={rms:.4f} "
-                f"wall={now-t0:.1f}s",
+                f"[vireo] segment {segment}/{segments} ran away on all "
+                f"{RUNAWAY_RETRIES + 1} seeds; playing the last attempt cut "
+                f"at {limit:.1f}s",
                 flush=True,
             )
-            t0 = now
-            yield audio_np
+        yield from held
 
     def synthesize_stream(self, text: str, voice: str | None = None,
                           streaming_interval: float | None = None
                           ) -> Iterator[np.ndarray]:
         del streaming_interval  # breeze_mlx chunks by codec frames, not seconds
-        speech_text = _prepare_for_speech(text)
+        speech_text = normalize_for_speech(_prepare_for_speech(text))
         if not speech_text:
             return
         segments = _chunk_utterance(speech_text)
@@ -654,16 +759,18 @@ class VireoTTS:
         self._ensure_model()
         if self.ref_audio and self.ref_text:
             self._ensure_codes()
+        emitted = False
         for i, segment in enumerate(segments):
             kwargs = self._stream_kwargs(segment, voice=voice)
             if kwargs is None:
                 continue
             kwargs["seed"] = self.seed + i
-            if i:
+            if emitted:
                 yield np.zeros(CHUNK_GAP_SAMPLES, dtype=np.float32)
-            yield from self._stream_one(
-                kwargs, segment=i + 1, segments=len(segments),
+            yield from self._guarded_segment(
+                kwargs, segment=i + 1, segments=len(segments), live=not emitted,
             )
+            emitted = True
 
     def synthesize_to_array(self, text: str) -> np.ndarray:
         chunks = []

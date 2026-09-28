@@ -13,6 +13,9 @@ from vireo_tts_engine import (
     MAX_CHUNK_CHARS,
     MAX_REF_FRAMES,
     MAX_TOKENS_CEILING,
+    RETRY_SEED_STRIDE,
+    RUNAWAY_RETRIES,
+    SAMPLE_RATE,
     VireoTTS,
     _chunk_utterance,
     _codes_cache_is_usable,
@@ -21,6 +24,8 @@ from vireo_tts_engine import (
     _normalize_ref_audio,
     _pack_ref_audio,
     _pack_ref_text,
+    _runaway_seconds,
+    _spoken_seconds,
     _token_budget,
     _trim_ref_audio,
     encode_lock_codes,
@@ -355,3 +360,108 @@ def test_encode_lock_codes_rejects_blocked_name(tmp_path):
     wav.write_bytes(b"x")
     with pytest.raises(ValueError, match="not allowed"):
         encode_lock_codes(wav)
+
+
+# --- runaway guard -----------------------------------------------------------
+
+
+_SEC = np.full(SAMPLE_RATE, 0.1, dtype=np.float32)  # one second of audio
+_TWO_SEGMENTS = (
+    "This is the first paragraph that is long enough to stand alone as "
+    "its own generate so the codec state can reset after it.\n\n"
+    "This is the second paragraph, also long enough on its own that the "
+    "chunker will not glue it back onto the first one at all."
+)
+
+
+RUNAWAY = 600
+
+
+class _ScriptedRuntime:
+    """Per call, yields N one-second chunks. RUNAWAY is far past any limit."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []
+        self.closed = 0
+
+    def stream(self, **kwargs):
+        self.calls.append((kwargs["request"]["text"], kwargs["seed"]))
+        seconds = self.script.pop(0)
+        try:
+            for _ in range(seconds):
+                yield _Chunk(_SEC)
+        finally:
+            self.closed += 1
+
+
+def _guarded_tts(monkeypatch, runtime):
+    tts = VireoTTS({"vireo_ref_audio": ""})
+    tts._runtime = runtime
+    monkeypatch.setattr(VireoTTS, "_ensure_model", lambda self: None)
+    return tts
+
+
+def _seconds(chunks):
+    return sum(c.size for c in chunks if float(np.max(np.abs(c))) > 0) / SAMPLE_RATE
+
+
+def test_spoken_seconds_charges_acronyms_and_digits_per_letter():
+    words = _spoken_seconds("the quick brown fox jumps over")
+    spelled = _spoken_seconds("GGUF NVFP4 155GB EXL3 Q4 DDR5")
+    assert spelled > 2 * words
+    assert _spoken_seconds("有時候我在想") == pytest.approx(6 / 4.5)
+    assert _spoken_seconds("") == 0.0
+
+
+def test_runaway_limit_has_a_floor_for_short_lines():
+    assert _runaway_seconds("Yes.") == 5.0
+    long = "word " * 60
+    assert _runaway_seconds(long) == pytest.approx(2.0 * _spoken_seconds(long))
+
+
+def test_first_segment_streams_before_its_generate_finishes(monkeypatch):
+    runtime = _ScriptedRuntime([3, 3])
+    tts = _guarded_tts(monkeypatch, runtime)
+    gen = tts.synthesize_stream(_TWO_SEGMENTS)
+    first = next(gen)
+    assert first.size == SAMPLE_RATE
+    assert runtime.closed == 0  # still mid-generate when audio came out
+    gen.close()
+
+
+def test_runaway_first_segment_is_cut_at_the_limit(monkeypatch):
+    runtime = _ScriptedRuntime([RUNAWAY])
+    tts = _guarded_tts(monkeypatch, runtime)
+    text = "Short line that never stops."
+    chunks = list(tts.synthesize_stream(text))
+    limit = _runaway_seconds(text)
+    assert limit <= _seconds(chunks) < limit + 1
+    assert runtime.closed == 1  # the runtime generator was stopped
+    assert len(runtime.calls) == 1  # already heard, so no retry
+
+
+def test_runaway_later_segment_is_discarded_and_regenerated(monkeypatch):
+    runtime = _ScriptedRuntime([3, RUNAWAY, 4])
+    tts = _guarded_tts(monkeypatch, runtime)
+    chunks = list(tts.synthesize_stream(_TWO_SEGMENTS))
+    assert _seconds(chunks) == 3 + 4  # the runaway attempt never played
+    (_, s1), (t2a, s2a), (t2b, s2b) = runtime.calls
+    assert t2a == t2b and "second paragraph" in t2a
+    assert s2b == s2a + RETRY_SEED_STRIDE
+
+
+def test_segment_that_runs_away_on_every_seed_plays_the_cut_last_attempt(monkeypatch):
+    runtime = _ScriptedRuntime([3] + [RUNAWAY] * (RUNAWAY_RETRIES + 1))
+    tts = _guarded_tts(monkeypatch, runtime)
+    chunks = list(tts.synthesize_stream(_TWO_SEGMENTS))
+    limit = _runaway_seconds(runtime.calls[1][0])
+    assert len(runtime.calls) == 1 + RUNAWAY_RETRIES + 1
+    assert 3 + limit <= _seconds(chunks) < 3 + limit + 1
+
+
+def test_symbols_are_spelled_out_before_generate(monkeypatch):
+    runtime = _ScriptedRuntime([1])
+    tts = _guarded_tts(monkeypatch, runtime)
+    list(tts.synthesize_stream("Q2 GGUF ≈ 315GB at 30–50 t/s."))
+    assert runtime.calls[0][0] == "Q2 GGUF about 315GB at 30 to 50 tokens per second."
