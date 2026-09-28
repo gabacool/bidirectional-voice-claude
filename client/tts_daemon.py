@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
-"""
-Persistent local TTS daemon — loads model once, serves requests via HTTP.
+"""Deprecated local-speaker daemon (port 8089).
 
-Start:    python tts_daemon.py
-Health:   curl http://127.0.0.1:8089/health
-Speak:    curl -X POST http://127.0.0.1:8089/speak
-          (reads clipboard at processing time, or send text in body)
-Stop:     kill $(cat /tmp/tts_daemon.pid)
-
-Auto-started by speak_clipboard.sh on first Option+S press.
+Option+S now posts to the LAN voice API on :9900 (localhost /speak, /stop,
+/seek). This process is unused. Kept so old scripts/docs don't 404 on import.
 """
 
 import os
@@ -21,7 +15,7 @@ from pathlib import Path
 
 import yaml
 
-from tts_client import LocalTTS, SeekControl
+from tts_client import SeekControl, create_local_tts, replace_or_reconfigure_tts
 
 PID_FILE = Path('/tmp/tts_daemon.pid')
 DEFAULT_PORT = 8089
@@ -165,8 +159,9 @@ def load_config():
 def maybe_reload_config(server):
     """Re-apply config.yaml to the live TTS object if the file changed on disk.
 
-    Lets voice/speed/etc. edits take effect without restarting the daemon.
-    Only reloads the model if tts_model itself changed (handled in apply_config).
+    Lets voice/speed/engine edits take effect without restarting the daemon.
+    Switching tts_engine swaps the TTS object; same-engine edits call apply_config
+    (Qwen only reloads the MLX model if tts_model itself changed).
     """
     try:
         mtime = CONFIG_PATH.stat().st_mtime
@@ -176,8 +171,14 @@ def maybe_reload_config(server):
         return
     server.config_mtime = mtime
     local_cfg = load_config().get('local', {})
-    server.tts.apply_config(local_cfg)
-    print(f"Reloaded config (speaker={server.tts.speaker}, speed={server.tts.speed})")
+    server.tts, swapped = replace_or_reconfigure_tts(server.tts, local_cfg)
+    if swapped:
+        server.tts._ensure_model()
+        print(f"Switched TTS engine to {server.tts.engine} "
+              f"(speaker={server.tts.speaker})", flush=True)
+    else:
+        print(f"Reloaded config (speaker={server.tts.speaker}, "
+              f"speed={server.tts.speed})", flush=True)
 
 
 def main():
@@ -185,10 +186,14 @@ def main():
     local_cfg = config.get('local', {})
     port = local_cfg.get('tts_server_port', DEFAULT_PORT)
 
-    tts = LocalTTS(local_cfg)
-    print("Loading TTS model...")
-    tts._ensure_model()
-    print("Model loaded")
+    tts = create_local_tts(local_cfg)
+    print(f"TTS engine: {tts.engine} ({tts.speaker})", flush=True)
+    if tts.engine == "qwen":
+        print("Loading TTS model...")
+        tts._ensure_model()
+        print("Model loaded")
+    else:
+        tts._ensure_model()
 
     server = ThreadedHTTPServer(('127.0.0.1', port), TTSHandler)
     server.tts = tts

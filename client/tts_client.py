@@ -2,7 +2,8 @@
 """
 TTS client for Claude Code voice output.
 Reads text from clipboard, synthesizes speech, and plays audio.
-Supports two backends: "origin" (GPU server via WebSocket) or "local" (Qwen3-TTS on Mac via MLX).
+Supports two backends: "origin" (GPU server via WebSocket) or "local"
+(Edge TTS or Qwen3-TTS on Mac).
 """
 
 import asyncio
@@ -153,8 +154,285 @@ class AudioTape:
             self.done = True
 
 
+PLAY_PRIME_SAMPLES = 48000  # 2.0s at 24 kHz
+PLAY_MIN_REALTIME = 1.2     # audio_sec / wall_sec; below this, wait for EOS
+PLAY_MAX_WAIT_S = 4.5       # never block Option+S longer than this when audio exists
+# Breeze 4-bit cannot outrun the speaker. Hold ~15s of PCM (or EOS on a
+# shorter clip) before playback so a short utterance is not 斷點. Vireo/Qwen
+# keep the 2s/4.5s defaults above.
+BREEZE_PLAY_PRIME_SAMPLES = 18 * 24000  # 15.0s at 24 kHz
+
+
+def _play_tape(tape: AudioTape, producer_thread: threading.Thread, gen_error: list,
+               stop_event=None, pause_event=None, seek=None,
+               stream_factory=None, sleep_fn=None, clock_fn=None,
+               started_event=None, prime_samples=PLAY_PRIME_SAMPLES,
+               max_wait_s=PLAY_MAX_WAIT_S, min_realtime=PLAY_MIN_REALTIME):
+    """Play an AudioTape while a producer fills it.
+
+    Shared by Qwen, Edge, and Breeze. The producer appends PCM and calls
+    tape.finish(); this loop only talks to the audio device (PortAudio /
+    CoreAudio are not thread-safe).
+
+    Default (Vireo/Qwen/Edge): wait until generation is done, *or* until we
+    have a 2s prime and are clearly faster than realtime, *or* until
+    ``PLAY_MAX_WAIT_S``. Breeze passes a 15s prime and ``max_wait_s=None`` so
+    a short clip is fully generated before the speaker opens.
+    """
+    # 0.1s at 24kHz. We write in small sub-chunks and poll stop_event
+    # between them so an interrupt is honored within ~100ms WITHOUT ever
+    # touching the PortAudio stream from another thread (doing so segfaults
+    # CoreAudio). The stream's stop()/close() happen here on this same
+    # thread via the context-manager exit, which is the only safe place.
+    SUBCHUNK = 2400
+    stream_factory = stream_factory or (
+        lambda: sd.OutputStream(
+            samplerate=24000, channels=1, dtype='float32', latency='high',
+        )
+    )
+    sleep_fn = sleep_fn or sd.sleep
+    clock_fn = clock_fn or time.monotonic
+
+    def stopped():
+        return stop_event is not None and stop_event.is_set()
+
+    def paused():
+        return pause_event is not None and pause_event.is_set()
+
+    def handle_pause(output):
+        # If paused, stop the audio device (safe — same thread) and hold
+        # until resumed or stopped, then restart so playback continues from
+        # exactly where it left off.
+        if not paused():
+            return
+        output.stop()
+        while paused() and not stopped():
+            sleep_fn(100)
+        if not stopped():
+            output.start()
+
+    def tape_ready():
+        _, total, done = tape.read(0, 0)
+        if done or gen_error[0] is not None:
+            return True
+        elapsed = max(clock_fn() - t0, 1e-6)
+        if max_wait_s is not None and total > 0 and elapsed >= max_wait_s:
+            return True
+        if total < prime_samples:
+            return False
+        return (total / 24000.0) / elapsed >= min_realtime
+
+    pos = 0          # absolute playback position in samples (into the tape)
+    written = 0      # total samples sent to the device (counts replays too)
+    outcome = "ok"
+    completed = False
+    starve_t = None
+    t0 = clock_fn()
+
+    while not stopped() and not tape_ready():
+        sleep_fn(50)
+
+    if started_event is not None and not stopped() and tape.read(0, 0)[1] > 0:
+        started_event.set()
+
+    if stopped() or tape.read(0, 0)[1] == 0:
+        if producer_thread is not None:
+            producer_thread.join(timeout=5)
+        if gen_error[0] is not None and not stopped():
+            raise gen_error[0]
+        print(f"Done [{written/24000:.1f}s played, {outcome}]", flush=True)
+        return
+
+    with stream_factory() as output:
+        try:
+            while not stopped():
+                handle_pause(output)
+                if stopped():
+                    break
+
+                # Apply any pending rewind/forward. Rewind clamps at 0;
+                # forward clamps at the generation frontier (can't skip past
+                # audio that doesn't exist yet).
+                if seek is not None:
+                    delta = seek.pop()
+                    if delta:
+                        total = tape.read(0, 0)[1]
+                        pos = max(0, min(pos + delta, total))
+
+                sub, total, done = tape.read(pos, SUBCHUNK)
+                if sub.size == 0:
+                    if done and pos >= total:
+                        completed = True
+                        break
+                    # Residual live-edge (seek past frontier, or RTF dipped
+                    # after we started). Keep the device clock with silence
+                    # rather than stop/start, which clicks every chunk.
+                    if starve_t is None:
+                        starve_t = clock_fn()
+                    output.write(np.zeros(SUBCHUNK, dtype=np.float32))
+                    written += SUBCHUNK
+                    sleep_fn(0)  # tests: let the producer append
+                    continue
+                if starve_t is not None:
+                    waited = clock_fn() - starve_t
+                    starve_t = None
+                    if waited >= 0.5:
+                        print(
+                            f"[tts-underrun] waited {waited:.2f}s "
+                            f"at {pos/24000:.1f}s played",
+                            flush=True,
+                        )
+                output.write(sub)
+                pos += len(sub)
+                written += len(sub)
+            # Drain: closing the stream discards audio still in PortAudio's
+            # buffer, clipping the final ~second of speech. On normal
+            # completion, append a generous silence pad and wait long enough
+            # for the real tail to actually play out before the stream closes.
+            if completed and not stopped():
+                output.write(np.zeros(12000, dtype=np.float32))  # 0.5s silence
+                sleep_fn(800)
+            elif stopped():
+                outcome = "interrupted"
+        except sd.PortAudioError as e:
+            outcome = f"PortAudioError:{e}"
+            if not stopped():
+                raise
+
+    if producer_thread is not None:
+        producer_thread.join(timeout=5)
+    if gen_error[0] is not None and not stopped():
+        raise gen_error[0]
+    print(f"Done [{written/24000:.1f}s played, {outcome}]", flush=True)
+
+
+_ENGINE_SECTIONS = ("edge", "qwen", "breeze", "vireo")
+
+# Short names inside local.<engine> map onto the flat keys each engine already
+# reads. Prefixed aliases (tts_voice, vireo_model, …) pass through unchanged.
+_ENGINE_KEY_MAP = {
+    "edge": {
+        "voice": "tts_voice",
+        "rate": "tts_rate",
+        "volume": "tts_volume",
+        "pitch": "tts_pitch",
+    },
+    "qwen": {
+        "model": "tts_model",
+        "speaker": "tts_speaker",
+        "language": "tts_language",
+        "instruct": "tts_instruct",
+        "temperature": "tts_temperature",
+        "top_k": "tts_top_k",
+        "top_p": "tts_top_p",
+        "repetition_penalty": "tts_repetition_penalty",
+        "max_tokens": "tts_max_tokens",
+        "streaming_interval": "tts_streaming_interval",
+    },
+    "breeze": {
+        "model": "breeze_model",
+        "instruct": "breeze_instruct",
+        "cfg_scale": "tts_cfg_scale",
+        "seed": "tts_seed",
+        "speaker": "tts_speaker",
+        "ref_audio": "breeze_ref_audio",
+        "ref_text": "breeze_ref_text",
+        "lock_audio": "breeze_lock_audio",
+        "temperature": "tts_temperature",
+        "top_k": "tts_top_k",
+        "top_p": "tts_top_p",
+        "repetition_penalty": "tts_repetition_penalty",
+        "max_tokens": "tts_max_tokens",
+        "streaming_interval": "tts_streaming_interval",
+    },
+    "vireo": {
+        "model": "vireo_model",
+        "instruct": "vireo_instruct",
+        "cfg_scale": "vireo_cfg_scale",
+        "seed": "tts_seed",
+        "speaker": "tts_speaker",
+        "ref_audio": "vireo_ref_audio",
+        "ref_text": "vireo_ref_text",
+        "temperature": "vireo_temperature",
+        "top_k": "vireo_top_k",
+        "top_p": "vireo_top_p",
+        "repetition_penalty": "vireo_repetition_penalty",
+        "max_tokens": "tts_max_tokens",
+    },
+}
+
+
+def flatten_local_tts_config(local: dict) -> dict:
+    """Merge ``local.<active_engine>`` onto a flat dict engines already read.
+
+    Nested sections for the other three engines are dropped so Qwen's speaker
+    cannot leak into Vireo. Flat configs (tests, old yaml) pass through.
+    Shared playback keys (speed, seek, pause) stay at the ``local`` top level.
+    """
+    local = dict(local or {})
+    engine = resolve_tts_engine(local)
+    section = local.get(engine)
+    out = {k: v for k, v in local.items() if k not in _ENGINE_SECTIONS}
+    if not isinstance(section, dict):
+        return out
+    mapping = _ENGINE_KEY_MAP[engine]
+    for key, value in section.items():
+        out[mapping.get(key, key)] = value
+    return out
+
+
+def resolve_tts_engine(config: dict) -> str:
+    """Canonical local TTS engine name: edge, qwen, breeze, or vireo."""
+    engine = str(config.get("tts_engine", "edge")).lower().strip()
+    if engine in ("edge", "edge-tts"):
+        return "edge"
+    if engine in ("qwen", "mlx", "local"):
+        return "qwen"
+    if engine in ("breeze", "breeze-tts", "breeze_tts"):
+        return "breeze"
+    if engine in ("vireo", "vireo-tts", "vireo_tts"):
+        return "vireo"
+    raise ValueError(
+        f"Unknown tts_engine: {engine!r} "
+        f"(use 'edge', 'qwen', 'breeze', or 'vireo')"
+    )
+
+
+def create_local_tts(config: dict):
+    """Build the local TTS engine selected by ``local.tts_engine`` (default edge)."""
+    config = flatten_local_tts_config(config)
+    engine = resolve_tts_engine(config)
+    if engine == "edge":
+        from edge_tts_engine import EdgeTTS
+        return EdgeTTS(config)
+    if engine == "breeze":
+        from breeze_tts_engine import BreezeTTS
+        return BreezeTTS(config)
+    if engine == "vireo":
+        from vireo_tts_engine import VireoTTS
+        return VireoTTS(config)
+    return LocalTTS(config)
+
+
+def replace_or_reconfigure_tts(current_tts, local_cfg: dict):
+    """Apply ``local_cfg`` to a live TTS object, swapping engines if needed.
+
+    Returns ``(tts, swapped)``. When the engine is unchanged, ``apply_config``
+    runs in place (voice/rate/speed without dropping a loaded Qwen model).
+    """
+    flat = flatten_local_tts_config(local_cfg)
+    new_engine = resolve_tts_engine(flat)
+    current = getattr(current_tts, "engine", "qwen")
+    if new_engine != current:
+        return create_local_tts(flat), True
+    current_tts.apply_config(flat)
+    return current_tts, False
+
+
 class LocalTTS:
     """Synthesize speech locally using Qwen3-TTS via mlx-audio."""
+
+    engine = "qwen"
 
     def __init__(self, config: dict):
         self._model = None
@@ -312,7 +590,7 @@ class LocalTTS:
         return _squeeze_silence(np.concatenate(chunks), max_gap_s=self.max_pause)
 
     def synthesize_and_play(self, text: str, stop_event=None, pause_event=None,
-                            seek=None):
+                            seek=None, started_event=None):
         """Synthesize text to speech and play it, streaming chunks as they generate.
 
         pause_event (optional threading.Event): when SET, playback pauses (audio
@@ -358,10 +636,9 @@ class LocalTTS:
                         audio_np = librosa.effects.time_stretch(
                             audio_np, rate=self.speed
                         ).astype(np.float32)
-                    # Trim the model's long inter-sentence pauses so playback
-                    # doesn't drag. Generation already runs ahead of playback,
-                    # so this directly shortens the gap the listener hears.
-                    audio_np = _squeeze_silence(audio_np, max_gap_s=self.max_pause)
+                    # Raw chunks on the play path. Squeezing per chunk (and
+                    # especially dropping ~1s silent frames to 0.2s) drains the
+                    # tape and makes Option+S hitch while the next chunk generates.
                     tape.append(audio_np)
             except Exception as e:
                 gen_error[0] = e
@@ -370,85 +647,12 @@ class LocalTTS:
 
         t = threading.Thread(target=producer, daemon=True)
         t.start()
-
-        # 0.1s at 24kHz. We write in small sub-chunks and poll stop_event
-        # between them so an interrupt is honored within ~100ms WITHOUT ever
-        # touching the PortAudio stream from another thread (doing so segfaults
-        # CoreAudio). The stream's stop()/close() happen here on this same
-        # thread via the context-manager exit, which is the only safe place.
-        SUBCHUNK = 2400
-
-        def stopped():
-            return stop_event is not None and stop_event.is_set()
-
-        def paused():
-            return pause_event is not None and pause_event.is_set()
-
-        def handle_pause(output):
-            # If paused, stop the audio device (safe — same thread) and hold
-            # until resumed or stopped, then restart so playback continues from
-            # exactly where it left off.
-            if not paused():
-                return
-            output.stop()
-            while paused() and not stopped():
-                sd.sleep(100)
-            if not stopped():
-                output.start()
-
-        pos = 0          # absolute playback position in samples (into the tape)
-        written = 0      # total samples sent to the device (counts replays too)
-        outcome = "ok"
-        completed = False
-        with sd.OutputStream(samplerate=24000, channels=1, dtype='float32') as output:
-            try:
-                while not stopped():
-                    handle_pause(output)
-                    if stopped():
-                        break
-
-                    # Apply any pending rewind/forward. Rewind clamps at 0;
-                    # forward clamps at the generation frontier (can't skip past
-                    # audio that doesn't exist yet).
-                    if seek is not None:
-                        delta = seek.pop()
-                        if delta:
-                            total = tape.read(0, 0)[1]
-                            pos = max(0, min(pos + delta, total))
-
-                    sub, total, done = tape.read(pos, SUBCHUNK)
-                    if sub.size == 0:
-                        if done and pos >= total:
-                            completed = True
-                            break
-                        # At the live edge: generation hasn't caught up yet.
-                        sd.sleep(50)
-                        continue
-                    output.write(sub)
-                    pos += len(sub)
-                    written += len(sub)
-                # Drain: closing the stream discards audio still in PortAudio's
-                # buffer, clipping the final ~second of speech. On normal
-                # completion, append a generous silence pad and wait long enough
-                # for the real tail to actually play out before the stream closes.
-                if completed and not stopped():
-                    output.write(np.zeros(12000, dtype=np.float32))  # 0.5s silence
-                    sd.sleep(800)
-                elif stopped():
-                    outcome = "interrupted"
-            except sd.PortAudioError as e:
-                outcome = f"PortAudioError:{e}"
-                if not stopped():
-                    raise
-
-        t.join(timeout=5)
-        if gen_error[0] is not None and not stopped():
-            raise gen_error[0]
-        print(f"Done [{written/24000:.1f}s played, {outcome}]", flush=True)
+        _play_tape(tape, t, gen_error, stop_event, pause_event, seek,
+                   started_event=started_event)
 
 
 class TTSClient:
-    """Manages TTS via origin server or local Piper."""
+    """Manages TTS via origin server or local engine (Edge / Qwen)."""
 
     def __init__(self, config_path: str = None):
         self.config = self._load_config(config_path)
@@ -461,7 +665,7 @@ class TTSClient:
             self.websocket = None
         elif self.backend == 'local':
             local_cfg = self.config.get('local', {})
-            self.local_tts = LocalTTS(local_cfg)
+            self.local_tts = create_local_tts(local_cfg)
         else:
             raise ValueError(f"Unknown backend: {self.backend}")
 

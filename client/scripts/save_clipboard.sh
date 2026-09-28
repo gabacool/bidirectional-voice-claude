@@ -1,9 +1,7 @@
 #!/bin/bash
-# Speak selected text — Hammerspoon Option+S.
+# Save clipboard TTS as a WAV in ~/Downloads — Hammerspoon Option+Shift+S.
 #
-# Posts to the LAN voice API on :9900 (localhost /speak). Same toggle as before:
-# speak (idle) / pause / resume. Double-press Option+S hits /stop.
-#
+# Same engine/voice as Option+S. Posts to localhost :9900 /save.
 # Text is $1 (Hammerspoon selection). Empty → service reads the clipboard.
 
 export PATH="/opt/homebrew/bin:$PATH"
@@ -13,11 +11,11 @@ export LC_ALL=en_US.UTF-8
 VOICE_URL="http://127.0.0.1:9900"
 TEXT="$1"
 
-post_speak() {
+post_save() {
     if [ -n "$TEXT" ]; then
-        curl -s -X POST "$VOICE_URL/speak" --data-raw "$TEXT" >> /tmp/tts_debug.log 2>&1
+        curl -s -X POST "$VOICE_URL/save" --data-raw "$TEXT"
     else
-        curl -s -X POST "$VOICE_URL/speak" >> /tmp/tts_debug.log 2>&1
+        curl -s -X POST "$VOICE_URL/save"
     fi
 }
 
@@ -39,7 +37,9 @@ ensure_voice_api() {
 }
 
 if ensure_voice_api; then
-    post_speak
+    path=$(post_save)
+    echo "$(date): save -> $path" >> /tmp/tts_debug.log
+    printf '%s' "$path"
     exit 0
 fi
 exit 1

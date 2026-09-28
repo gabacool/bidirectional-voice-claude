@@ -103,10 +103,44 @@ hs.hotkey.bind({"alt"}, ".", function()
     runTTSScript("seek_forward.sh")
 end)
 
+-- Save clipboard TTS as a WAV in ~/Downloads (same engine as Option+S).
+-- ABC layout maps Option+Shift+S to Í, so hs.hotkey.bind({"alt","shift"},"s")
+-- often never fires and the character is typed instead. Catch the S keycode
+-- and swallow it — that is the "disable the unused Í shortcut" the combo needs.
+local function saveClipboardWav()
+    print("TTS Option+Shift+S -> save WAV")
+    hs.task.new("/bin/bash", function(exitCode, stdOut, stdErr)
+        local path = (stdOut or ""):gsub("^%s+", ""):gsub("%s+$", "")
+        if exitCode == 0 and path ~= "" then
+            hs.notify.new({title="TTS", informativeText="Saved " .. path}):send()
+        else
+            hs.notify.new({title="TTS", informativeText="Save failed"}):send()
+        end
+        print("TTS save finished: " .. (stdOut or "") .. (stdErr or ""))
+    end, {voiceScriptsPath .. "/save_clipboard.sh"}):start()
+end
+
+local sKeyCode = hs.keycodes.map.s
+saveWavTap = hs.eventtap.new({hs.eventtap.event.types.keyDown}, function(e)
+    local flags = e:getFlags()
+    if not (flags.alt and flags.shift) or flags.cmd or flags.ctrl then
+        return false
+    end
+    if e:getKeyCode() ~= sKeyCode then
+        return false
+    end
+    if e:getProperty(hs.eventtap.event.properties.keyboardEventAutorepeat) == 1 then
+        return true
+    end
+    saveClipboardWav()
+    return true
+end)
+saveWavTap:start()
+
 -- Reload config with Cmd+Ctrl+R
 hs.hotkey.bind({"cmd", "ctrl"}, "r", function()
     hs.reload()
 end)
 
-hs.notify.new({title="Hammerspoon", informativeText="Config loaded. Option+V=voice, Option+S=speak/pause, double Option+S=stop, Option+,/.=rewind/forward"}):send()
-print("Hammerspoon config loaded. Option+V=voice input, Option+S=speak/pause, double Option+S=stop, Option+,/.=seek")
+hs.notify.new({title="Hammerspoon", informativeText="Config loaded. Option+V=voice, Option+S=speak/pause, Option+Shift+S=save WAV, double Option+S=stop, Option+,/.=rewind/forward"}):send()
+print("Hammerspoon config loaded. Option+V=voice input, Option+S=speak/pause, Option+Shift+S=save WAV, double Option+S=stop, Option+,/.=seek")

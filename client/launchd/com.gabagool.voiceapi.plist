@@ -5,6 +5,8 @@
   Install:
     cp client/launchd/com.gabagool.voiceapi.plist ~/Library/LaunchAgents/
     launchctl load -w ~/Library/LaunchAgents/com.gabagool.voiceapi.plist
+  Restart:
+    launchctl kickstart -k "gui/$(id -u)/com.gabagool.voiceapi"
   Stop / uninstall:
     launchctl unload -w ~/Library/LaunchAgents/com.gabagool.voiceapi.plist
   It runs as a LaunchAgent (user session) so MLX/Metal has GPU access, and

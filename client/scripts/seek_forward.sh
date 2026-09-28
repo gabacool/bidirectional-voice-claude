@@ -4,8 +4,8 @@
 
 export PATH="/opt/homebrew/bin:$PATH"
 
-DAEMON_URL="http://127.0.0.1:8089"
+VOICE_URL="http://127.0.0.1:9900"
 
-if curl -s --max-time 1 "$DAEMON_URL/health" > /dev/null 2>&1; then
-    curl -s -X POST "$DAEMON_URL/seek/forward" >> /tmp/tts_debug.log 2>&1
+if curl -s --max-time 1 "$VOICE_URL/health" > /dev/null 2>&1; then
+    curl -s -X POST "$VOICE_URL/seek/forward" >> /tmp/tts_debug.log 2>&1
 fi
