@@ -396,6 +396,9 @@ class _ScriptedRuntime:
 
 
 def _guarded_tts(monkeypatch, runtime):
+    import vireo_tts_engine
+    # Frozen clock: playback backlog equals the audio emitted so far.
+    monkeypatch.setattr(vireo_tts_engine, "_clock", lambda: 0.0)
     tts = VireoTTS({"vireo_ref_audio": ""})
     tts._runtime = runtime
     monkeypatch.setattr(VireoTTS, "_ensure_model", lambda self: None)
@@ -442,22 +445,36 @@ def test_runaway_first_segment_is_cut_at_the_limit(monkeypatch):
 
 
 def test_runaway_later_segment_is_discarded_and_regenerated(monkeypatch):
-    runtime = _ScriptedRuntime([3, RUNAWAY, 4])
+    runtime = _ScriptedRuntime([12, RUNAWAY, 4])  # 12s backlog covers it
     tts = _guarded_tts(monkeypatch, runtime)
     chunks = list(tts.synthesize_stream(_TWO_SEGMENTS))
-    assert _seconds(chunks) == 3 + 4  # the runaway attempt never played
+    assert _seconds(chunks) == 12 + 4  # the runaway attempt never played
     (_, s1), (t2a, s2a), (t2b, s2b) = runtime.calls
     assert t2a == t2b and "second paragraph" in t2a
     assert s2b == s2a + RETRY_SEED_STRIDE
 
 
 def test_segment_that_runs_away_on_every_seed_plays_the_cut_last_attempt(monkeypatch):
-    runtime = _ScriptedRuntime([3] + [RUNAWAY] * (RUNAWAY_RETRIES + 1))
+    runtime = _ScriptedRuntime([12] + [RUNAWAY] * (RUNAWAY_RETRIES + 1))
     tts = _guarded_tts(monkeypatch, runtime)
     chunks = list(tts.synthesize_stream(_TWO_SEGMENTS))
     limit = _runaway_seconds(runtime.calls[1][0])
     assert len(runtime.calls) == 1 + RUNAWAY_RETRIES + 1
-    assert 3 + limit <= _seconds(chunks) < 3 + limit + 1
+    assert 12 + limit <= _seconds(chunks) < 12 + limit + 1
+
+
+def test_segment_streams_live_when_backlog_cannot_cover_holding_it(monkeypatch):
+    # A 1s first line leaves too little queued audio to hide a held generate
+    # (it would play as an underrun gap), so the next segment streams live.
+    runtime = _ScriptedRuntime([1, RUNAWAY])
+    tts = _guarded_tts(monkeypatch, runtime)
+    gen = tts.synthesize_stream(_TWO_SEGMENTS)
+    got = [next(gen) for _ in range(4)]  # 1s line, gap, then segment 2 audio
+    assert got[2].size == SAMPLE_RATE and runtime.closed == 1  # seg 2 mid-generate
+    rest = list(gen)
+    limit = _runaway_seconds(runtime.calls[1][0])
+    assert len(runtime.calls) == 2  # already heard, so cut rather than retried
+    assert 1 + limit <= _seconds(got + rest) < 1 + limit + 1
 
 
 def test_symbols_are_spelled_out_before_generate(monkeypatch):

@@ -94,6 +94,10 @@ RUNAWAY_FACTOR = 2.0
 MIN_RUNAWAY_SECONDS = 5.0
 RUNAWAY_RETRIES = 2
 RETRY_SEED_STRIDE = 1000
+# Slowest clean generate measured on M-series: 2.4x realtime. Holding a
+# segment is only gap-free while the playback backlog covers its generate.
+GEN_REALTIME_FACTOR = 2.4
+_clock = time.monotonic
 
 
 def _runaway_seconds(text: str) -> float:
@@ -714,10 +718,9 @@ class VireoTTS:
                          live: bool) -> Iterator[np.ndarray]:
         """One segment under the runaway guard.
 
-        ``live`` streams chunks as they are generated (the first segment, so
-        time-to-first-audio stays low); a runaway there can only be cut.
-        Otherwise the segment is held until it finishes — playback is still
-        draining earlier segments, since generation runs ~3x realtime — and a
+        ``live`` streams chunks as they are generated; a runaway there can
+        only be cut. Otherwise the segment is held until it finishes — the
+        caller holds only when playback backlog covers the generate — and a
         runaway attempt is discarded unheard and regenerated on a new seed.
         """
         limit = _runaway_seconds(kwargs["request"]["text"])
@@ -759,18 +762,36 @@ class VireoTTS:
         self._ensure_model()
         if self.ref_audio and self.ref_text:
             self._ensure_codes()
-        emitted = False
+        # Backlog = audio handed to the player minus wall time since the first
+        # chunk (playback runs at 1x). Pausing only grows the real backlog, so
+        # this errs toward streaming live.
+        started = None
+        emitted_s = 0.0
         for i, segment in enumerate(segments):
             kwargs = self._stream_kwargs(segment, voice=voice)
             if kwargs is None:
                 continue
             kwargs["seed"] = self.seed + i
-            if emitted:
-                yield np.zeros(CHUNK_GAP_SAMPLES, dtype=np.float32)
-            yield from self._guarded_segment(
-                kwargs, segment=i + 1, segments=len(segments), live=not emitted,
+            if started is not None:
+                gap = np.zeros(CHUNK_GAP_SAMPLES, dtype=np.float32)
+                emitted_s += gap.size / SAMPLE_RATE
+                yield gap
+            backlog = 0.0 if started is None else emitted_s - (_clock() - started)
+            gen_s = _spoken_seconds(kwargs["request"]["text"]) / GEN_REALTIME_FACTOR
+            live = backlog < gen_s
+            print(
+                f"[vireo] segment {i + 1}/{len(segments)} "
+                f"{'live' if live else 'held'} backlog={backlog:.1f}s "
+                f"gen_est={gen_s:.1f}s",
+                flush=True,
             )
-            emitted = True
+            for chunk in self._guarded_segment(
+                kwargs, segment=i + 1, segments=len(segments), live=live,
+            ):
+                if started is None:
+                    started = _clock()
+                emitted_s += chunk.size / SAMPLE_RATE
+                yield chunk
 
     def synthesize_to_array(self, text: str) -> np.ndarray:
         chunks = []
