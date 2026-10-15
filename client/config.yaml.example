@@ -33,7 +33,7 @@ local:
   tts_seek_seconds: 15              # Option+< / Option+> step while speaking
   tts_max_pause_seconds: 0.2        # Cap inter-sentence silence on the batch path (0 = off)
 
-  # Active TTS engine: edge | qwen | breeze | vireo
+  # Active TTS engine: edge | qwen | breeze | vireo | fish
   tts_engine: edge
 
   # --- edge (internet, no GPU) ---
@@ -91,6 +91,24 @@ local:
     instruct: "A warm, thoughtful young American woman with a clear voice."
     cfg_scale: 1                    # 1.0 = realtime clone; 4.0 is the slow two-branch
     seed: 42
+    # ref_audio: "/Users/you/Git/nvidia_parakeet/client/voices/my_voice.wav"
+    # ref_text: "The exact sentence spoken in that wav."
+
+  # --- fish (Fish Audio Drama 3 via mlx-audio, ~22GB disk, ~26GB RAM). ---
+  # Fish Audio Community License: personal / non-commercial use.
+  # Tuned for low latency: ~0.19s first chunk, then 0.32s chunks, 0.5s
+  # playback prime, warm-up at load. Clones the same voice as Breeze
+  # (voices/breeze_lock.wav + its transcript) unless ref_audio+ref_text set.
+  # Delivery cues go inline in the text: "[whispers] ...", "[laughs]".
+  fish:
+    model: "mlx-community/fish-audio-drama-3-4bit"
+    # model: "Nav8ha/drama-3-mlx-mixed-3bit"   # ~20GB, if 4-bit falls behind
+    temperature: 0.7
+    top_p: 0.7
+    top_k: 30
+    streaming_interval: 0.32        # seconds of audio per streamed chunk
+    first_chunk_frames: 4           # ~0.19s first chunk = fast first audio
+    play_prime_seconds: 0.5         # Option+S buffer before the speaker opens
     # ref_audio: "/Users/you/Git/nvidia_parakeet/client/voices/my_voice.wav"
     # ref_text: "The exact sentence spoken in that wav."
 

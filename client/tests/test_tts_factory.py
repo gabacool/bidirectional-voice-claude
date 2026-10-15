@@ -219,3 +219,58 @@ def test_factory_nested_vireo_and_swap_to_breeze():
     assert other.model_name.endswith("Breeze-TTS-2-mlx-8bit")
     assert other.instruct == "A restrained narrator."
     assert other.cfg_scale == 3.0
+
+
+# --- fish (Fish Audio Drama 3) -------------------------------------------
+
+def test_resolve_fish_aliases():
+    for name in ("fish", "Fish", "fish-audio", "fish_audio", "drama",
+                 "drama3", "fish-drama3"):
+        assert resolve_tts_engine({"tts_engine": name}) == "fish"
+
+
+def test_resolve_unknown_lists_fish():
+    with pytest.raises(ValueError, match="fish"):
+        resolve_tts_engine({"tts_engine": "piper"})
+
+
+def test_factory_fish_is_lazy():
+    from fish_tts_engine import DEFAULT_MODEL as FISH_MODEL, FishTTS
+    tts = create_local_tts({"tts_engine": "fish"})
+    assert isinstance(tts, FishTTS)
+    assert tts.engine == "fish"
+    assert tts.model_name == FISH_MODEL
+    assert tts._model is None
+
+
+def test_flatten_fish_section_is_isolated():
+    flat = flatten_local_tts_config({
+        "tts_engine": "fish",
+        "tts_speed": 1.1,
+        "qwen": {"temperature": 0.9, "speaker": "aiden"},
+        "vireo": {"top_k": 99},
+        "fish": {"model": "x/fish", "temperature": 0.5, "top_k": 20,
+                 "ref_audio": "/a.wav", "ref_text": "hi",
+                 "first_chunk_frames": 3},
+    })
+    assert flat["fish_model"] == "x/fish"
+    assert flat["fish_temperature"] == 0.5
+    assert flat["fish_top_k"] == 20
+    assert flat["fish_ref_audio"] == "/a.wav"
+    assert flat["fish_ref_text"] == "hi"
+    assert flat["fish_first_chunk_frames"] == 3
+    assert flat["tts_speed"] == 1.1
+    assert "tts_temperature" not in flat
+    assert "tts_speaker" not in flat
+    assert "vireo_top_k" not in flat
+
+
+def test_reconfigure_vireo_to_fish_swaps_and_fish_reconfigures_in_place():
+    from fish_tts_engine import FishTTS
+    tts = create_local_tts({"tts_engine": "edge"})
+    fish, swapped = replace_or_reconfigure_tts(tts, {"tts_engine": "fish"})
+    assert swapped is True and isinstance(fish, FishTTS)
+    same, swapped = replace_or_reconfigure_tts(
+        fish, {"tts_engine": "fish", "fish": {"temperature": 0.6}})
+    assert swapped is False and same is fish
+    assert fish.temperature == 0.6

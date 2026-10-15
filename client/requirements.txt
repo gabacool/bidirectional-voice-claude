@@ -7,7 +7,10 @@ pyobjc-framework-Cocoa>=10.0
 
 # Local backend (Apple Silicon) - install these for backend: local
 mlx-qwen3-asr>=0.3.5
-mlx-audio>=0.5.4  # 0.5.4+ ships breeze_tts (Breeze TTS 2 MLX); 0.4.5+ fixed Qwen3 missed-EOS
+# One shared mlx-audio for Qwen/Breeze/Vireo/Fish. main@dad2087 = 0.5.9 + Fish Drama 3
+# (PR #1018). Switch to mlx-audio>=0.5.10 once released. Rollback: mlx-audio==0.5.4.
+mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@dad2087f790dfe96b07d5aac1405db4b578b411f
 huggingface_hub>=0.26.0  # Vireo gated bundle (mchen04/Vireo-TTS-3B-MLX-mixed4bit)
 edge-tts>=7.0.0   # Microsoft Edge online TTS (default local engine; no API key)
 soundfile>=0.12.0
+soxr>=0.3.0      # streaming 44.1k->24k resample for Fish Drama 3

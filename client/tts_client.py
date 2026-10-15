@@ -306,7 +306,7 @@ def _play_tape(tape: AudioTape, producer_thread: threading.Thread, gen_error: li
     print(f"Done [{written/24000:.1f}s played, {outcome}]", flush=True)
 
 
-_ENGINE_SECTIONS = ("edge", "qwen", "breeze", "vireo")
+_ENGINE_SECTIONS = ("edge", "qwen", "breeze", "vireo", "fish")
 
 # Short names inside local.<engine> map onto the flat keys each engine already
 # reads. Prefixed aliases (tts_voice, vireo_model, …) pass through unchanged.
@@ -359,6 +359,24 @@ _ENGINE_KEY_MAP = {
         "repetition_penalty": "vireo_repetition_penalty",
         "max_tokens": "tts_max_tokens",
     },
+    # Fish-prefixed sampling keys: Drama 3's recipe (0.7/0.7/30) differs from
+    # Qwen's, so shared tts_* keys must not leak across engines.
+    "fish": {
+        "model": "fish_model",
+        "ref_audio": "fish_ref_audio",
+        "ref_text": "fish_ref_text",
+        "lock_audio": "fish_lock_audio",
+        "temperature": "fish_temperature",
+        "top_k": "fish_top_k",
+        "top_p": "fish_top_p",
+        "max_tokens": "fish_max_tokens",
+        "streaming_interval": "fish_streaming_interval",
+        "first_chunk_frames": "fish_first_chunk_frames",
+        "play_prime_seconds": "fish_play_prime_seconds",
+        "warmup": "fish_warmup",
+        "seed": "tts_seed",
+        "speaker": "tts_speaker",
+    },
 }
 
 
@@ -382,7 +400,7 @@ def flatten_local_tts_config(local: dict) -> dict:
 
 
 def resolve_tts_engine(config: dict) -> str:
-    """Canonical local TTS engine name: edge, qwen, breeze, or vireo."""
+    """Canonical local TTS engine name: edge, qwen, breeze, vireo, or fish."""
     engine = str(config.get("tts_engine", "edge")).lower().strip()
     if engine in ("edge", "edge-tts"):
         return "edge"
@@ -392,9 +410,12 @@ def resolve_tts_engine(config: dict) -> str:
         return "breeze"
     if engine in ("vireo", "vireo-tts", "vireo_tts"):
         return "vireo"
+    if engine in ("fish", "fish-audio", "fish_audio", "drama", "drama3",
+                  "fish-drama3", "fish_drama3"):
+        return "fish"
     raise ValueError(
         f"Unknown tts_engine: {engine!r} "
-        f"(use 'edge', 'qwen', 'breeze', or 'vireo')"
+        f"(use 'edge', 'qwen', 'breeze', 'vireo', or 'fish')"
     )
 
 
@@ -411,6 +432,9 @@ def create_local_tts(config: dict):
     if engine == "vireo":
         from vireo_tts_engine import VireoTTS
         return VireoTTS(config)
+    if engine == "fish":
+        from fish_tts_engine import FishTTS
+        return FishTTS(config)
     return LocalTTS(config)
 
 
