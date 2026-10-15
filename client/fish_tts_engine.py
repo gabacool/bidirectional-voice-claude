@@ -18,6 +18,7 @@ Weights: https://huggingface.co/mlx-community/fish-audio-drama-3-4bit
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 from pathlib import Path
@@ -35,10 +36,48 @@ DEFAULT_PLAY_PRIME_SECONDS = 0.5
 PLAY_MAX_WAIT_S = 1.5    # never hold Option+S longer than this once audio exists
 PLAY_MIN_REALTIME = 1.2  # start early only if generation is clearly ahead
 WARMUP_TEXT = "Okay."
+# Silence watchdog. Drama 3 sometimes stops emitting EOS and samples silence
+# until its 1024-frame cap (~47s) — reliably after a blank line inside one of
+# its ~300-byte text pieces. Pauses are capped; a long stall abandons the piece.
+SILENT_RMS = 0.01          # per streamed chunk (~0.32s)
+PAUSE_CAP_S = 0.6          # longest pause we ever play
+SILENCE_ABORT_S = 3.0      # continuous silence that counts as a stall
+_SEPARATOR_LINE = re.compile(r"^[\s\-_=*~#•·—–]+$")
+_BULLET = re.compile(r"^(?:[-•·*–—]+|\d{1,3}[.)])\s+")
+_TERMINATED = re.compile(r"[.!?;:…。！？；：][\"'”’)\]]*$")
+
 MLX_AUDIO_PIN = (
     "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio"
     "@dad2087f790dfe96b07d5aac1405db4b578b411f"
 )
+
+
+def _fish_text(text: str) -> str:
+    """One line of prose: Drama 3 stalls on paragraph breaks.
+
+    Lines are joined with spaces; a line without end punctuation (heading,
+    bullet) gets a period so it is still read as its own sentence. Separator
+    lines (``----``) and bullet markers are dropped.
+    """
+    lines = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or _SEPARATOR_LINE.match(s):
+            continue
+        s = _BULLET.sub("", s).strip()
+        if s:
+            lines.append(s)
+    out = [
+        s if i == len(lines) - 1 or _TERMINATED.search(s) else s + "."
+        for i, s in enumerate(lines)
+    ]
+    return re.sub(r"\s+", " ", " ".join(out)).strip()
+
+
+def split_text(text: str) -> list[str]:
+    """The model's own text pieces (segment_idx indexes into this list)."""
+    from mlx_audio.tts.models.fish_drama3.chunking import split_text as _split
+    return _split(text)
 
 
 def _load_model(name: str):
@@ -150,7 +189,7 @@ class FishTTS:
 
     def _generation_kwargs(self, text: str, voice: str | None = None,
                            streaming_interval: float | None = None) -> dict | None:
-        speech_text = _prepare_for_speech(text)
+        speech_text = _fish_text(_prepare_for_speech(text))
         if not speech_text:
             return None
         interval = self.streaming_interval
@@ -178,8 +217,14 @@ class FishTTS:
     def synthesize_stream(self, text: str, voice: str | None = None,
                           streaming_interval: float | None = None
                           ) -> Iterator[np.ndarray]:
-        """Yield mono float32 24 kHz chunks as Drama 3 generates them."""
-        if _prepare_for_speech(text) == "":
+        """Yield mono float32 24 kHz chunks as Drama 3 generates them.
+
+        Silence watchdog: pauses are held back and capped at PAUSE_CAP_S; if a
+        text piece stalls (SILENCE_ABORT_S of silence) the generator is closed
+        and generation restarts from the next piece. A piece that stalls
+        before saying anything is retried once.
+        """
+        if not _fish_text(_prepare_for_speech(text)):
             return
         self._ensure_model()
         self._check_reference()
@@ -188,26 +233,67 @@ class FishTTS:
         )
         if kwargs is None:
             return
-        rs = _StreamResampler(getattr(self._model, "sample_rate", 44100), OUT_SAMPLE_RATE)
+        in_rate = int(getattr(self._model, "sample_rate", 44100))
+        rs = _StreamResampler(in_rate, OUT_SAMPLE_RATE)
         print(f"[fish] generate chars={len(kwargs['text'])} "
               f"interval={kwargs['streaming_interval']}", flush=True)
         t_start = time.monotonic()
         n = 0
         audio_s = 0.0
-        for result in self._model.generate(**kwargs):
-            out = rs.process(np.array(result.audio, dtype=np.float32))
-            if out.size == 0:
-                continue
-            n += 1
-            now = time.monotonic()
-            dur = out.size / OUT_SAMPLE_RATE
-            audio_s += dur
-            if n == 1:
-                print(f"[fish] first audio {now - t_start:.2f}s", flush=True)
-            elif n % 10 == 0:
-                print(f"[fish] chunk#{n} audio={audio_s:.1f}s "
-                      f"rtf={audio_s / max(now - t_start, 1e-6):.2f}x", flush=True)
-            yield out
+        text_left = kwargs["text"]
+        retried_piece = None
+        while text_left:
+            kwargs["text"] = text_left
+            gen = self._model.generate(**kwargs)
+            held: list[np.ndarray] = []
+            held_s = 0.0
+            spoke: set[int] = set()
+            stalled = None
+            try:
+                for result in gen:
+                    raw = np.asarray(result.audio, dtype=np.float32).reshape(-1)
+                    if raw.size == 0:
+                        continue
+                    seg = int(getattr(result, "segment_idx", 0) or 0)
+                    if float(np.sqrt(np.mean(np.square(raw)))) < SILENT_RMS:
+                        held.append(raw)
+                        held_s += raw.size / in_rate
+                        if held_s >= SILENCE_ABORT_S:
+                            stalled = seg
+                            break
+                        continue
+                    if held:
+                        pause = np.concatenate(held)[: int(PAUSE_CAP_S * in_rate)]
+                        held, held_s = [], 0.0
+                        raw = np.concatenate([pause, raw])
+                    spoke.add(seg)
+                    out = rs.process(raw)
+                    if out.size == 0:
+                        continue
+                    n += 1
+                    now = time.monotonic()
+                    audio_s += out.size / OUT_SAMPLE_RATE
+                    if n == 1:
+                        print(f"[fish] first audio {now - t_start:.2f}s", flush=True)
+                    elif n % 10 == 0:
+                        print(f"[fish] chunk#{n} audio={audio_s:.1f}s "
+                              f"rtf={audio_s / max(now - t_start, 1e-6):.2f}x", flush=True)
+                    yield out
+            finally:
+                gen.close()
+            if stalled is None:
+                break
+            pieces = split_text(text_left)
+            piece = pieces[stalled] if stalled < len(pieces) else ""
+            if stalled not in spoke and piece != retried_piece:
+                retried_piece = piece
+                text_left = " ".join(pieces[stalled:])
+                print(f"[fish] stall before speech in piece {stalled}; retrying",
+                      flush=True)
+            else:
+                text_left = " ".join(pieces[stalled + 1:])
+                print(f"[fish] stall in piece {stalled} after {SILENCE_ABORT_S}s "
+                      f"silence; skipping to next piece", flush=True)
         tail = rs.flush()
         if tail.size:
             yield tail

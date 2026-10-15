@@ -150,6 +150,15 @@ after the upgrade (see plan). Rollback: `pip install mlx-audio==0.5.4`.
 
 ## Error handling
 
+- **Paragraph-break stall (found in testing):** a blank line inside one of
+  Drama 3's ~300-byte text pieces made it say the sentence before it, then
+  sample silence to its 1024-frame cap (~47 s) and drop the rest of the
+  piece — 4/8 runs on a 3-paragraph news snippet; 0/10 once newlines were
+  collapsed. Fix: `_fish_text` joins lines (adds a period to unterminated
+  lines, drops `----` separators and bullet markers). Safety net: pauses
+  are capped at 0.6 s; 3 s of continuous silence closes the generator and
+  restarts at the next piece (a piece that never spoke is retried once).
+
 - Import/`load_model` failure → `RuntimeError` naming the git pin.
 - Empty text after cleanup → no audio (same as other engines).
 - Generation error mid-stream → existing `voice_api` handling (log, close).

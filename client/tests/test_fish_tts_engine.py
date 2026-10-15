@@ -170,3 +170,118 @@ def test_warmup_runs_one_short_generation(monkeypatch, tmp_path):
     assert fake.calls[0]["ref_audio"] == str(ref)
     tts._ensure_model()  # idempotent
     assert len(fake.calls) == 1
+
+
+# --- paragraph breaks + silence watchdog (Drama 3 stalls on "\n\n") ----------
+
+from fish_tts_engine import _fish_text  # noqa: E402
+
+
+def test_fish_text_joins_paragraphs_and_terminates_lines():
+    raw = ("BREAKING: merger soon, per Barclays.\n\n"
+           "Key points\n- SpaceX buys Tesla\n- 0.7 shares each\n\n"
+           "----\nDone!\n")
+    assert _fish_text(raw) == (
+        "BREAKING: merger soon, per Barclays. Key points. "
+        "SpaceX buys Tesla. 0.7 shares each. Done!"
+    )
+
+
+def test_fish_text_keeps_single_line_and_cues():
+    assert _fish_text("  [whispers] Hello there  ") == "[whispers] Hello there"
+    assert _fish_text("\n\n---\n") == ""
+
+
+def test_kwargs_have_no_newlines():
+    kw = _loaded()._generation_kwargs("One.\n\nTwo.\nThree")
+    assert "\n" not in kw["text"]
+    assert kw["text"] == "One. Two. Three"
+
+
+class ScriptedModel:
+    """Each generate() call plays a script of (segment_idx, rms) chunks of 0.32s.
+
+    ``scripts`` is consumed one per call, so tests can model a stall on the
+    first call and normal speech on the retry/continuation.
+    """
+
+    sample_rate = 44100
+
+    def __init__(self, scripts):
+        self.scripts = list(scripts)
+        self.calls: list[dict] = []
+        self.closed = 0
+
+    def generate(self, **kwargs):
+        self.calls.append(kwargs)
+        script = self.scripts.pop(0) if self.scripts else []
+        n = int(0.32 * self.sample_rate)
+        try:
+            for seg, amp in script:
+                t = np.arange(n) / self.sample_rate
+                yield SimpleNamespace(
+                    segment_idx=seg,
+                    audio=(amp * np.sin(2 * np.pi * 220 * t)).astype(np.float32),
+                )
+        finally:
+            self.closed += 1
+
+
+def _seconds(chunks):
+    return sum(c.size for c in chunks) / OUT_SAMPLE_RATE
+
+
+def _two_pieces():
+    # Two model text pieces (> 300 bytes total, one sentence each side).
+    return ("Alpha sentence goes here with enough words to matter. " * 3,
+            "Omega sentence follows it with different words entirely. " * 3)
+
+
+def test_watchdog_aborts_stalled_piece_and_continues_with_next(monkeypatch):
+    first, second = _two_pieces()
+    speech, quiet = 0.3, 0.0
+    stall = [(0, speech)] * 5 + [(0, quiet)] * 200          # speaks, then stalls
+    rest = [(0, speech)] * 4                                  # next piece, fresh call
+    model = ScriptedModel([stall, rest])
+    tts = _loaded(model=model)
+    pieces = (first.strip(), second.strip())
+    monkeypatch.setattr("fish_tts_engine.split_text",
+                        lambda t: [p for p in pieces if p in t] or [t])
+    out = list(tts.synthesize_stream(first + second))
+    assert len(model.calls) == 2
+    assert model.calls[1]["text"] == second.strip()
+    # 5 + 4 speech chunks (0.32s each) plus at most one capped pause.
+    assert _seconds(out) < 9 * 0.32 + 0.8
+    assert model.closed == 2
+
+
+def test_watchdog_retries_piece_that_never_spoke(monkeypatch):
+    dead = [(0, 0.0)] * 200
+    ok = [(0, 0.3)] * 3
+    model = ScriptedModel([dead, ok])
+    tts = _loaded(model=model)
+    monkeypatch.setattr("fish_tts_engine.split_text", lambda t: [t])
+    out = list(tts.synthesize_stream("Hello there."))
+    assert len(model.calls) == 2
+    assert model.calls[1]["text"] == "Hello there."
+    assert _seconds(out) > 0.8
+
+
+def test_watchdog_gives_up_after_one_retry(monkeypatch):
+    dead = [(0, 0.0)] * 200
+    model = ScriptedModel([dead, dead, dead])
+    tts = _loaded(model=model)
+    monkeypatch.setattr("fish_tts_engine.split_text", lambda t: [t])
+    out = list(tts.synthesize_stream("Hello there."))
+    assert len(model.calls) == 2
+    assert _seconds(out) < 0.1
+
+
+def test_natural_pauses_are_kept_but_capped():
+    script = [(0, 0.3)] * 3 + [(0, 0.0)] * 4 + [(0, 0.3)] * 3   # 1.28s pause
+    model = ScriptedModel([script])
+    tts = _loaded(model=model)
+    out = list(tts.synthesize_stream("Hi. There."))
+    assert len(model.calls) == 1
+    total = _seconds(out)
+    assert 6 * 0.32 + 0.4 < total < 6 * 0.32 + 0.8
