@@ -373,6 +373,8 @@ _ENGINE_KEY_MAP = {
         "streaming_interval": "fish_streaming_interval",
         "first_chunk_frames": "fish_first_chunk_frames",
         "play_prime_seconds": "fish_play_prime_seconds",
+        "sentence_pause_seconds": "fish_sentence_pause_seconds",
+        "clause_pause_seconds": "fish_clause_pause_seconds",
         "warmup": "fish_warmup",
         "seed": "tts_seed",
         "speaker": "tts_speaker",

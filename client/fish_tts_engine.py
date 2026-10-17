@@ -19,6 +19,7 @@ Weights: https://huggingface.co/mlx-community/fish-audio-drama-3-4bit
 from __future__ import annotations
 
 import re
+import sys
 import threading
 import time
 from pathlib import Path
@@ -28,7 +29,7 @@ import numpy as np
 
 from breeze_tts_engine import DEFAULT_LOCK_PATH as BREEZE_LOCK_PATH
 from breeze_tts_engine import LOCK_TEXT as BREEZE_LOCK_TEXT
-from tts_client import AudioTape, _play_tape, _prepare_for_speech, _squeeze_silence
+from tts_client import AudioTape, _play_tape, _prepare_for_speech
 
 DEFAULT_MODEL = "mlx-community/fish-audio-drama-3-4bit"
 OUT_SAMPLE_RATE = 24000
@@ -45,6 +46,17 @@ SILENCE_ABORT_S = 3.0      # continuous silence that counts as a stall
 _SEPARATOR_LINE = re.compile(r"^[\s\-_=*~#•·—–]+$")
 _BULLET = re.compile(r"^(?:[-•·*–—]+|\d{1,3}[.)])\s+")
 _TERMINATED = re.compile(r"[.!?;:…。！？；：][\"'”’)\]]*$")
+# Pauses between pieces. Drama 3's own gaps run ~0.1s at a comma and vary a
+# lot at a period, so text is fed to it one sentence (or clause) per piece and
+# an exact silence is inserted wherever the piece index changes.
+DEFAULT_SENTENCE_PAUSE_S = 0.5
+DEFAULT_CLAUSE_PAUSE_S = 0.25
+MIN_PIECE_CHARS = 20       # shorter clause fragments ("CXMT,") join the next piece
+_SENTENCE_END = re.compile(r"[.!?;…。！？；][\"'”’)\]]*$")
+_CLAUSE_END = re.compile(r"[,:，：、][\"'”’)\]]*$")
+
+# Module whose ``split_text`` Drama 3's generate() calls (see _install_splitter).
+DRAMA3_MODULE = "mlx_audio.tts.models.fish_drama3.drama3"
 
 MLX_AUDIO_PIN = (
     "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio"
@@ -74,10 +86,71 @@ def _fish_text(text: str) -> str:
     return re.sub(r"\s+", " ", " ".join(out)).strip()
 
 
-def split_text(text: str) -> list[str]:
-    """The model's own text pieces (segment_idx indexes into this list)."""
-    from mlx_audio.tts.models.fish_drama3.chunking import split_text as _split
-    return _split(text)
+def _cut(text: str, marks: frozenset[str]) -> list[str]:
+    """Cut after every mark, except between two digits (3.14, 1,255)."""
+    parts, start = [], 0
+    for i, char in enumerate(text):
+        if char not in marks:
+            continue
+        if (char in ".," and 0 < i < len(text) - 1
+                and text[i - 1].isdigit() and text[i + 1].isdigit()):
+            continue
+        parts.append(text[start:i + 1])
+        start = i + 1
+    if start < len(text):
+        parts.append(text[start:])
+    return parts
+
+
+def split_text(text: str, clauses: bool = False) -> list[str]:
+    """The model's text pieces: one sentence each, or one clause with ``clauses``.
+
+    Installed as Drama 3's own chunker (see ``_install_splitter``), so
+    ``segment_idx`` indexes into this list. [cues] are never cut and, like
+    fragments under MIN_PIECE_CHARS, are carried into the following piece.
+    Speaker-tagged text keeps the library's grouping.
+    """
+    from mlx_audio.tts.models.fish_drama3 import chunking as ck
+    if ck.SPEAKER_TAG.search(text):
+        return ck.split_text(text)
+    marks = ck.SENTENCE_ENDS | ck.CLAUSE_MARKS if clauses else ck.SENTENCE_ENDS
+
+    def cut(free: str) -> list[str]:
+        return [piece for part in _cut(free, marks)
+                for piece in ck._fit(part, ck.CHUNK_BYTES, (ck.CLAUSE_MARKS, ck.SPACES))]
+
+    raw, last = [], 0
+    for m in ck.UNCUTTABLE.finditer(text):
+        raw += cut(text[last:m.start()])
+        raw.append(m.group(0))
+        last = m.end()
+    raw += cut(text[last:])
+
+    out: list[str] = []
+    carry = ""
+    for piece in raw:
+        carry += piece
+        short = (len(carry.strip()) < MIN_PIECE_CHARS
+                 and not _SENTENCE_END.search(carry.strip()))
+        if short or ck.UNCUTTABLE.fullmatch(piece.strip()):
+            continue
+        out.append(carry)
+        carry = ""
+    if carry.strip():
+        if out:
+            out[-1] += carry
+        else:
+            out.append(carry)
+    return [p.strip(ck.WHITE_SPACE) for p in out if p.strip(ck.WHITE_SPACE)]
+
+
+def _piece_pause(piece: str, sentence_s: float, clause_s: float) -> float:
+    """Silence after a piece: by its closing mark; none for a length cut."""
+    if _SENTENCE_END.search(piece):
+        return sentence_s
+    if _CLAUSE_END.search(piece):
+        return clause_s
+    return 0.0
 
 
 def _load_model(name: str):
@@ -157,11 +230,29 @@ class FishTTS:
             config.get("fish_play_prime_seconds", DEFAULT_PLAY_PRIME_SECONDS)
         )
         self.warmup = bool(config.get("fish_warmup", True))
+        self.sentence_pause = float(
+            config.get("fish_sentence_pause_seconds", DEFAULT_SENTENCE_PAUSE_S)
+        )
+        self.clause_pause = float(
+            config.get("fish_clause_pause_seconds", DEFAULT_CLAUSE_PAUSE_S)
+        )
         self.speed = config.get("tts_speed", 1.0)
         self.seek_seconds = config.get("tts_seek_seconds", 15)
-        self.max_pause = config.get("tts_max_pause_seconds", 0.2)
 
     # --- model ---------------------------------------------------------------
+
+    def _split(self, text: str) -> list[str]:
+        return split_text(text, clauses=self.clause_pause > 0)
+
+    def _install_splitter(self) -> None:
+        """Make Drama 3 chunk text with ``_split`` (one sentence/clause per piece).
+
+        ``generate`` calls its module's ``split_text``; generation is
+        single-threaded (the voice API's TTS inference thread).
+        """
+        if type(self._model).__module__ != DRAMA3_MODULE:
+            return  # test doubles / other models chunk on their own
+        sys.modules[DRAMA3_MODULE].split_text = self._split
 
     def _check_reference(self) -> None:
         if not Path(self.ref_audio).is_file():
@@ -219,10 +310,13 @@ class FishTTS:
                           ) -> Iterator[np.ndarray]:
         """Yield mono float32 24 kHz chunks as Drama 3 generates them.
 
+        Pieces are sentences (or clauses); where the piece index changes, the
+        piece's quiet tail is played and the configured pause appended.
         Silence watchdog: pauses are held back and capped at PAUSE_CAP_S; if a
         text piece stalls (SILENCE_ABORT_S of silence) the generator is closed
         and generation restarts from the next piece. A piece that stalls
-        before saying anything is retried once.
+        before saying anything is retried once. Quiet audio held at the very
+        end is the last word's fade-out and is played, not dropped.
         """
         if not _fish_text(_prepare_for_speech(text)):
             return
@@ -233,6 +327,7 @@ class FishTTS:
         )
         if kwargs is None:
             return
+        self._install_splitter()
         in_rate = int(getattr(self._model, "sample_rate", 44100))
         rs = _StreamResampler(in_rate, OUT_SAMPLE_RATE)
         print(f"[fish] generate chars={len(kwargs['text'])} "
@@ -244,30 +339,45 @@ class FishTTS:
         retried_piece = None
         while text_left:
             kwargs["text"] = text_left
+            pieces = self._split(text_left)
             gen = self._model.generate(**kwargs)
             held: list[np.ndarray] = []
             held_s = 0.0
             spoke: set[int] = set()
             stalled = None
+            cur_seg = None
             try:
                 for result in gen:
                     raw = np.asarray(result.audio, dtype=np.float32).reshape(-1)
                     if raw.size == 0:
                         continue
                     seg = int(getattr(result, "segment_idx", 0) or 0)
+                    parts: list[np.ndarray] = []
+                    if cur_seg is not None and seg != cur_seg:
+                        # Piece boundary: its quiet tail, then the set pause.
+                        if held:
+                            parts.append(np.concatenate(held)[: int(PAUSE_CAP_S * in_rate)])
+                            held, held_s = [], 0.0
+                        prev = pieces[cur_seg] if cur_seg < len(pieces) else ""
+                        gap = _piece_pause(prev, self.sentence_pause, self.clause_pause)
+                        if gap > 0:
+                            parts.append(np.zeros(int(gap * in_rate), dtype=np.float32))
+                    cur_seg = seg
                     if float(np.sqrt(np.mean(np.square(raw)))) < SILENT_RMS:
                         held.append(raw)
                         held_s += raw.size / in_rate
                         if held_s >= SILENCE_ABORT_S:
                             stalled = seg
                             break
+                    else:
+                        if held:
+                            parts.append(np.concatenate(held)[: int(PAUSE_CAP_S * in_rate)])
+                            held, held_s = [], 0.0
+                        parts.append(raw)
+                        spoke.add(seg)
+                    if not parts:
                         continue
-                    if held:
-                        pause = np.concatenate(held)[: int(PAUSE_CAP_S * in_rate)]
-                        held, held_s = [], 0.0
-                        raw = np.concatenate([pause, raw])
-                    spoke.add(seg)
-                    out = rs.process(raw)
+                    out = rs.process(np.concatenate(parts))
                     if out.size == 0:
                         continue
                     n += 1
@@ -282,8 +392,12 @@ class FishTTS:
             finally:
                 gen.close()
             if stalled is None:
+                if held and spoke:
+                    out = rs.process(np.concatenate(held)[: int(PAUSE_CAP_S * in_rate)])
+                    audio_s += out.size / OUT_SAMPLE_RATE
+                    if out.size:
+                        yield out
                 break
-            pieces = split_text(text_left)
             piece = pieces[stalled] if stalled < len(pieces) else ""
             if stalled not in spoke and piece != retried_piece:
                 retried_piece = piece
@@ -312,7 +426,9 @@ class FishTTS:
         chunks = [self._stretch(c) for c in self.synthesize_stream(text)]
         if not chunks:
             return np.zeros(0, dtype=np.float32)
-        return _squeeze_silence(np.concatenate(chunks), max_gap_s=self.max_pause)
+        # No _squeeze_silence: pauses are set per piece (and capped) above,
+        # so a saved WAV keeps the same timing Option+S plays.
+        return np.concatenate(chunks)
 
     def synthesize_and_play(self, text: str, stop_event=None, pause_event=None,
                             seek=None, started_event=None):

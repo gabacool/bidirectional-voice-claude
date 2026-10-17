@@ -246,7 +246,7 @@ def test_watchdog_aborts_stalled_piece_and_continues_with_next(monkeypatch):
     tts = _loaded(model=model)
     pieces = (first.strip(), second.strip())
     monkeypatch.setattr("fish_tts_engine.split_text",
-                        lambda t: [p for p in pieces if p in t] or [t])
+                        lambda t, clauses=False: [p for p in pieces if p in t] or [t])
     out = list(tts.synthesize_stream(first + second))
     assert len(model.calls) == 2
     assert model.calls[1]["text"] == second.strip()
@@ -260,7 +260,7 @@ def test_watchdog_retries_piece_that_never_spoke(monkeypatch):
     ok = [(0, 0.3)] * 3
     model = ScriptedModel([dead, ok])
     tts = _loaded(model=model)
-    monkeypatch.setattr("fish_tts_engine.split_text", lambda t: [t])
+    monkeypatch.setattr("fish_tts_engine.split_text", lambda t, clauses=False: [t])
     out = list(tts.synthesize_stream("Hello there."))
     assert len(model.calls) == 2
     assert model.calls[1]["text"] == "Hello there."
@@ -271,7 +271,7 @@ def test_watchdog_gives_up_after_one_retry(monkeypatch):
     dead = [(0, 0.0)] * 200
     model = ScriptedModel([dead, dead, dead])
     tts = _loaded(model=model)
-    monkeypatch.setattr("fish_tts_engine.split_text", lambda t: [t])
+    monkeypatch.setattr("fish_tts_engine.split_text", lambda t, clauses=False: [t])
     out = list(tts.synthesize_stream("Hello there."))
     assert len(model.calls) == 2
     assert _seconds(out) < 0.1
@@ -285,3 +285,105 @@ def test_natural_pauses_are_kept_but_capped():
     assert len(model.calls) == 1
     total = _seconds(out)
     assert 6 * 0.32 + 0.4 < total < 6 * 0.32 + 0.8
+
+
+# --- pieces, pauses, and the last word -------------------------------------
+
+from fish_tts_engine import split_text  # noqa: E402
+
+
+def test_split_text_one_sentence_per_piece():
+    text = "Here is the first sentence. And here is the second one! Is this third?"
+    assert split_text(text) == [
+        "Here is the first sentence.",
+        "And here is the second one!",
+        "Is this third?",
+    ]
+
+
+def test_split_text_clauses_keep_numbers_and_merge_fragments():
+    text = ("Shares hit 1,255 dollars, up 3.14 percent on the week. "
+            "The trigger was ChangXin Memory Technologies, CXMT, announcing plans.")
+    assert split_text(text, clauses=True) == [
+        "Shares hit 1,255 dollars,",
+        "up 3.14 percent on the week.",
+        "The trigger was ChangXin Memory Technologies,",
+        "CXMT, announcing plans.",
+    ]
+
+
+def test_split_text_cue_joins_following_piece():
+    text = "That is all for today. [whispers] Here is a little secret for you."
+    assert split_text(text) == [
+        "That is all for today.",
+        "[whispers] Here is a little secret for you.",
+    ]
+
+
+def _paced(monkeypatch, pieces, script, config=None):
+    model = ScriptedModel([script])
+    tts = _loaded(config, model=model)
+    monkeypatch.setattr("fish_tts_engine.split_text",
+                        lambda t, clauses=False: list(pieces))
+    return tts, model
+
+
+def test_sentence_pause_inserted_between_pieces(monkeypatch):
+    pieces = ("The first sentence is here.", "The second sentence follows.")
+    script = [(0, 0.3)] * 3 + [(1, 0.3)] * 3
+    tts, _ = _paced(monkeypatch, pieces, script,
+                    {"fish_warmup": False, "fish_sentence_pause_seconds": 0.5})
+    total = _seconds(tts.synthesize_stream(" ".join(pieces)))
+    assert abs(total - (6 * 0.32 + 0.5)) < 0.03
+
+
+def test_clause_pause_after_comma_and_none_after_length_cut(monkeypatch):
+    pieces = ("A clause that ends in a comma,", "a run that was cut for length",
+              "and the end.")
+    script = [(0, 0.3)] * 2 + [(1, 0.3)] * 2 + [(2, 0.3)] * 2
+    tts, _ = _paced(monkeypatch, pieces, script,
+                    {"fish_warmup": False, "fish_clause_pause_seconds": 0.25})
+    total = _seconds(tts.synthesize_stream(" ".join(pieces)))
+    assert abs(total - (6 * 0.32 + 0.25)) < 0.03
+
+
+def test_clause_pause_zero_splits_by_sentence_only(monkeypatch):
+    seen = []
+    monkeypatch.setattr("fish_tts_engine.split_text",
+                        lambda t, clauses=False: seen.append(clauses) or [t])
+    tts = _loaded({"fish_warmup": False, "fish_clause_pause_seconds": 0})
+    tts._model = ScriptedModel([[(0, 0.3)]])
+    list(tts.synthesize_stream("One, two."))
+    assert seen and not any(seen)
+
+
+def test_quiet_fade_of_last_word_is_played(monkeypatch):
+    # The final chunk is the last word fading out (RMS < SILENT_RMS). It used
+    # to be held as "pause" and dropped, clipping the end of the reading.
+    script = [(0, 0.3)] * 3 + [(0, 0.008)]
+    tts, _ = _paced(monkeypatch, ("Want me to dig deeper?",), script)
+    total = _seconds(tts.synthesize_stream("Want me to dig deeper?"))
+    assert abs(total - 4 * 0.32) < 0.03
+
+
+def test_splitter_installed_into_model_module(monkeypatch):
+    import sys
+    import types
+    mod = types.ModuleType("fake_drama3")
+    mod.split_text = lambda t: ["library"]
+    monkeypatch.setitem(sys.modules, "fake_drama3", mod)
+    monkeypatch.setattr("fish_tts_engine.DRAMA3_MODULE", "fake_drama3")
+    Model = type("Model", (ScriptedModel,), {"__module__": "fake_drama3"})
+    tts = _loaded(model=Model([[(0, 0.3)]]))
+    list(tts.synthesize_stream("First one here, then more words here."))
+    assert mod.split_text("A long enough clause, and another long clause.") == [
+        "A long enough clause,", "and another long clause."]
+
+
+def test_saved_wav_keeps_sentence_pause(monkeypatch):
+    pieces = ("The first sentence is here.", "The second sentence follows.")
+    script = [(0, 0.3)] * 3 + [(1, 0.3)] * 3
+    tts, _ = _paced(monkeypatch, pieces, script,
+                    {"fish_warmup": False, "fish_sentence_pause_seconds": 0.5})
+    audio = tts.synthesize_to_array(" ".join(pieces))
+    assert abs(audio.size / OUT_SAMPLE_RATE - (6 * 0.32 + 0.5)) < 0.03

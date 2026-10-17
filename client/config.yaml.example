@@ -109,6 +109,11 @@ local:
     streaming_interval: 0.32        # seconds of audio per streamed chunk
     first_chunk_frames: 4           # ~0.19s first chunk = fast first audio
     play_prime_seconds: 0.5         # Option+S buffer before the speaker opens
+    # Text goes to the model one sentence (or clause) at a time and this
+    # silence is inserted between pieces. clause 0 = don't split at commas
+    # (the model's own ~0.1s comma pause stays).
+    sentence_pause_seconds: 0.5     # after . ! ? ;
+    clause_pause_seconds: 0.25      # after , :
     # Clone a wav instead (BOTH keys; ref_text = exact words in the clip).
     # 44.1 kHz, 5-15 s, one speaker, quiet room. Longer clips add prefill latency.
     # ref_audio: "/Users/you/Git/nvidia_parakeet/client/voices/my_voice.wav"
