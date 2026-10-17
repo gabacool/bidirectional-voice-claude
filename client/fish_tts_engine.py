@@ -48,10 +48,18 @@ _BULLET = re.compile(r"^(?:[-•·*–—]+|\d{1,3}[.)])\s+")
 _TERMINATED = re.compile(r"[.!?;:…。！？；：][\"'”’)\]]*$")
 # Pauses between pieces. Drama 3's own gaps run ~0.1s at a comma and vary a
 # lot at a period, so text is fed to it one sentence (or clause) per piece and
-# an exact silence is inserted wherever the piece index changes.
+# a set silence is added (on top of the model's own) wherever the piece
+# index changes.
 DEFAULT_SENTENCE_PAUSE_S = 0.5
 DEFAULT_CLAUSE_PAUSE_S = 0.25
 MIN_PIECE_CHARS = 20       # shorter clause fragments ("CXMT,") join the next piece
+_CLOSERS = frozenset("\"'”’)]")
+_CJK_MARKS = frozenset("。！？；，：、")
+# A period after these is not a sentence end: the piece runs on.
+_ABBREVIATION = re.compile(
+    r"(?:^|[\s(])(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|Mt|Inc|Ltd|Co|Corp|vs|etc|approx"
+    r"|No|Fig|[A-Za-z]|(?:[A-Za-z]\.)+[A-Za-z])\.$"
+)
 _SENTENCE_END = re.compile(r"[.!?;…。！？；][\"'”’)\]]*$")
 _CLAUSE_END = re.compile(r"[,:，：、][\"'”’)\]]*$")
 
@@ -87,16 +95,24 @@ def _fish_text(text: str) -> str:
 
 
 def _cut(text: str, marks: frozenset[str]) -> list[str]:
-    """Cut after every mark, except between two digits (3.14, 1,255)."""
-    parts, start = [], 0
-    for i, char in enumerate(text):
+    """Cut after a mark and its closing quotes/brackets.
+
+    A Latin mark cuts only before white space or the end, so 3.14, 1,255,
+    10:30, U.S and "..." stay whole; CJK marks cut directly (no spaces).
+    """
+    parts, start, i = [], 0, 0
+    while i < len(text):
+        char = text[i]
+        i += 1
         if char not in marks:
             continue
-        if (char in ".," and 0 < i < len(text) - 1
-                and text[i - 1].isdigit() and text[i + 1].isdigit()):
+        end = i
+        while end < len(text) and text[end] in _CLOSERS:
+            end += 1
+        if char not in _CJK_MARKS and end < len(text) and not text[end].isspace():
             continue
-        parts.append(text[start:i + 1])
-        start = i + 1
+        parts.append(text[start:end])
+        start = i = end
     if start < len(text):
         parts.append(text[start:])
     return parts
@@ -130,9 +146,9 @@ def split_text(text: str, clauses: bool = False) -> list[str]:
     carry = ""
     for piece in raw:
         carry += piece
-        short = (len(carry.strip()) < MIN_PIECE_CHARS
-                 and not _SENTENCE_END.search(carry.strip()))
-        if short or ck.UNCUTTABLE.fullmatch(piece.strip()):
+        tail = carry.strip()
+        short = len(tail) < MIN_PIECE_CHARS and not _SENTENCE_END.search(tail)
+        if short or _ABBREVIATION.search(tail) or ck.UNCUTTABLE.fullmatch(piece.strip()):
             continue
         out.append(carry)
         carry = ""

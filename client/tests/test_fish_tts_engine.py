@@ -312,6 +312,20 @@ def test_split_text_clauses_keep_numbers_and_merge_fragments():
     ]
 
 
+@pytest.mark.parametrize("text, pieces", [
+    ("Dr. Smith and the U.S. team arrived at Apple Inc. yesterday. It went well.",
+     ["Dr. Smith and the U.S. team arrived at Apple Inc. yesterday.", "It went well."]),
+    ("Wait... what is going on here today?", ["Wait...", "what is going on here today?"]),
+    ("The meeting is scheduled for 10:30 tomorrow morning at the office.",
+     ["The meeting is scheduled for 10:30 tomorrow morning at the office."]),
+    ('He said "stop." Then he left the building quietly.',
+     ['He said "stop."', "Then he left the building quietly."]),
+    ("我们走吧。今天很好，明天也好。", ["我们走吧。", "今天很好，明天也好。"]),
+])
+def test_split_text_abbreviations_times_quotes_and_cjk(text, pieces):
+    assert split_text(text, clauses=True) == pieces
+
+
 def test_split_text_cue_joins_following_piece():
     text = "That is all for today. [whispers] Here is a little secret for you."
     assert split_text(text) == [
