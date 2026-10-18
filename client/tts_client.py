@@ -55,6 +55,12 @@ def _prepare_for_speech(text: str) -> str:
     return _manual_cleanup(text)
 
 
+def log_ts() -> str:
+    """Local wall-clock stamp for service log lines: ``2026-10-19 17:15:02.481``."""
+    from datetime import datetime
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
 def _squeeze_silence(audio: np.ndarray, sr: int = 24000, max_gap_s: float = 0.2,
                      thresh: float = 0.01, win_s: float = 0.02) -> np.ndarray:
     """Shorten the long silences the TTS model inserts between sentences so

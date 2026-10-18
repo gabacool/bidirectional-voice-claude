@@ -65,6 +65,7 @@ from tts_client import (
     BREEZE_PLAY_PRIME_SAMPLES,
     SeekControl,
     create_local_tts,
+    log_ts,
     replace_or_reconfigure_tts,
 )
 from voice_client import LocalTranscriber
@@ -682,7 +683,7 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             audio = self.server.tts_executor.submit(
                 self.server.tts.synthesize_to_array, text).result()
         except Exception as e:
-            print(f"[synthesize error] {e}", file=sys.stderr, flush=True)
+            print(f"{log_ts()} [synthesize error] {e}", file=sys.stderr, flush=True)
             self._respond_json(500, {"error": str(e)})
             return
 
@@ -762,12 +763,12 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError) as e:
                 # Client hung up mid-stream: not an error, just stop writing.
-                print(f"[speech] client disconnected mid-stream: {e}",
+                print(f"{log_ts()} [speech] client disconnected mid-stream: {e}",
                       file=sys.stderr, flush=True)
             except Exception as e:
                 # Generation failed after headers were already sent — a 400 is
                 # no longer possible; log and let the connection close.
-                print(f"[speech] generation error mid-stream: {e}",
+                print(f"{log_ts()} [speech] generation error mid-stream: {e}",
                       file=sys.stderr, flush=True)
         finally:
             # Stop the producer (aborts generation if we exited early) and join it.

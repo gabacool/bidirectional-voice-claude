@@ -29,7 +29,7 @@ import numpy as np
 
 from breeze_tts_engine import DEFAULT_LOCK_PATH as BREEZE_LOCK_PATH
 from breeze_tts_engine import LOCK_TEXT as BREEZE_LOCK_TEXT
-from tts_client import AudioTape, _play_tape, _prepare_for_speech
+from tts_client import AudioTape, _play_tape, _prepare_for_speech, log_ts
 
 DEFAULT_MODEL = "mlx-community/fish-audio-drama-3-4bit"
 OUT_SAMPLE_RATE = 24000
@@ -292,7 +292,7 @@ class FishTTS:
             for _ in self._model.generate(**kwargs):
                 pass
             self._warmed = True
-            print(f"[fish] warm-up done ({time.monotonic() - t0:.1f}s)", flush=True)
+            print(f"{log_ts()} [fish] warm-up done ({time.monotonic() - t0:.1f}s)", flush=True)
 
     def _generation_kwargs(self, text: str, voice: str | None = None,
                            streaming_interval: float | None = None) -> dict | None:
@@ -346,7 +346,7 @@ class FishTTS:
         self._install_splitter()
         in_rate = int(getattr(self._model, "sample_rate", 44100))
         rs = _StreamResampler(in_rate, OUT_SAMPLE_RATE)
-        print(f"[fish] generate chars={len(kwargs['text'])} "
+        print(f"{log_ts()} [fish] generate chars={len(kwargs['text'])} "
               f"interval={kwargs['streaming_interval']}", flush=True)
         t_start = time.monotonic()
         n = 0
@@ -400,9 +400,9 @@ class FishTTS:
                     now = time.monotonic()
                     audio_s += out.size / OUT_SAMPLE_RATE
                     if n == 1:
-                        print(f"[fish] first audio {now - t_start:.2f}s", flush=True)
+                        print(f"{log_ts()} [fish] first audio {now - t_start:.2f}s", flush=True)
                     elif n % 10 == 0:
-                        print(f"[fish] chunk#{n} audio={audio_s:.1f}s "
+                        print(f"{log_ts()} [fish] chunk#{n} audio={audio_s:.1f}s "
                               f"rtf={audio_s / max(now - t_start, 1e-6):.2f}x", flush=True)
                     yield out
             finally:
@@ -418,17 +418,17 @@ class FishTTS:
             if stalled not in spoke and piece != retried_piece:
                 retried_piece = piece
                 text_left = " ".join(pieces[stalled:])
-                print(f"[fish] stall before speech in piece {stalled}; retrying",
+                print(f"{log_ts()} [fish] stall before speech in piece {stalled}; retrying",
                       flush=True)
             else:
                 text_left = " ".join(pieces[stalled + 1:])
-                print(f"[fish] stall in piece {stalled} after {SILENCE_ABORT_S}s "
+                print(f"{log_ts()} [fish] stall in piece {stalled} after {SILENCE_ABORT_S}s "
                       f"silence; skipping to next piece", flush=True)
         tail = rs.flush()
         if tail.size:
             yield tail
         wall = time.monotonic() - t_start
-        print(f"[fish] done audio={audio_s:.1f}s wall={wall:.1f}s "
+        print(f"{log_ts()} [fish] done audio={audio_s:.1f}s wall={wall:.1f}s "
               f"rtf={audio_s / max(wall, 1e-6):.2f}x", flush=True)
 
     def _stretch(self, audio: np.ndarray) -> np.ndarray:
