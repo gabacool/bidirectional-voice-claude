@@ -17,7 +17,7 @@ import threading
 import time
 import wave
 from pathlib import Path
-from typing import Iterator
+from typing import Iterable, Iterator
 
 import numpy as np
 import sounddevice as sd
@@ -608,8 +608,16 @@ class LocalTTS:
         inter-sentence ``_squeeze_silence``. The streaming generator itself
         yields raw chunks without either.
         """
+        return self.array_from_chunks(self.synthesize_stream(text))
+
+    def array_from_chunks(self, stream: Iterable[np.ndarray]) -> np.ndarray:
+        """Post-process ``synthesize_stream`` chunks into the full waveform.
+
+        Split from ``synthesize_to_array`` so the voice API can generate on the
+        inference thread and finish (numpy/librosa only) on its handler thread.
+        """
         chunks = []
-        for audio_np in self.synthesize_stream(text):
+        for audio_np in stream:
             if self.speed != 1.0:
                 import librosa
                 audio_np = librosa.effects.time_stretch(

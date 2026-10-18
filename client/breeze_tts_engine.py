@@ -16,7 +16,7 @@ import threading
 import time
 import wave
 from pathlib import Path
-from typing import Iterator
+from typing import Iterable, Iterator
 
 import numpy as np
 
@@ -249,8 +249,12 @@ class BreezeTTS:
             yield audio_np
 
     def synthesize_to_array(self, text: str) -> np.ndarray:
+        return self.array_from_chunks(self.synthesize_stream(text))
+
+    def array_from_chunks(self, stream: Iterable[np.ndarray]) -> np.ndarray:
+        """Speed + silence post-processing of streamed chunks (see LocalTTS)."""
         chunks = []
-        for audio_np in self.synthesize_stream(text):
+        for audio_np in stream:
             if self.speed != 1.0:
                 import librosa
                 audio_np = librosa.effects.time_stretch(

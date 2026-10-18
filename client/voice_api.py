@@ -45,6 +45,8 @@ import json
 import os
 import queue
 import re
+import select
+import socket
 import struct
 import subprocess
 import sys
@@ -329,6 +331,28 @@ class _GeneratorError:
 
 # Distinct end-of-stream marker put on the queue when the producer finishes.
 _STREAM_SENTINEL = object()
+# How often a waiting consumer re-checks ``cancelled`` (queued or between chunks).
+CANCEL_POLL_S = 0.1
+
+
+class ClientDisconnected(Exception):
+    """The HTTP client closed its socket before the response was written."""
+
+
+def client_disconnected(sock: socket.socket) -> bool:
+    """True once the peer has closed the connection; never blocks or consumes.
+
+    The request body is already read, so a readable socket that peeks zero
+    bytes is EOF (the client hung up). Bytes waiting (a pipelined request) or
+    a socket that is not readable both mean the client is still there.
+    """
+    try:
+        readable, _, _ = select.select([sock], [], [], 0)
+        if not readable:
+            return False
+        return sock.recv(1, socket.MSG_PEEK) == b''
+    except (OSError, ValueError):
+        return True
 # Origin's per-read timeout is 30s. Hold Breeze body bytes until 15s of audio
 # (or EOS), but start draining by ~22s wall so the first body byte still lands
 # inside that budget after clone prefill.
@@ -372,6 +396,7 @@ def run_generator_on(
     executor: ThreadPoolExecutor,
     gen_factory: Callable[[], Iterator[np.ndarray]],
     maxsize: int = STREAM_QUEUE_MAXSIZE,
+    cancelled: Callable[[], bool] | None = None,
 ) -> Iterator[np.ndarray]:
     """Pump ``gen_factory()`` on ``executor``'s thread, yield chunks on the caller's.
 
@@ -388,13 +413,22 @@ def run_generator_on(
         and generation never races far ahead of the client;
       * if the consumer stops early (``close()`` / ``GeneratorExit`` on socket
         disconnect) a stop flag is set that the producer checks between chunks, so
-        generation aborts instead of running to completion as an orphan.
+        generation aborts instead of running to completion as an orphan;
+      * with ``cancelled`` (e.g. "has the HTTP client hung up?") the consumer
+        polls it every ``CANCEL_POLL_S`` while waiting — including while the job
+        is still queued behind others — and before handing over each chunk, and
+        raises ``ClientDisconnected`` once it is true. The producer checks it
+        too, before the model starts and after every chunk, so a job whose
+        client left while it was queued never generates at all, and a running
+        one stops within one chunk. ``cancelled`` must be safe to call from
+        either thread (the socket peek is read-only).
 
     Args:
         executor: The single-worker inference executor to run the generator on.
         gen_factory: Zero-arg callable that creates the underlying chunk iterator
             (deferred so its lazy model work also runs on the inference thread).
         maxsize: Bounded hand-off queue depth.
+        cancelled: Optional zero-arg check, run on both threads.
 
     Yields:
         The chunks produced by ``gen_factory()``, in order.
@@ -416,10 +450,16 @@ def run_generator_on(
     def _produce() -> None:
         gen: Iterator[np.ndarray] | None = None
         try:
+            if stop.is_set():
+                return  # consumer left while this job waited in the queue
+            if cancelled is not None and cancelled():
+                raise ClientDisconnected()  # client left before its turn came
             gen = gen_factory()
             for chunk in gen:
                 if stop.is_set():
                     break
+                if cancelled is not None and cancelled():
+                    raise ClientDisconnected()
                 if not _put(chunk):
                     break
         except BaseException as exc:  # noqa: BLE001 - relayed to the consumer
@@ -436,11 +476,21 @@ def run_generator_on(
     future = executor.submit(_produce)
     try:
         while True:
-            item = handoff.get()
+            if cancelled is None:
+                item = handoff.get()
+            else:
+                try:
+                    item = handoff.get(timeout=CANCEL_POLL_S)
+                except queue.Empty:
+                    if cancelled():
+                        raise ClientDisconnected()
+                    continue
             if item is _STREAM_SENTINEL:
                 break
             if isinstance(item, _GeneratorError):
                 raise item.exc
+            if cancelled is not None and cancelled():
+                raise ClientDisconnected()
             yield item
     finally:
         # Consumer is done or was closed (disconnect): stop the producer and drain
@@ -451,7 +501,8 @@ def run_generator_on(
                 handoff.get_nowait()
         except queue.Empty:
             pass
-        future.result()
+        if not future.cancel():  # cancel() only wins if the job never started
+            future.result()
 
 
 class VoiceAPIHandler(BaseHTTPRequestHandler):
@@ -679,13 +730,31 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             self._respond_json(400, {"error": "missing 'text'"})
             return
 
+        # Same audio as tts.synthesize_to_array(text), but generated chunk by
+        # chunk through the bridge so an abandoned request stops: the socket is
+        # checked while queued and between chunks, and a client that hung up
+        # releases the single inference thread within one chunk. The response
+        # is still one WAV with Content-Length, written only at the end.
+        tts = self.server.tts
+        t0 = time.monotonic()
+        stream = run_generator_on(
+            self.server.tts_executor,
+            lambda: tts.synthesize_stream(text),
+            cancelled=self._client_gone,
+        )
         try:
-            audio = self.server.tts_executor.submit(
-                self.server.tts.synthesize_to_array, text).result()
+            audio = tts.array_from_chunks(stream)
+        except ClientDisconnected:
+            print(f"{log_ts()} [synthesize] client disconnected after "
+                  f"{(time.monotonic() - t0) * 1000:.0f}ms; generation stopped",
+                  file=sys.stderr, flush=True)
+            return
         except Exception as e:
             print(f"{log_ts()} [synthesize error] {e}", file=sys.stderr, flush=True)
             self._respond_json(500, {"error": str(e)})
             return
+        finally:
+            stream.close()
 
         if audio.size == 0:
             self._respond_json(400, {"error": "no speakable text after cleanup"})
@@ -729,6 +798,7 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             self.server.tts_executor,
             lambda: self.server.tts.synthesize_stream(
                 text, voice=voice, streaming_interval=SPEECH_STREAMING_INTERVAL),
+            cancelled=self._client_gone,
         )
         try:
             self.send_response(200)
@@ -761,10 +831,11 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
                 for chunk in primed:
                     self.wfile.write(f32_to_pcm16(chunk))
                     self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError) as e:
-                # Client hung up mid-stream: not an error, just stop writing.
-                print(f"{log_ts()} [speech] client disconnected mid-stream: {e}",
-                      file=sys.stderr, flush=True)
+            except (BrokenPipeError, ConnectionResetError, ClientDisconnected) as e:
+                # Client hung up (seen on write, or by the socket check while
+                # queued / between chunks): not an error, just stop.
+                print(f"{log_ts()} [speech] client disconnected mid-stream: "
+                      f"{str(e) or 'socket closed'}", file=sys.stderr, flush=True)
             except Exception as e:
                 # Generation failed after headers were already sent — a 400 is
                 # no longer possible; log and let the connection close.
@@ -773,6 +844,9 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
         finally:
             # Stop the producer (aborts generation if we exited early) and join it.
             stream.close()
+
+    def _client_gone(self) -> bool:
+        return client_disconnected(self.connection)
 
     def _respond_text(self, code: int, body: str):
         payload = body.encode()

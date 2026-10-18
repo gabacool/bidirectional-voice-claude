@@ -10,7 +10,7 @@ import asyncio
 import subprocess
 import threading
 import time
-from typing import Iterator
+from typing import Iterable, Iterator
 
 import numpy as np
 
@@ -124,7 +124,11 @@ class EdgeTTS:
 
     def synthesize_to_array(self, text: str) -> np.ndarray:
         """Full mono float32 waveform at 24 kHz (LAN ``/synthesize``)."""
-        chunks = list(self.synthesize_stream(text))
+        return self.array_from_chunks(self.synthesize_stream(text))
+
+    def array_from_chunks(self, stream: Iterable[np.ndarray]) -> np.ndarray:
+        """Silence post-processing of streamed chunks (see LocalTTS)."""
+        chunks = list(stream)
         if not chunks:
             return np.zeros(0, dtype=np.float32)
         audio = np.concatenate(chunks)

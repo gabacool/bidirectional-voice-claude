@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Iterator
+from typing import Iterable, Iterator
 
 import numpy as np
 
@@ -439,7 +439,11 @@ class FishTTS:
         return librosa.effects.time_stretch(audio, rate=self.speed).astype(np.float32)
 
     def synthesize_to_array(self, text: str) -> np.ndarray:
-        chunks = [self._stretch(c) for c in self.synthesize_stream(text)]
+        return self.array_from_chunks(self.synthesize_stream(text))
+
+    def array_from_chunks(self, stream: Iterable[np.ndarray]) -> np.ndarray:
+        """Speed post-processing of streamed chunks (see LocalTTS)."""
+        chunks = [self._stretch(c) for c in stream]
         if not chunks:
             return np.zeros(0, dtype=np.float32)
         # No _squeeze_silence: pauses are set per piece (and capped) above,
