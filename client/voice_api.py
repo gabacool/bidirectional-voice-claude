@@ -65,6 +65,7 @@ import yaml
 
 from tts_client import (
     BREEZE_PLAY_PRIME_SAMPLES,
+    AudioTape,
     SeekControl,
     create_local_tts,
     log_ts,
@@ -599,6 +600,10 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             self.server.seek.pop()
             self.server.playing.set()
             try:
+                if hasattr(self.server.tts, 'generate_into_tape'):
+                    self._speak_split(text)
+                    self._respond_text(200, 'ok')
+                    return
                 # Qwen must generate on the TTS infer thread (mlx stream affinity).
                 self.server.tts_executor.submit(
                     self.server.tts.synthesize_and_play,
@@ -615,6 +620,48 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             finally:
                 self.server.playing.clear()
                 self.server.pause_event.clear()
+
+    def _speak_split(self, text: str) -> None:
+        """Option+S for engines with a generation/playback split (Fish).
+
+        Only generation is queued on the single TTS infer thread, so the
+        worker is free the moment the last chunk is on the tape; playback,
+        with its pause / seek / stop, runs here on the handler thread, which
+        still holds speak_lock and ``playing`` until the audio ends.
+        """
+        server = self.server
+        tts = server.tts
+        tape = AudioTape()
+        gen_error: list = [None]
+        gen_started = threading.Event()
+
+        def generate():
+            gen_started.set()
+            if server.stop_event.is_set():
+                return False
+            return tts.generate_into_tape(text, tape, gen_error, server.stop_event)
+
+        gen = server.tts_executor.submit(generate)
+        try:
+            # Playback's prime / max-wait clock must start with generation,
+            # not while this job waits behind another one on the worker.
+            # A stop while queued (second Option+S, /stop) drops the job.
+            while not gen_started.wait(0.05):
+                if server.stop_event.is_set() and gen.cancel():
+                    return
+            if server.stop_event.is_set():
+                return
+            tts.play_tape(
+                tape, gen_error, server.stop_event, server.pause_event,
+                server.seek, server.audible,
+                stream_factory=getattr(server, 'speak_stream_factory', None),
+            )
+        except BaseException:
+            server.stop_event.set()   # playback died: don't finish generating
+            raise
+        finally:
+            if not gen.cancelled():
+                gen.result()
 
     def _handle_save(self) -> None:
         """Option+Shift+S: clipboard (or POST body) → WAV in ~/Downloads."""

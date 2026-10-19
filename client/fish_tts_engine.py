@@ -459,32 +459,54 @@ class FishTTS:
         print(f"Speaking: {speech_text[:100]}...")
         tape = AudioTape()
         gen_error: list = [None]
-        # Generate on THIS thread (voice_api's TTS infer worker): MLX GPU
-        # streams are thread-local. Playback owns PortAudio on a side thread.
+        # Generate on THIS thread (the TTS infer thread): MLX GPU streams are
+        # thread-local. Playback owns PortAudio on a side thread.
         play_t = threading.Thread(
-            target=_play_tape,
-            args=(tape, None, gen_error, stop_event, pause_event, seek),
-            kwargs={
-                "started_event": started_event,
-                "prime_samples": int(self.play_prime_seconds * OUT_SAMPLE_RATE),
-                "max_wait_s": PLAY_MAX_WAIT_S,
-                "min_realtime": PLAY_MIN_REALTIME,
-            },
+            target=self.play_tape,
+            args=(tape, gen_error, stop_event, pause_event, seek, started_event),
             daemon=True,
         )
         play_t.start()
+        self.generate_into_tape(text, tape, gen_error, stop_event)
+        play_t.join()
+        if gen_error[0] is not None and not (
+            stop_event is not None and stop_event.is_set()
+        ):
+            raise gen_error[0]
+
+    # voice_api runs these two halves on different threads so Option+S frees
+    # the single TTS infer thread as soon as generation ends. Pause gates only
+    # playback: the generation loop below never looks at pause_event.
+
+    def generate_into_tape(self, text: str, tape: AudioTape, gen_error: list,
+                           stop_event=None, on_chunk=None) -> None:
+        """Generation half: fill ``tape`` on the TTS infer thread, then finish it.
+
+        Errors land in ``gen_error[0]`` for the player to raise; ``stop_event``
+        ends generation within one chunk.
+        """
         try:
             for chunk in self.synthesize_stream(text):
                 if stop_event is not None and stop_event.is_set():
                     break
                 if chunk.size:
                     tape.append(self._stretch(chunk))
+                if on_chunk is not None:
+                    on_chunk()
         except Exception as e:
             gen_error[0] = e
         finally:
             tape.finish()
-        play_t.join()
-        if gen_error[0] is not None and not (
-            stop_event is not None and stop_event.is_set()
-        ):
-            raise gen_error[0]
+
+    def play_tape(self, tape: AudioTape, gen_error: list, stop_event=None,
+                  pause_event=None, seek=None, started_event=None,
+                  stream_factory=None) -> None:
+        """Playback half: play ``tape`` (pause / seek / stop) on any one thread."""
+        _play_tape(
+            tape, None, gen_error, stop_event, pause_event, seek,
+            stream_factory=stream_factory,
+            started_event=started_event,
+            prime_samples=int(self.play_prime_seconds * OUT_SAMPLE_RATE),
+            max_wait_s=PLAY_MAX_WAIT_S,
+            min_realtime=PLAY_MIN_REALTIME,
+        )
