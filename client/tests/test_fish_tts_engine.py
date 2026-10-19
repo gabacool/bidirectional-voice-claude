@@ -401,3 +401,74 @@ def test_saved_wav_keeps_sentence_pause(monkeypatch):
                     {"fish_warmup": False, "fish_sentence_pause_seconds": 0.5})
     audio = tts.synthesize_to_array(" ".join(pieces))
     assert abs(audio.size / OUT_SAMPLE_RATE - (6 * 0.32 + 0.5)) < 0.03
+
+
+# --- onset trim ------------------------------------------------------------
+
+from fish_tts_engine import ONSET_END_S, ONSET_START_S, TAIL_S  # noqa: E402
+
+
+def _db(x):
+    return 20 * np.log10(np.sqrt(np.mean(np.square(x))) + 1e-12)
+
+
+def _onset_vs_steady(audio):
+    r = OUT_SAMPLE_RATE
+    onset = audio[int(ONSET_START_S * r):int(ONSET_END_S * r)]
+    steady = audio[int(ONSET_END_S * r):audio.size - int(TAIL_S * r)]
+    return _db(onset) - _db(steady)
+
+
+def _one_piece(monkeypatch, script, config=None):
+    tts, _ = _paced(monkeypatch, ("A single piece of speech here.",), script,
+                    config or {"fish_warmup": False})
+    return np.concatenate(list(tts.synthesize_stream("A single piece of speech here.")))
+
+
+def test_hot_onset_is_trimmed_to_steady_level(monkeypatch):
+    # Two 0.32s chunks +4 dB hot, then 3.2s at steady level.
+    hot, steady = 0.3 * 10 ** (4 / 20), 0.3
+    script = [(0, hot)] * 2 + [(0, steady)] * 10
+    off = _one_piece(monkeypatch, script, {"fish_warmup": False, "fish_onset_trim": False})
+    on = _one_piece(monkeypatch, script)
+    assert _onset_vs_steady(off) > 3.5          # the defect is really there
+    assert abs(_onset_vs_steady(on)) < 1.5      # ... and trimmed away
+    assert on.size == off.size                  # nothing dropped or added
+    assert np.max(np.abs(on)) <= np.max(np.abs(off)) + 1e-6   # only ever trims
+
+
+def test_flat_piece_is_left_alone(monkeypatch):
+    script = [(0, 0.3)] * 12
+    off = _one_piece(monkeypatch, script, {"fish_warmup": False, "fish_onset_trim": False})
+    on = _one_piece(monkeypatch, script)
+    np.testing.assert_array_equal(on, off)
+
+
+def test_onset_below_threshold_is_left_alone(monkeypatch):
+    script = [(0, 0.3 * 10 ** (1.0 / 20))] * 2 + [(0, 0.3)] * 10   # +1 dB < 1.5
+    off = _one_piece(monkeypatch, script, {"fish_warmup": False, "fish_onset_trim": False})
+    on = _one_piece(monkeypatch, script)
+    np.testing.assert_array_equal(on, off)
+
+
+def test_long_piece_streams_after_the_hold(monkeypatch):
+    # The trim holds only ONSET_HOLD_S of a piece; the rest still streams.
+    script = [(0, 0.3)] * 30                      # ~9.6s piece
+    tts, _ = _paced(monkeypatch, ("A long piece of speech.",), script)
+    chunks = [c for c in tts.synthesize_stream("A long piece of speech.") if c.size]
+    first = chunks[0].size / OUT_SAMPLE_RATE
+    assert 1.5 <= first < 2.0      # 1.6s held, minus the resampler's delay
+    assert len(chunks) > 20
+
+
+def test_each_piece_trimmed_on_its_own(monkeypatch):
+    hot = 0.3 * 10 ** (4 / 20)
+    pieces = ("The first sentence is here.", "The second sentence follows.")
+    script = ([(0, hot)] * 2 + [(0, 0.3)] * 8) + ([(1, hot)] * 2 + [(1, 0.3)] * 8)
+    tts, _ = _paced(monkeypatch, pieces, script,
+                    {"fish_warmup": False, "fish_sentence_pause_seconds": 0.5})
+    audio = np.concatenate(list(tts.synthesize_stream(" ".join(pieces))))
+    n = int(10 * 0.32 * OUT_SAMPLE_RATE)
+    second = audio[n + int(0.5 * OUT_SAMPLE_RATE):]
+    assert abs(_onset_vs_steady(audio[:n])) < 1.5
+    assert abs(_onset_vs_steady(second)) < 1.5

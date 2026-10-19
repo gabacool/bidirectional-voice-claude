@@ -60,6 +60,18 @@ _ABBREVIATION = re.compile(
     r"(?:^|[\s(])(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|Mt|Inc|Ltd|Co|Corp|vs|etc|approx"
     r"|No|Fig|[A-Za-z]|(?:[A-Za-z]\.)+[A-Za-z])\.$"
 )
+# Onset trim. Every Drama 3 piece starts hot: over 105 pieces the mean
+# envelope runs +2 to +4 dB above steady from 50 to 550 ms, settling by ~1 s.
+# The first ONSET_HOLD_S of each piece is held to measure its steady level,
+# then the head is trimmed down to it and eased back to 0 dB.
+DEFAULT_ONSET_TRIM_THRESHOLD_DB = 1.5
+ONSET_START_S = 0.05       # the model's own attack, measured past
+ONSET_END_S = 0.55
+TAIL_S = 0.7               # the last word's fade-out is never "steady"
+ONSET_HOLD_S = 1.6
+MIN_STEADY_S = 0.3
+TRIM_FLAT_S = 0.35         # full trim across the hot onset ...
+TRIM_EASE_S = 0.45         # ... then a raised-cosine back to 0 dB
 _SENTENCE_END = re.compile(r"[.!?;…。！？；][\"'”’)\]]*$")
 _CLAUSE_END = re.compile(r"[,:，：、][\"'”’)\]]*$")
 
@@ -203,6 +215,62 @@ class _StreamResampler:
         return self._stream.resample_chunk(np.zeros(0, dtype=np.float32), last=True)
 
 
+def _rms_db(x: np.ndarray) -> float:
+    return 20.0 * float(np.log10(np.sqrt(np.mean(np.square(x))) + 1e-12))
+
+
+class _OnsetTrim:
+    """Per-piece onset gain: trims a piece's hot start to its own steady level.
+
+    ``feed`` holds a piece's first ONSET_HOLD_S, measures it, and from then on
+    passes audio straight through; ``end_piece`` releases a shorter piece
+    (its last TAIL_S excluded from steady). A piece too short to measure
+    borrows the previous piece's steady level. Gain is only ever <= 0 dB.
+    """
+
+    def __init__(self, rate: int, threshold_db: float, enabled: bool = True):
+        self.rate = int(rate)
+        self.threshold_db = float(threshold_db)
+        self.enabled = bool(enabled)
+        self._buf: list[np.ndarray] = []
+        self._n = 0
+        self._decided = False
+        self._last_steady_db: float | None = None
+
+    def feed(self, x: np.ndarray) -> np.ndarray:
+        if not self.enabled or self._decided or x.size == 0:
+            return x
+        self._buf.append(x)
+        self._n += x.size
+        if self._n < int(ONSET_HOLD_S * self.rate):
+            return np.zeros(0, dtype=np.float32)
+        self._decided = True
+        return self._release(complete=False)
+
+    def end_piece(self) -> np.ndarray:
+        out = self._release(complete=True) if self._buf else np.zeros(0, dtype=np.float32)
+        self._decided = False
+        return out
+
+    def _release(self, complete: bool) -> np.ndarray:
+        a = np.concatenate(self._buf)
+        self._buf, self._n = [], 0
+        r = self.rate
+        start, end = int(ONSET_END_S * r), a.size - (int(TAIL_S * r) if complete else 0)
+        if end - start >= int(MIN_STEADY_S * r):
+            self._last_steady_db = _rms_db(a[start:end])
+        onset = a[int(ONSET_START_S * r):int(ONSET_END_S * r)]
+        if self._last_steady_db is None or onset.size < int(0.2 * r):
+            return a
+        trim_db = min(0.0, self._last_steady_db - _rms_db(onset))
+        if -trim_db <= self.threshold_db:
+            return a
+        t = np.arange(a.size) / r
+        ease = np.clip((t - TRIM_FLAT_S) / TRIM_EASE_S, 0.0, 1.0)
+        gain_db = trim_db * 0.5 * (1.0 + np.cos(np.pi * ease))
+        return (a * np.power(10.0, gain_db / 20.0)).astype(np.float32)
+
+
 class FishTTS:
     """On-device Fish Audio Drama 3 (MLX 4-bit by default)."""
 
@@ -251,6 +319,10 @@ class FishTTS:
         )
         self.clause_pause = float(
             config.get("fish_clause_pause_seconds", DEFAULT_CLAUSE_PAUSE_S)
+        )
+        self.onset_trim = bool(config.get("fish_onset_trim", True))
+        self.onset_trim_threshold_db = float(
+            config.get("fish_onset_trim_threshold_db", DEFAULT_ONSET_TRIM_THRESHOLD_DB)
         )
         self.speed = config.get("tts_speed", 1.0)
         self.seek_seconds = config.get("tts_seek_seconds", 15)
@@ -332,7 +404,8 @@ class FishTTS:
         text piece stalls (SILENCE_ABORT_S of silence) the generator is closed
         and generation restarts from the next piece. A piece that stalls
         before saying anything is retried once. Quiet audio held at the very
-        end is the last word's fade-out and is played, not dropped.
+        end is the last word's fade-out and is played, not dropped. Each
+        piece's hot onset is trimmed to its steady level (_OnsetTrim).
         """
         if not _fish_text(_prepare_for_speech(text)):
             return
@@ -353,6 +426,7 @@ class FishTTS:
         audio_s = 0.0
         text_left = kwargs["text"]
         retried_piece = None
+        trim = _OnsetTrim(in_rate, self.onset_trim_threshold_db, self.onset_trim)
         while text_left:
             kwargs["text"] = text_left
             pieces = self._split(text_left)
@@ -371,6 +445,7 @@ class FishTTS:
                     parts: list[np.ndarray] = []
                     if cur_seg is not None and seg != cur_seg:
                         # Piece boundary: its quiet tail, then the set pause.
+                        parts.append(trim.end_piece())
                         if held:
                             parts.append(np.concatenate(held)[: int(PAUSE_CAP_S * in_rate)])
                             held, held_s = [], 0.0
@@ -387,10 +462,12 @@ class FishTTS:
                             break
                     else:
                         if held:
-                            parts.append(np.concatenate(held)[: int(PAUSE_CAP_S * in_rate)])
+                            pause = np.concatenate(held)[: int(PAUSE_CAP_S * in_rate)]
+                            parts.append(trim.feed(pause))
                             held, held_s = [], 0.0
-                        parts.append(raw)
+                        parts.append(trim.feed(raw))
                         spoke.add(seg)
+                    parts = [p for p in parts if p.size]
                     if not parts:
                         continue
                     out = rs.process(np.concatenate(parts))
@@ -407,12 +484,14 @@ class FishTTS:
                     yield out
             finally:
                 gen.close()
+            last = [trim.end_piece()]
+            if stalled is None and held and spoke:
+                last.append(np.concatenate(held)[: int(PAUSE_CAP_S * in_rate)])
+            out = rs.process(np.concatenate(last))
+            audio_s += out.size / OUT_SAMPLE_RATE
+            if out.size:
+                yield out
             if stalled is None:
-                if held and spoke:
-                    out = rs.process(np.concatenate(held)[: int(PAUSE_CAP_S * in_rate)])
-                    audio_s += out.size / OUT_SAMPLE_RATE
-                    if out.size:
-                        yield out
                 break
             piece = pieces[stalled] if stalled < len(pieces) else ""
             if stalled not in spoke and piece != retried_piece:

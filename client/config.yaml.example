@@ -135,6 +135,10 @@ local:
     # (the model's own ~0.1s comma pause stays).
     sentence_pause_seconds: 0.5     # after . ! ? ;
     clause_pause_seconds: 0.25      # after , :
+    # Each piece starts ~3 dB hotter than it continues for ~0.5s (measured
+    # mean over 105 pieces); trim that onset down to the piece's own steady level.
+    onset_trim: true
+    onset_trim_threshold_db: 1.5    # trim only onsets hotter than steady by more than this
     # Clone a wav instead (BOTH keys; ref_text = exact words in the clip).
     # 44.1 kHz, 5-15 s, one speaker, quiet room. Longer clips add prefill latency.
     # ref_audio: "/Users/you/Git/nvidia_parakeet/client/voices/my_voice.wav"

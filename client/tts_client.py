@@ -381,6 +381,8 @@ _ENGINE_KEY_MAP = {
         "play_prime_seconds": "fish_play_prime_seconds",
         "sentence_pause_seconds": "fish_sentence_pause_seconds",
         "clause_pause_seconds": "fish_clause_pause_seconds",
+        "onset_trim": "fish_onset_trim",
+        "onset_trim_threshold_db": "fish_onset_trim_threshold_db",
         "warmup": "fish_warmup",
         "seed": "tts_seed",
         "speaker": "tts_speaker",
