@@ -571,6 +571,21 @@ def test_runaway_budget_follows_how_text_is_spoken():
     assert exp("今" * 50) > 4 * 50
 
 
+def test_resume_does_not_recount_trimmed_voiced_frames(monkeypatch, capsys):
+    # "Okay." has a budget of 34 voiced frames. The first take speaks 28 voiced
+    # frames, the last 6 of them only the tail of the word (trimmed from the
+    # resume prefix), then stalls. The resume keeps 22 voiced frames, so one
+    # more chunk (7) is 29 <= 34: not a runaway. Counting the 6 trimmed frames
+    # twice made it 35 and cut a good take.
+    assert fish_tts_engine._runaway_budget("Okay.", 1024) == 34
+    first = [0.3] * 3 + [(0.3, 1), (0.3, 6, "tail")] + [0.0] * 20      # stalls
+    tts, drv = _paced(monkeypatch, ["Okay."], [first, [0.3]])
+    list(tts.synthesize_stream("Okay."))
+    log = capsys.readouterr().out
+    assert "resume 1/" in log and drv.calls[1].prefix_len == 22
+    assert "runaway=0" in log and "ERROR runaway" not in log
+
+
 def test_long_cjk_piece_is_not_cut(monkeypatch, capsys):
     # 95 CJK characters fit in one piece (300 bytes). At the slowest rate
     # measured on real Chinese (4.89 voiced frames/char) a 90-char sentence

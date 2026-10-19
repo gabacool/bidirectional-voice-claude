@@ -849,6 +849,7 @@ class FishTTS:
             content: list = []           # this piece's frames so far (prefix + new)
             prefix_len = 0               # of `content`: through the last frame with sound
             voiced = 0                   # voiced frames in `content`
+            voiced_kept = 0              # of `voiced`: those through `prefix_len`
             voiced_snap = None           # codec state after the last voiced chunk
             held: list[np.ndarray] = []  # silent chunks since the last voiced one
             prefix = None                # frames handed to the model as the prefix
@@ -890,6 +891,7 @@ class FishTTS:
                             quiet = _silent_tail(raw, len(chunk), p.silence_rms)
                             if quiet < len(chunk):
                                 prefix_len = len(content) - quiet
+                                voiced_kept = voiced - quiet
                             voiced_snap = drv.codec_snapshot()
                         else:
                             held.append(raw)
@@ -948,7 +950,7 @@ class FishTTS:
                     print(f"[fish] stall before speech in {where}; "
                           f"retry {used}/{p.stall_attempts} {shown}", flush=True)
                     restore_eos()
-                    content, prefix_len, voiced, held, prefix = [], 0, 0, [], None
+                    content, prefix_len, voiced, voiced_kept, held, prefix = [], 0, 0, 0, [], None
                 elif left >= 1:                                         # R2
                     stats.resumed += 1
                     print(f"[fish] stall in {where} after {p.stall_seconds:g}s silence "
@@ -956,13 +958,14 @@ class FishTTS:
                           f"resume {used}/{p.stall_attempts} {shown}", flush=True)
                     drv.codec_restore(voiced_snap, drop_overlap=True)
                     content = content[:prefix_len]      # trailing silent frames dropped
+                    voiced = voiced_kept   # the trimmed ones are regenerated: count once
                     prefix = list(content)
                 else:                                                   # R3
                     stats.retried += 1
                     print(f"[fish] WARNING {where} resumes failed; repeating from "
                           f"start {used}/{p.stall_attempts} {shown}", flush=True)
                     drv.codec_restore(voiced_snap, drop_overlap=True)
-                    content, prefix_len, voiced, prefix = [], 0, 0, None
+                    content, prefix_len, voiced, voiced_kept, prefix = [], 0, 0, 0, None
         if pending is not None and pending[0] is not None and pending[0].size:
             yield pending[0]
 
