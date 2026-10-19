@@ -380,6 +380,7 @@ _ENGINE_KEY_MAP = {
         "stall_seconds": "fish_stall_seconds",
         "stall_attempts": "fish_stall_attempts",
         "carry_codec_state": "fish_carry_codec_state",
+        "mlx_cache_limit_gb": "fish_mlx_cache_limit_gb",
         "seed": "tts_seed",
         "speaker": "tts_speaker",
     },

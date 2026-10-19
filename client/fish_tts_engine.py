@@ -52,6 +52,15 @@ DEFAULT_SILENCE_RMS = 0.001  # per streamed chunk (~0.32s); below it = silent
 DEFAULT_STALL_S = 3.0        # continuous silence that counts as a stall
 DEFAULT_STALL_ATTEMPTS = 3   # re-generations per stalled piece before skipping it
 PAUSE_CAP_S = 0.6            # longest pause we ever play
+# MLX keeps freed GPU buffers for reuse, and by default never gives them back
+# (its cache limit defaults to the memory limit, ~1.5x the GPU working set).
+# Drama 3 frees buffers of ever-new sizes (KV caches and attention scratch
+# sized by each piece's history), so the cache grew 9.5 -> 29.7 GB over 29
+# chat requests while live arrays stayed at 24.2 GB. Process-wide cap; a
+# request's whole working set beyond the weights is ~1.2 GB. Paired runs:
+# no cache = ~10% slower and +0.05 s first audio; 4 GB ~15 ms faster first
+# audio than 2 GB.
+DEFAULT_MLX_CACHE_LIMIT_GB = 4.0
 # A piece's voiced frames are bounded by its text; babble at 0.001-0.01 RMS is
 # "voiced" now, so this is what stops a runaway (593 real pieces: 1/593 over).
 QUIET_RMS = 0.01             # the old silence line; quiet speech sits below it
@@ -454,6 +463,7 @@ class FishTTS:
         self._model_key = None     # model name _model was loaded for
         self._driver = None
         self._carry = None         # (signature, codec snapshot after the last EOS)
+        self._cache_limit = None   # bytes last passed to mx.set_cache_limit
         self.model_name = None
         self.apply_config(config)
 
@@ -493,6 +503,8 @@ class FishTTS:
             config.get("fish_clause_pause_seconds", DEFAULT_CLAUSE_PAUSE_S)
         )
         self.carry_codec_state = bool(config.get("fish_carry_codec_state", True))
+        self.mlx_cache_limit_gb = max(0.0, float(config.get(
+            "fish_mlx_cache_limit_gb", DEFAULT_MLX_CACHE_LIMIT_GB)))
         self.silence_rms = float(config.get("fish_silence_rms", DEFAULT_SILENCE_RMS))
         self.stall_seconds = float(config.get("fish_stall_seconds", DEFAULT_STALL_S))
         self.stall_attempts = max(0, int(config.get("fish_stall_attempts",
@@ -539,7 +551,19 @@ class FishTTS:
         t0 = time.monotonic()
         self._model = _load_model(cfg.model_name)
         self._model_key = cfg.model_name
+        import mlx.core as mx
+        mx.clear_cache()   # the loader's freed temporaries (~8-9 GB measured)
         print(f"TTS model loaded ({time.monotonic() - t0:.1f}s)", flush=True)
+
+    def _apply_cache_limit(self) -> None:
+        """Cap MLX's buffer cache (process-wide). Inference thread only; a
+        config change takes effect at the next request."""
+        limit = int(self.mlx_cache_limit_gb * 1e9)
+        if limit != self._cache_limit:
+            import mlx.core as mx
+            mx.set_cache_limit(limit)
+            self._cache_limit = limit
+            print(f"[fish] mlx cache limit {limit / 1e9:g} GB", flush=True)
 
     def _signature(self, cfg: _Cfg) -> _Signature:
         st = os.stat(cfg.ref_audio)
@@ -557,6 +581,7 @@ class FishTTS:
         it ends, whatever ``apply_config`` does meanwhile."""
         cfg = self._cfg           # one read: never a torn config
         self._load_for(cfg)
+        self._apply_cache_limit()
         self._check_reference(cfg)
         sig = self._signature(cfg)
         drv = self._driver

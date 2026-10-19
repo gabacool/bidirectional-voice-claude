@@ -290,6 +290,37 @@ def test_warmup_seeds_the_codec_with_the_voices_own_speech(monkeypatch):
     assert drv.events[n] == ("restore", seed_last, False)
 
 
+def test_mlx_cache_is_capped_and_load_residue_cleared(monkeypatch):
+    import mlx.core as mx
+    calls = []
+    monkeypatch.setattr(mx, "set_cache_limit", lambda n: calls.append(("limit", n)) or 0)
+    monkeypatch.setattr(mx, "clear_cache", lambda: calls.append(("clear",)))
+    monkeypatch.setattr("fish_tts_engine._load_model",
+                        lambda name: calls.append(("load", name)) or object())
+    tts = _loaded(scripts=[[(0.3, 7)]] * 4)
+    tts._model = None                         # this request loads the model
+    list(tts.synthesize_stream("Hello there."))
+    # The loader's freed temporaries go right after the load, then the cap.
+    assert calls == [("load", tts.model_name), ("clear",), ("limit", 4_000_000_000)]
+    list(tts.synthesize_stream("Hello again."))
+    assert len(calls) == 3                    # unchanged limit: not re-applied
+    tts.apply_config({"fish_ref_audio": str(REF), "fish_ref_text": "x",
+                      "fish_warmup": False, "fish_first_chunk_frames": FPC,
+                      "fish_mlx_cache_limit_gb": 0.5})
+    assert len(calls) == 3                    # apply_config only writes attributes
+    list(tts.synthesize_stream("And again."))
+    assert calls[-1] == ("limit", 500_000_000)
+
+
+def test_mlx_cache_limit_key_flattens():
+    from tts_client import flatten_local_tts_config
+    flat = flatten_local_tts_config({"tts_engine": "fish", "fish": {"mlx_cache_limit_gb": 3}})
+    assert flat["fish_mlx_cache_limit_gb"] == 3
+    assert FishTTS(flat).mlx_cache_limit_gb == 3.0
+    assert FishTTS({}).mlx_cache_limit_gb == 4.0
+    assert FishTTS({"fish_mlx_cache_limit_gb": -1}).mlx_cache_limit_gb == 0.0
+
+
 class _FailOnceDriver(FakeDriver):
     """The first frames() call (the warm-up seed's first piece) raises."""
 

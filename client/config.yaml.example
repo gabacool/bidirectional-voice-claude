@@ -128,6 +128,10 @@ local:
     # louder: chat sends one request per sentence group, so the volume pumps).
     # true = carry the codec state across requests. false = old cold start.
     carry_codec_state: true
+    # GB of freed GPU buffers MLX may keep for reuse (process-wide). With no
+    # cap MLX keeps them all and the process grows by 20+ GB within a few
+    # dozen requests; 0 = keep none (about 10% slower, +0.05 s first audio).
+    mlx_cache_limit_gb: 4
     # Clone a wav instead (BOTH keys; ref_text = exact words in the clip).
     # 44.1 kHz, 5-15 s, one speaker, quiet room. Longer clips add prefill latency.
     # ref_audio: "/Users/you/Git/nvidia_parakeet/client/voices/my_voice.wav"
