@@ -80,6 +80,10 @@ _FRAMES_PER_SPELLED = 6.3    # a letter said on its own ("N V D A", "GPU")
 _FRAMES_PER_DIGIT = 9.1      # "142.18" -> "one hundred forty two point one eight"
 _FRAMES_PER_SYMBOL = 9.0     # % $ & said as a word (few in the data: set lenient)
 _FRAMES_PER_CJK = 4.1        # one syllable per CJK character
+# A letter of any other script (Cyrillic, Greek, Arabic, Hebrew, accented
+# Latin...). Not measured: set lenient so a normal piece is never cut (a
+# late-cut runaway costs seconds, a false cut loses speech).
+_FRAMES_PER_OTHER_LETTER = 3.0
 RUNAWAY_MIN_FRAMES = 21      # three chunks: voiced frames come in whole chunks
 RUNAWAY_FACTOR = 1.55
 _CJK_CHAR = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")
@@ -210,8 +214,10 @@ def _expected_frames(piece: str) -> float:
     spelled = (len(_LONE_LETTER.findall(piece))
                + sum(len(m) for m in _ACRONYM.findall(piece)))
     letters = sum(c.isascii() and c.isalpha() for c in piece) - spelled
+    other = sum(c.isalpha() and not c.isascii() and not _CJK_CHAR.match(c) for c in piece)
     digits = sum(c.isdigit() for c in piece)
     return (_FRAMES_BASE + _FRAMES_PER_LETTER * letters + _FRAMES_PER_SPELLED * spelled
+            + _FRAMES_PER_OTHER_LETTER * other
             + _FRAMES_PER_DIGIT * digits + _FRAMES_PER_CJK * cjk
             + _FRAMES_PER_SYMBOL * len(_SPOKEN_SYMBOL.findall(piece)))
 

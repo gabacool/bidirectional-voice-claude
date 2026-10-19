@@ -571,6 +571,20 @@ def test_runaway_budget_follows_how_text_is_spoken():
     assert exp("今" * 50) > 4 * 50
 
 
+def test_runaway_budget_covers_other_scripts():
+    # Cyrillic, Greek, Arabic, Hebrew speak like Latin letters, not like nothing:
+    # the old formula gave this Russian sentence a budget of 26 frames (~1.2 s).
+    for piece in ("Привет, как у тебя дела сегодня, друг мой?",
+                  "Γεια σου, τι κάνεις σήμερα, φίλε μου;",
+                  "مرحبا كيف حالك اليوم يا صديقي العزيز؟",
+                  "שלום מה שלומך היום חבר שלי היקר?"):
+        assert fish_tts_engine._runaway_budget(piece, 1024) >= 100, piece
+    ru = "Привет, как у тебя дела сегодня, друг мой?"
+    assert fish_tts_engine._runaway_budget(ru, 1024) >= 150      # >= the old 96 + 3 x chars
+    gr = "Γεια σου, τι κάνεις σήμερα, φίλε μου;"
+    assert fish_tts_engine._runaway_budget(gr, 1024) >= 150
+
+
 def test_resume_does_not_recount_trimmed_voiced_frames(monkeypatch, capsys):
     # "Okay." has a budget of 34 voiced frames. The first take speaks 28 voiced
     # frames, the last 6 of them only the tail of the word (trimmed from the
