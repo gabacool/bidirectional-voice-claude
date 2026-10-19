@@ -60,6 +60,9 @@ _ABBREVIATION = re.compile(
     r"(?:^|[\s(])(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|Mt|Inc|Ltd|Co|Corp|vs|etc|approx"
     r"|No|Fig|[A-Za-z]|(?:[A-Za-z]\.)+[A-Za-z])\.$"
 )
+# Two or more spelled letters then a period ("I R E N.", "S P Y.") end a
+# sentence: the lone-letter initial rule above must not swallow them.
+_SPELLED_LETTERS = re.compile(r"(?:^|\s)[A-Za-z] [A-Za-z]\.$")
 _SENTENCE_END = re.compile(r"[.!?;…。！？；][\"'”’)\]]*$")
 _CLAUSE_END = re.compile(r"[,:，：、][\"'”’)\]]*$")
 
@@ -148,7 +151,8 @@ def split_text(text: str, clauses: bool = False) -> list[str]:
         carry += piece
         tail = carry.strip()
         short = len(tail) < MIN_PIECE_CHARS and not _SENTENCE_END.search(tail)
-        if short or _ABBREVIATION.search(tail) or ck.UNCUTTABLE.fullmatch(piece.strip()):
+        abbreviation = _ABBREVIATION.search(tail) and not _SPELLED_LETTERS.search(tail)
+        if short or abbreviation or ck.UNCUTTABLE.fullmatch(piece.strip()):
             continue
         out.append(carry)
         carry = ""

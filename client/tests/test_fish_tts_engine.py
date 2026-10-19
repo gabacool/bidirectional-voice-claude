@@ -401,3 +401,15 @@ def test_saved_wav_keeps_sentence_pause(monkeypatch):
                     {"fish_warmup": False, "fish_sentence_pause_seconds": 0.5})
     audio = tts.synthesize_to_array(" ".join(pieces))
     assert abs(audio.size / OUT_SAMPLE_RATE - (6 * 0.32 + 0.5)) < 0.03
+
+
+def test_spelled_letters_end_sentence():
+    # A spelled ticker ending in "." is a sentence end, not an initial.
+    assert split_text("I R E N. Worst cohort this week:", clauses=True) == [
+        "I R E N.", "Worst cohort this week:"]
+    assert split_text("Ticker S P Y. Next one.", clauses=True) == [
+        "Ticker S P Y.", "Next one."]
+    # Real initials and abbreviations still run on (today's behaviour).
+    assert split_text("John F. Kennedy spoke.", clauses=True) == ["John F. Kennedy spoke."]
+    assert split_text("J. Smith arrived.", clauses=True) == ["J. Smith arrived."]
+    assert split_text("Plan B. Then we left.", clauses=True) == ["Plan B. Then we left."]
