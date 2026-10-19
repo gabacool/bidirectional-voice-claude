@@ -1,40 +1,117 @@
-"""Unit tests for FishTTS (Fish Audio Drama 3) — fake model, no MLX generate."""
+"""Unit tests for FishTTS (Fish Audio Drama 3).
 
+The engine is driven through ``_Drama3Driver``; these tests replace it with a
+``FakeDriver`` (scripted per-chunk levels, recorded calls) so no MLX model runs.
+"""
+
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 import breeze_tts_engine
+import fish_tts_engine
 from fish_tts_engine import (
     DEFAULT_MODEL,
     OUT_SAMPLE_RATE,
     FishTTS,
+    _Drama3Driver,
     _StreamResampler,
 )
 
+SPF = 2016                 # samples per frame: 7 frames = 0.32 s at 44.1 kHz
+FPC = 7                    # frames per 0.32 s chunk
+_TMP = Path(tempfile.mkdtemp(prefix="fish-tests-"))
+REF = _TMP / "ref.wav"
+REF.write_bytes(b"RIFF" + b"\0" * 100)
 
-class FakeModel:
-    """Mimics mlx-audio Drama 3: 44.1 kHz, streams GenerationResult-like chunks."""
+
+class FakeFrame:
+    def __init__(self, rms):
+        self.rms = rms
+
+
+class FakeDriver:
+    """Stands in for _Drama3Driver. A script is a list of per-chunk levels
+    (RMS; 7 frames each) or ``(rms, n_frames)`` runs; ``scripts`` is consumed
+    one entry per frames() call, and a call whose script ran out ended at EOS."""
 
     sample_rate = 44100
+    frame_rate = 44100 / SPF
 
-    def __init__(self, chunk_seconds=(0.2, 0.33, 0.33)):
-        self.calls: list[dict] = []
-        self.chunk_seconds = chunk_seconds
+    def __init__(self, scripts, signature=None, max_frames=1024):
+        self.scripts = scripts
+        self.signature = signature
+        self.max_frames = max_frames
+        self.calls: list[SimpleNamespace] = []   # one per frames() call
+        self.closed = 0
+        self.events: list[tuple] = []            # codec reset/snapshot/restore
+        self._snaps = 0
 
-    def generate(self, **kwargs):
-        self.calls.append(kwargs)
-        for sec in self.chunk_seconds:
-            n = int(sec * self.sample_rate)
-            t = np.arange(n) / self.sample_rate
-            yield SimpleNamespace(audio=(0.3 * np.sin(2 * np.pi * 220 * t)).astype(np.float32))
+    def frames(self, text, history, prefix=None):
+        self.calls.append(SimpleNamespace(
+            text=text, history=[len(t[1]) for t in history],
+            prefix_len=0 if not prefix else len(prefix),
+            prefix=list(prefix) if prefix else None,
+        ))
+        script = self.scripts.pop(0) if self.scripts else []
+        try:
+            for item in script:
+                rms, n = item if isinstance(item, tuple) else (item, FPC)
+                for _ in range(n):
+                    yield FakeFrame(rms)
+        finally:
+            self.closed += 1
+
+    def decode(self, frames):
+        rms = np.repeat([f.rms for f in frames], SPF)
+        t = np.arange(rms.size) / self.sample_rate
+        return (rms * np.sqrt(2) * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+
+    def turn(self, text, frames):
+        return (text, list(frames))
+
+    def codec_reset(self):
+        self.events.append(("reset",))
+
+    def codec_snapshot(self):
+        self._snaps += 1
+        snap = ("snap", self._snaps)
+        self.events.append(("snapshot", snap))
+        return snap
+
+    def codec_restore(self, snap, drop_overlap=False):
+        self.events.append(("restore", snap, drop_overlap))
+
+    def kinds(self):
+        return [e[0] for e in self.events]
 
 
-def _loaded(config=None, model=None):
-    tts = FishTTS(config or {"fish_warmup": False})
-    tts._model = model or FakeModel()
+def _loaded(config=None, driver=None, scripts=None):
+    """A FishTTS with a fake driver and a stand-in model (nothing loads)."""
+    cfg = {"fish_warmup": False, "fish_first_chunk_frames": FPC,
+           "fish_ref_audio": str(REF), "fish_ref_text": "x", **(config or {})}
+    tts = FishTTS(cfg)
+    tts._model = object()
+    tts._model_key = tts.model_name
+    shared = scripts if scripts is not None else []
+    tts.made = []
+
+    def make(model, signature):
+        drv = driver if driver is not None else FakeDriver(shared)
+        drv.signature = signature
+        tts.made.append(drv)
+        return drv
+
+    tts._make_driver = make
     return tts
+
+
+def _text_pieces(monkeypatch, pieces):
+    monkeypatch.setattr("fish_tts_engine.split_text",
+                        lambda t, clauses=False: list(pieces))
 
 
 # --- config ----------------------------------------------------------------
@@ -55,16 +132,20 @@ def test_defaults_favor_low_latency_and_breeze_reference():
     assert tts._model is None
 
 
-def test_apply_config_overrides_and_model_change_drops_loaded_model():
+def test_apply_config_overrides_and_model_change_marks_model_stale():
     tts = _loaded()
+    model = tts._model
     tts.apply_config({
         "fish_model": "Nav8ha/drama-3-mlx-mixed-3bit",
         "fish_temperature": 0.6, "fish_top_k": 20, "fish_top_p": 0.8,
         "fish_ref_audio": "/tmp/me.wav", "fish_ref_text": "hello",
         "fish_first_chunk_frames": 3, "fish_streaming_interval": 0.25,
     })
-    assert tts._model is None
+    # apply_config runs on an HTTP thread: it never touches the loaded model.
+    # The swap happens at the next request (see test_model_swap_...).
+    assert tts._model is model and tts._model_key != tts.model_name
     assert tts.model_name == "Nav8ha/drama-3-mlx-mixed-3bit"
+    assert tts._cfg.model_name == "Nav8ha/drama-3-mlx-mixed-3bit"
     assert (tts.temperature, tts.top_k, tts.top_p) == (0.6, 20, 0.8)
     assert (tts.ref_audio, tts.ref_text) == ("/tmp/me.wav", "hello")
     assert (tts.first_chunk_frames, tts.streaming_interval) == (3, 0.25)
@@ -78,7 +159,7 @@ def test_ref_audio_without_ref_text_raises():
 # --- generation kwargs -----------------------------------------------------
 
 def test_kwargs_clone_breeze_voice_and_never_pass_unsupported_args():
-    tts = _loaded()
+    tts = _loaded({"fish_first_chunk_frames": 4})
     kw = tts._generation_kwargs("[whispers] Hello there.", voice="nova")
     assert kw["text"] == "[whispers] Hello there."
     assert kw["ref_audio"] == tts.ref_audio and kw["ref_text"] == tts.ref_text
@@ -105,6 +186,7 @@ def test_empty_text_yields_nothing_without_loading(monkeypatch):
     def boom(*a, **k):
         raise AssertionError("model should not load for empty text")
     monkeypatch.setattr(FishTTS, "_ensure_model", boom)
+    monkeypatch.setattr(FishTTS, "_acquire_driver", boom)
     assert list(FishTTS({}).synthesize_stream("  **  ")) == []
 
 
@@ -134,18 +216,20 @@ def test_stream_resampler_passthrough_when_rates_match():
 
 
 def test_synthesize_stream_yields_24k_chunks():
-    tts = _loaded()
+    drv = FakeDriver([[(0.2, 19)]])           # 19 frames = 0.87 s
+    tts = _loaded(driver=drv)
     chunks = list(tts.synthesize_stream("Hello there.", voice="S0"))
     assert chunks and all(c.dtype == np.float32 and c.ndim == 1 for c in chunks)
     total = sum(c.size for c in chunks)
     expected = round(0.86 * OUT_SAMPLE_RATE)
     assert abs(total - expected) <= 0.02 * expected
-    assert "voice" not in tts._model.calls[0]
+    assert drv.calls[0].text == "Hello there."   # "voice" is never forwarded
 
 
 def test_synthesize_to_array_applies_speed():
-    normal = _loaded().synthesize_to_array("Hello there.")
-    fast = _loaded({"tts_speed": 1.5, "fish_warmup": False}).synthesize_to_array("Hello there.")
+    normal = _loaded(scripts=[[(0.2, 19)]]).synthesize_to_array("Hello there.")
+    fast = _loaded({"tts_speed": 1.5, "fish_warmup": False},
+                   scripts=[[(0.2, 19)]]).synthesize_to_array("Hello there.")
     assert fast.size < normal.size * 0.8
 
 
@@ -154,22 +238,46 @@ def test_synthesize_to_array_applies_speed():
 def test_missing_reference_clip_fails_clearly(tmp_path):
     tts = FishTTS({"fish_ref_audio": str(tmp_path / "nope.wav"),
                    "fish_ref_text": "x", "fish_warmup": False})
-    tts._model = FakeModel()
     with pytest.raises(RuntimeError, match="reference clip"):
         tts._check_reference()
 
 
-def test_warmup_runs_one_short_generation(monkeypatch, tmp_path):
-    ref = tmp_path / "ref.wav"
-    ref.write_bytes(b"RIFF" + b"\0" * 100)
-    fake = FakeModel()
-    monkeypatch.setattr("fish_tts_engine._load_model", lambda name: fake)
-    tts = FishTTS({"fish_ref_audio": str(ref), "fish_ref_text": "x"})
+def test_warmup_runs_one_short_generation(monkeypatch):
+    drv = FakeDriver([[(0.3, 7)], [(0.3, 7)]])
+    monkeypatch.setattr("fish_tts_engine._load_model", lambda name: object())
+
+    def make(self, model, sig):
+        drv.signature = sig
+        return drv
+
+    monkeypatch.setattr(FishTTS, "_make_driver", make)
+    tts = FishTTS({"fish_ref_audio": str(REF), "fish_ref_text": "x"})
     tts._ensure_model()
-    assert len(fake.calls) == 1
-    assert fake.calls[0]["ref_audio"] == str(ref)
+    assert [c.text for c in drv.calls] == [fish_tts_engine.WARMUP_TEXT]
     tts._ensure_model()  # idempotent
-    assert len(fake.calls) == 1
+    assert len(drv.calls) == 1
+
+
+def test_model_swap_releases_the_old_model_before_loading_the_new(monkeypatch):
+    seen = []
+
+    def load(name):
+        seen.append((name, tts._model, tts._driver))
+        return object()
+
+    monkeypatch.setattr("fish_tts_engine._load_model", load)
+    tts = _loaded(scripts=[[(0.3, 7)], [(0.3, 7)]])
+    old_model = tts._model
+    list(tts.synthesize_stream("Hello there."))
+    assert tts._driver is not None
+    tts.apply_config({"fish_model": "other/model", "fish_ref_audio": str(REF),
+                      "fish_ref_text": "x", "fish_warmup": False,
+                      "fish_first_chunk_frames": FPC})
+    assert tts._model is old_model            # apply_config leaves it alone
+    list(tts.synthesize_stream("Hello again."))
+    # While the new model loaded, the old model and its driver were gone.
+    assert seen == [("other/model", None, None)]
+    assert tts._model_key == "other/model"
 
 
 # --- paragraph breaks + silence watchdog (Drama 3 stalls on "\n\n") ----------
@@ -198,35 +306,6 @@ def test_kwargs_have_no_newlines():
     assert kw["text"] == "One. Two. Three"
 
 
-class ScriptedModel:
-    """Each generate() call plays a script of (segment_idx, rms) chunks of 0.32s.
-
-    ``scripts`` is consumed one per call, so tests can model a stall on the
-    first call and normal speech on the retry/continuation.
-    """
-
-    sample_rate = 44100
-
-    def __init__(self, scripts):
-        self.scripts = list(scripts)
-        self.calls: list[dict] = []
-        self.closed = 0
-
-    def generate(self, **kwargs):
-        self.calls.append(kwargs)
-        script = self.scripts.pop(0) if self.scripts else []
-        n = int(0.32 * self.sample_rate)
-        try:
-            for seg, amp in script:
-                t = np.arange(n) / self.sample_rate
-                yield SimpleNamespace(
-                    segment_idx=seg,
-                    audio=(amp * np.sin(2 * np.pi * 220 * t)).astype(np.float32),
-                )
-        finally:
-            self.closed += 1
-
-
 def _seconds(chunks):
     return sum(c.size for c in chunks) / OUT_SAMPLE_RATE
 
@@ -240,49 +319,45 @@ def _two_pieces():
 def test_watchdog_aborts_stalled_piece_and_continues_with_next(monkeypatch):
     first, second = _two_pieces()
     speech, quiet = 0.3, 0.0
-    stall = [(0, speech)] * 5 + [(0, quiet)] * 200          # speaks, then stalls
-    rest = [(0, speech)] * 4                                  # next piece, fresh call
-    model = ScriptedModel([stall, rest])
-    tts = _loaded(model=model)
-    pieces = (first.strip(), second.strip())
-    monkeypatch.setattr("fish_tts_engine.split_text",
-                        lambda t, clauses=False: [p for p in pieces if p in t] or [t])
+    stall = [speech] * 5 + [quiet] * 200                    # speaks, then stalls
+    rest = [speech] * 4                                      # next piece
+    drv = FakeDriver([stall, rest])
+    tts = _loaded(driver=drv)
+    _text_pieces(monkeypatch, (first.strip(), second.strip()))
     out = list(tts.synthesize_stream(first + second))
-    assert len(model.calls) == 2
-    assert model.calls[1]["text"] == second.strip()
+    assert len(drv.calls) == 2
+    assert drv.calls[1].text == second.strip()
     # 5 + 4 speech chunks (0.32s each) plus at most one capped pause.
     assert _seconds(out) < 9 * 0.32 + 0.8
-    assert model.closed == 2
+    assert drv.closed == 2
 
 
 def test_watchdog_retries_piece_that_never_spoke(monkeypatch):
-    dead = [(0, 0.0)] * 200
-    ok = [(0, 0.3)] * 3
-    model = ScriptedModel([dead, ok])
-    tts = _loaded(model=model)
-    monkeypatch.setattr("fish_tts_engine.split_text", lambda t, clauses=False: [t])
+    drv = FakeDriver([[0.0] * 200, [0.3] * 3])
+    tts = _loaded(driver=drv)
+    _text_pieces(monkeypatch, ["Hello there."])
     out = list(tts.synthesize_stream("Hello there."))
-    assert len(model.calls) == 2
-    assert model.calls[1]["text"] == "Hello there."
+    assert len(drv.calls) == 2
+    assert drv.calls[1].text == "Hello there."
     assert _seconds(out) > 0.8
 
 
 def test_watchdog_gives_up_after_one_retry(monkeypatch):
-    dead = [(0, 0.0)] * 200
-    model = ScriptedModel([dead, dead, dead])
-    tts = _loaded(model=model)
-    monkeypatch.setattr("fish_tts_engine.split_text", lambda t, clauses=False: [t])
+    dead = [0.0] * 200
+    drv = FakeDriver([dead, dead, dead])
+    tts = _loaded(driver=drv)
+    _text_pieces(monkeypatch, ["Hello there."])
     out = list(tts.synthesize_stream("Hello there."))
-    assert len(model.calls) == 2
+    assert len(drv.calls) == 2
     assert _seconds(out) < 0.1
 
 
-def test_natural_pauses_are_kept_but_capped():
-    script = [(0, 0.3)] * 3 + [(0, 0.0)] * 4 + [(0, 0.3)] * 3   # 1.28s pause
-    model = ScriptedModel([script])
-    tts = _loaded(model=model)
+def test_natural_pauses_are_kept_but_capped(monkeypatch):
+    drv = FakeDriver([[0.3] * 3 + [0.0] * 4 + [0.3] * 3])    # 1.28s pause
+    tts = _loaded(driver=drv)
+    _text_pieces(monkeypatch, ["Hi. There."])
     out = list(tts.synthesize_stream("Hi. There."))
-    assert len(model.calls) == 1
+    assert len(drv.calls) == 1
     total = _seconds(out)
     assert 6 * 0.32 + 0.4 < total < 6 * 0.32 + 0.8
 
@@ -334,18 +409,18 @@ def test_split_text_cue_joins_following_piece():
     ]
 
 
-def _paced(monkeypatch, pieces, script, config=None):
-    model = ScriptedModel([script])
-    tts = _loaded(config, model=model)
-    monkeypatch.setattr("fish_tts_engine.split_text",
-                        lambda t, clauses=False: list(pieces))
-    return tts, model
+def _paced(monkeypatch, pieces, scripts, config=None):
+    """One script per piece; the text is split into exactly ``pieces``."""
+    drv = FakeDriver(list(scripts))
+    tts = _loaded(config, driver=drv)
+    _text_pieces(monkeypatch, pieces)
+    return tts, drv
 
 
 def test_sentence_pause_inserted_between_pieces(monkeypatch):
     pieces = ("The first sentence is here.", "The second sentence follows.")
-    script = [(0, 0.3)] * 3 + [(1, 0.3)] * 3
-    tts, _ = _paced(monkeypatch, pieces, script,
+    scripts = [[0.3] * 3, [0.3] * 3]
+    tts, _ = _paced(monkeypatch, pieces, scripts,
                     {"fish_warmup": False, "fish_sentence_pause_seconds": 0.5})
     total = _seconds(tts.synthesize_stream(" ".join(pieces)))
     assert abs(total - (6 * 0.32 + 0.5)) < 0.03
@@ -354,8 +429,8 @@ def test_sentence_pause_inserted_between_pieces(monkeypatch):
 def test_clause_pause_after_comma_and_none_after_length_cut(monkeypatch):
     pieces = ("A clause that ends in a comma,", "a run that was cut for length",
               "and the end.")
-    script = [(0, 0.3)] * 2 + [(1, 0.3)] * 2 + [(2, 0.3)] * 2
-    tts, _ = _paced(monkeypatch, pieces, script,
+    scripts = [[0.3] * 2, [0.3] * 2, [0.3] * 2]
+    tts, _ = _paced(monkeypatch, pieces, scripts,
                     {"fish_warmup": False, "fish_clause_pause_seconds": 0.25})
     total = _seconds(tts.synthesize_stream(" ".join(pieces)))
     assert abs(total - (6 * 0.32 + 0.25)) < 0.03
@@ -365,8 +440,8 @@ def test_clause_pause_zero_splits_by_sentence_only(monkeypatch):
     seen = []
     monkeypatch.setattr("fish_tts_engine.split_text",
                         lambda t, clauses=False: seen.append(clauses) or [t])
-    tts = _loaded({"fish_warmup": False, "fish_clause_pause_seconds": 0})
-    tts._model = ScriptedModel([[(0, 0.3)]])
+    tts = _loaded({"fish_warmup": False, "fish_clause_pause_seconds": 0},
+                  scripts=[[0.3]])
     list(tts.synthesize_stream("One, two."))
     assert seen and not any(seen)
 
@@ -374,30 +449,16 @@ def test_clause_pause_zero_splits_by_sentence_only(monkeypatch):
 def test_quiet_fade_of_last_word_is_played(monkeypatch):
     # The final chunk is the last word fading out (RMS < SILENT_RMS). It used
     # to be held as "pause" and dropped, clipping the end of the reading.
-    script = [(0, 0.3)] * 3 + [(0, 0.008)]
-    tts, _ = _paced(monkeypatch, ("Want me to dig deeper?",), script)
+    script = [0.3] * 3 + [0.008]
+    tts, _ = _paced(monkeypatch, ("Want me to dig deeper?",), [script])
     total = _seconds(tts.synthesize_stream("Want me to dig deeper?"))
     assert abs(total - 4 * 0.32) < 0.03
 
 
-def test_splitter_installed_into_model_module(monkeypatch):
-    import sys
-    import types
-    mod = types.ModuleType("fake_drama3")
-    mod.split_text = lambda t: ["library"]
-    monkeypatch.setitem(sys.modules, "fake_drama3", mod)
-    monkeypatch.setattr("fish_tts_engine.DRAMA3_MODULE", "fake_drama3")
-    Model = type("Model", (ScriptedModel,), {"__module__": "fake_drama3"})
-    tts = _loaded(model=Model([[(0, 0.3)]]))
-    list(tts.synthesize_stream("First one here, then more words here."))
-    assert mod.split_text("A long enough clause, and another long clause.") == [
-        "A long enough clause,", "and another long clause."]
-
-
 def test_saved_wav_keeps_sentence_pause(monkeypatch):
     pieces = ("The first sentence is here.", "The second sentence follows.")
-    script = [(0, 0.3)] * 3 + [(1, 0.3)] * 3
-    tts, _ = _paced(monkeypatch, pieces, script,
+    scripts = [[0.3] * 3, [0.3] * 3]
+    tts, _ = _paced(monkeypatch, pieces, scripts,
                     {"fish_warmup": False, "fish_sentence_pause_seconds": 0.5})
     audio = tts.synthesize_to_array(" ".join(pieces))
     assert abs(audio.size / OUT_SAMPLE_RATE - (6 * 0.32 + 0.5)) < 0.03
@@ -413,3 +474,111 @@ def test_spelled_letters_end_sentence():
     assert split_text("John F. Kennedy spoke.", clauses=True) == ["John F. Kennedy spoke."]
     assert split_text("J. Smith arrived.", clauses=True) == ["J. Smith arrived."]
     assert split_text("Plan B. Then we left.", clauses=True) == ["Plan B. Then we left."]
+
+
+# --- driver seam: load guard and real-model equivalence ----------------------
+
+import os  # noqa: E402
+
+import mlx.core as mx  # noqa: E402
+
+
+class _StatefulModule:
+    """A codec module with streaming state (_buffer) like CausalConvNet."""
+
+    def __init__(self):
+        self._buffer = None
+        self.counter = 0
+
+    def reset_state(self):
+        self._buffer = None
+
+
+class GuardModel:
+    """The attribute surface _Drama3Driver reads, with no real weights."""
+
+    semantic_begin = 100
+    num_codebooks = 10
+    sample_rate = 44100
+
+    def __init__(self, rope=mx.float32, leaky=False):
+        self.module = _StatefulModule()
+        post = SimpleNamespace(freqs_cis=mx.zeros((4, 2), dtype=rope))
+
+        def step(indices):
+            if leaky:
+                self.module.counter += 1       # state outside STATE_ATTRS
+            self.module._buffer = indices
+            return mx.zeros((1, 1, 8))
+
+        self.codec = SimpleNamespace(
+            frame_length=2048,
+            quantizer=SimpleNamespace(post_module=post),
+            named_modules=lambda: [("m", self.module)],
+            reset_streaming_state=self.module.reset_state,
+            streaming_step=step,
+        )
+
+    def build_frames(self, references, history, target):
+        raise NotImplementedError
+
+    def _frames(self, frames, system_rows, voice, max_frames,
+                temperature, top_k, top_p):
+        raise NotImplementedError
+
+    def _voice(self, ref_audio, ref_text):
+        return SimpleNamespace(references=[])
+
+
+def _sig():
+    return fish_tts_engine._Signature("m", "/r.wav", "t", 1, 2, 0.7, 30, 0.7, 1024)
+
+
+def test_driver_guard_fails_loudly():
+    drv = _Drama3Driver(GuardModel(), _sig())          # the happy path builds
+    assert drv.frame_rate == pytest.approx(44100 / 2048)
+    pin = "dad2087f"
+
+    class NoFrames(GuardModel):
+        _frames = None                                    # an internal vanished
+
+    with pytest.raises(RuntimeError, match=pin):
+        _Drama3Driver(NoFrames(), _sig())
+
+    wrong = GuardModel()
+    wrong._frames = lambda frames, rows: None            # signature drifted
+    with pytest.raises(RuntimeError, match=pin):
+        _Drama3Driver(wrong, _sig())
+
+    with pytest.raises(RuntimeError, match=pin):          # RoPE table not float32
+        _Drama3Driver(GuardModel(rope=mx.float16), _sig())
+
+    with pytest.raises(RuntimeError, match=pin):          # streaming state elsewhere
+        _Drama3Driver(GuardModel(leaky=True), _sig())
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not os.environ.get("FISH_SLOW"), reason="real model: set FISH_SLOW=1")
+def test_driver_matches_generate_real_model():
+    import yaml
+    from tts_client import flatten_local_tts_config
+    cfg = flatten_local_tts_config(
+        yaml.safe_load(open(Path(__file__).resolve().parent.parent / "config.yaml"))["local"])
+    tts = FishTTS(cfg)
+    tts._ensure_model()
+    model, drv = tts._model, tts._acquire_driver()
+    text = "The market closed higher on Friday."
+    mx.random.seed(1234)
+    ref = np.concatenate([
+        np.asarray(r.audio, dtype=np.float32).reshape(-1)
+        for r in model.generate(
+            text=text, ref_audio=tts.ref_audio, ref_text=tts.ref_text,
+            temperature=tts.temperature, top_k=tts.top_k, top_p=tts.top_p,
+            stream=False)
+    ])
+    mx.random.seed(1234)
+    drv.codec_reset()
+    frames = list(drv.frames(text, []))
+    got = drv.decode(frames)
+    assert got.shape == ref.shape
+    assert np.max(np.abs(got - ref)) <= 1e-5

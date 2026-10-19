@@ -18,12 +18,14 @@ Weights: https://huggingface.co/mlx-community/fish-audio-drama-3-4bit
 
 from __future__ import annotations
 
+import gc
+import inspect
+import os
 import re
-import sys
 import threading
 import time
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, NamedTuple
 
 import numpy as np
 
@@ -37,6 +39,7 @@ DEFAULT_PLAY_PRIME_SECONDS = 0.5
 PLAY_MAX_WAIT_S = 1.5    # never hold Option+S longer than this once audio exists
 PLAY_MIN_REALTIME = 1.2  # start early only if generation is clearly ahead
 WARMUP_TEXT = "Okay."
+DEFAULT_MAX_FRAMES = 1024  # Drama 3's own cap on the frames of one piece
 # Silence watchdog. Drama 3 sometimes stops emitting EOS and samples silence
 # until its 1024-frame cap (~47s) — reliably after a blank line inside one of
 # its ~300-byte text pieces. Pauses are capped; a long stall abandons the piece.
@@ -65,9 +68,6 @@ _ABBREVIATION = re.compile(
 _SPELLED_LETTERS = re.compile(r"(?:^|\s)[A-Za-z] [A-Za-z]\.$")
 _SENTENCE_END = re.compile(r"[.!?;…。！？；][\"'”’)\]]*$")
 _CLAUSE_END = re.compile(r"[,:，：、][\"'”’)\]]*$")
-
-# Module whose ``split_text`` Drama 3's generate() calls (see _install_splitter).
-DRAMA3_MODULE = "mlx_audio.tts.models.fish_drama3.drama3"
 
 MLX_AUDIO_PIN = (
     "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio"
@@ -124,9 +124,9 @@ def _cut(text: str, marks: frozenset[str]) -> list[str]:
 def split_text(text: str, clauses: bool = False) -> list[str]:
     """The model's text pieces: one sentence each, or one clause with ``clauses``.
 
-    Installed as Drama 3's own chunker (see ``_install_splitter``), so
-    ``segment_idx`` indexes into this list. [cues] are never cut and, like
-    fragments under MIN_PIECE_CHARS, are carried into the following piece.
+    The engine feeds the model one piece at a time (see ``FishTTS._pieces``).
+    [cues] are never cut and, like fragments under MIN_PIECE_CHARS, are
+    carried into the following piece.
     Speaker-tagged text keeps the library's grouping.
     """
     from mlx_audio.tts.models.fish_drama3 import chunking as ck
@@ -184,6 +184,13 @@ def _load_model(name: str):
     return load_model(name)
 
 
+def _collect(frames, sink: list) -> Iterator:
+    """Pass frames through, recording each in ``sink`` (the piece's codes)."""
+    for frame in frames:
+        sink.append(frame)
+        yield frame
+
+
 class _StreamResampler:
     """Chunk-wise resampling with filter state carried across chunks (no seams)."""
 
@@ -207,6 +214,196 @@ class _StreamResampler:
         return self._stream.resample_chunk(np.zeros(0, dtype=np.float32), last=True)
 
 
+class _Signature(NamedTuple):
+    """Everything a driver (and a codec carry) is only valid for."""
+
+    model_name: str
+    ref_audio: str
+    ref_text: str
+    ref_mtime_ns: int   # a clip re-recorded in place changes the voice
+    ref_size: int
+    temperature: float
+    top_k: int
+    top_p: float
+    max_frames: int
+
+
+class _Cfg(NamedTuple):
+    """The signature's config half. Published in one assignment by
+    ``apply_config`` so a request never reads a torn ref_audio / ref_text."""
+
+    model_name: str
+    ref_audio: str
+    ref_text: str
+    temperature: float
+    top_k: int
+    top_p: float
+    max_frames: int
+
+
+class _Drama3Driver:
+    """The only code touching Drama 3 and codec internals (pinned mlx-audio).
+
+    One driver per ``_Signature``. ``frames`` yields one frame of codes per
+    decode step and simply ends when the model emits EOS (or at max_frames).
+    """
+
+    # Attributes the codec's ``reset_state`` methods clear: conv buffers
+    # (_buffer), transposed-conv overlap tails (_overlap), and the transformer
+    # KV caches with their position counter (_cache, _position).
+    STATE_ATTRS = ("_buffer", "_overlap", "_cache", "_position")
+
+    def __init__(self, model, signature: _Signature):
+        self._guard(model)
+        self._model = model
+        self.signature = signature
+        self.max_frames = signature.max_frames
+        self._codec = model.codec
+        self.sample_rate = int(model.sample_rate)
+        self.frame_rate = self.sample_rate / self._codec.frame_length
+        self._stateful = [
+            (mod, [a for a in self.STATE_ATTRS if hasattr(mod, a)])
+            for _, mod in self._codec.named_modules()
+            if hasattr(mod, "reset_state")
+        ]
+        self._check_state_drift()
+        self._voice = model._voice(signature.ref_audio, signature.ref_text)
+
+    # --- load guard ---------------------------------------------------------
+
+    @staticmethod
+    def _fail(msg: str):
+        raise RuntimeError(
+            f"Fish Drama 3 driver: {msg}. The mlx-audio internals this engine "
+            f"drives changed; reinstall the pinned build: pip install '{MLX_AUDIO_PIN}'"
+        )
+
+    @classmethod
+    def _guard(cls, model) -> None:
+        expected = {
+            "build_frames": ["references", "history", "target"],
+            "_frames": ["frames", "system_rows", "voice", "max_frames",
+                        "temperature", "top_k", "top_p"],
+            "_voice": ["ref_audio", "ref_text"],
+        }
+        for name, params in expected.items():
+            fn = getattr(model, name, None)
+            if not callable(fn):
+                cls._fail(f"model.{name} is missing")
+            got = list(inspect.signature(fn).parameters)
+            if got != params:
+                cls._fail(f"model.{name}{tuple(got)} no longer matches {tuple(params)}")
+        for attr in ("semantic_begin", "num_codebooks", "codec"):
+            if not hasattr(model, attr):
+                cls._fail(f"model.{attr} is missing")
+        codec = model.codec
+        for attr in ("streaming_step", "reset_streaming_state"):
+            if not callable(getattr(codec, attr, None)):
+                cls._fail(f"codec.{attr} is missing")
+        if not hasattr(codec, "frame_length"):
+            cls._fail("codec.frame_length is missing")
+        import mlx.core as mx
+        post = getattr(getattr(codec, "quantizer", None), "post_module", None)
+        dtype = getattr(getattr(post, "freqs_cis", None), "dtype", None)
+        if dtype != mx.float32:
+            cls._fail(f"codec.quantizer.post_module RoPE table is {dtype}, not float32")
+
+    def _check_state_drift(self) -> None:
+        """Decode two frames and make sure only STATE_ATTRS changed: a codec
+        that keeps streaming state anywhere else cannot be snapshotted."""
+        import mlx.core as mx
+
+        def view(mod):
+            items = dict(mod.items()) if hasattr(mod, "items") else {}
+            return {**mod.__dict__, **items}
+
+        before = [(mod, view(mod)) for mod, _ in self._stateful]
+        self._codec.reset_streaming_state()
+        zeros = mx.zeros((1, int(self._model.num_codebooks), 2), dtype=mx.int32)
+        mx.eval(self._codec.streaming_step(zeros))
+        for mod, old in before:
+            new = view(mod)
+            for key in set(old) | set(new):
+                if key in self.STATE_ATTRS:
+                    continue
+                a, b = old.get(key), new.get(key)
+                same = a is b or (isinstance(a, (int, float, str, bool, type(None)))
+                                  and a == b)
+                if not same:
+                    self._fail(f"codec module {type(mod).__name__} changed "
+                               f"{key!r} while decoding")
+        self._codec.reset_streaming_state()
+
+    # --- model --------------------------------------------------------------
+
+    def frames(self, text: str, history, prefix=None) -> Iterator:
+        """Frames of ``text`` after ``history`` (and an optional played prefix)."""
+        import mlx.core as mx
+        m = self._model
+        rows, system_rows = m.build_frames(self._voice.references, history, text)
+        if prefix:
+            codes = mx.stack(list(prefix), axis=1).astype(mx.int32)
+            extra = mx.concatenate([codes[:1] + m.semantic_begin, codes], axis=0).T
+            rows = mx.concatenate([rows, extra])
+        s = self.signature
+        yield from m._frames(rows, system_rows, self._voice, self.max_frames,
+                             s.temperature, s.top_k, s.top_p)
+
+    def turn(self, text: str, frames) -> tuple:
+        import mlx.core as mx
+        return (text, mx.stack(list(frames), axis=1))
+
+    # --- codec --------------------------------------------------------------
+
+    def decode(self, frames) -> np.ndarray:
+        import mlx.core as mx
+        audio = self._codec.streaming_step(mx.stack(list(frames), axis=1)[None])[0, 0]
+        return np.asarray(audio, dtype=np.float32).reshape(-1)
+
+    def codec_reset(self) -> None:
+        self._codec.reset_streaming_state()
+
+    def codec_snapshot(self):
+        """Streaming state as (module, {attr: value}). The codec step functions
+        reassign these attributes and never mutate them in place, so holding
+        the references is a complete, copy-free snapshot."""
+        return [(mod, {a: getattr(mod, a) for a in attrs})
+                for mod, attrs in self._stateful]
+
+    def codec_restore(self, snap, drop_overlap: bool = False) -> None:
+        """Back to ``snap``. ``drop_overlap`` clears the transposed-conv overlap
+        tails: when audio decoded after the snapshot was already played, the
+        tail is in it and must not be added a second time."""
+        for mod, state in snap:
+            for attr, value in state.items():
+                if drop_overlap and attr == "_overlap":
+                    value = None
+                setattr(mod, attr, value)
+
+
+class _Chunker:
+    """Cuts a piece's frames into chunks as the library did: the first chunk
+    of a request is ``first`` frames, every later one ``interval``, and the
+    remainder of a piece is its last chunk."""
+
+    def __init__(self, first: int, interval: int):
+        self.first = first
+        self.interval = interval
+        self.started = False
+
+    def cut(self, frames) -> Iterator[list]:
+        pend: list = []
+        for frame in frames:
+            pend.append(frame)
+            if len(pend) >= (self.interval if self.started else self.first):
+                self.started = True
+                yield pend
+                pend = []
+        if pend:
+            self.started = True
+            yield pend
+
+
 class FishTTS:
     """On-device Fish Audio Drama 3 (MLX 4-bit by default)."""
 
@@ -214,16 +411,17 @@ class FishTTS:
 
     def __init__(self, config: dict):
         self._model = None
-        self._warmed = False
+        self._model_key = None     # model name _model was loaded for
+        self._driver = None
         self.model_name = None
         self.apply_config(config)
 
     def apply_config(self, config: dict):
-        new_model = config.get("fish_model", DEFAULT_MODEL)
-        if new_model != self.model_name:
-            self.model_name = new_model
-            self._model = None
-            self._warmed = False
+        """Plain attribute writes only: this runs on an HTTP thread while a
+        stream may be running on the inference thread. The driver, codec and
+        model are only touched at the start of a request (``_acquire_driver``).
+        """
+        self.model_name = config.get("fish_model", DEFAULT_MODEL)
         user_ref = config.get("fish_ref_audio") or None
         user_text = config.get("fish_ref_text") or None
         if bool(user_ref) != bool(user_text):
@@ -231,10 +429,7 @@ class FishTTS:
                 "fish.ref_audio and fish.ref_text must be set together "
                 "(Drama 3 needs the exact transcript of the clip)"
             )
-        new_ref = user_ref or str(BREEZE_LOCK_PATH)
-        if new_ref != getattr(self, "ref_audio", None):
-            self._warmed = False
-        self.ref_audio = new_ref
+        self.ref_audio = user_ref or str(BREEZE_LOCK_PATH)
         self.ref_text = user_text or BREEZE_LOCK_TEXT
         self.speaker = config.get("tts_speaker") or (
             Path(self.ref_audio).stem if user_ref else "breeze-lock"
@@ -258,45 +453,81 @@ class FishTTS:
         )
         self.speed = config.get("tts_speed", 1.0)
         self.seek_seconds = config.get("tts_seek_seconds", 15)
+        # LAST: one assignment publishes the whole signature half at once.
+        self._cfg = _Cfg(
+            self.model_name, self.ref_audio, self.ref_text, self.temperature,
+            self.top_k, self.top_p, self.max_tokens or DEFAULT_MAX_FRAMES,
+        )
 
     # --- model ---------------------------------------------------------------
 
     def _split(self, text: str) -> list[str]:
         return split_text(text, clauses=self.clause_pause > 0)
 
-    def _install_splitter(self) -> None:
-        """Make Drama 3 chunk text with ``_split`` (one sentence/clause per piece).
-
-        ``generate`` calls its module's ``split_text``; generation is
-        single-threaded (the voice API's TTS inference thread).
-        """
-        if type(self._model).__module__ != DRAMA3_MODULE:
-            return  # test doubles / other models chunk on their own
-        sys.modules[DRAMA3_MODULE].split_text = self._split
-
-    def _check_reference(self) -> None:
-        if not Path(self.ref_audio).is_file():
+    def _check_reference(self, cfg: _Cfg | None = None) -> None:
+        ref = (cfg or self._cfg).ref_audio
+        if not Path(ref).is_file():
             raise RuntimeError(
-                f"Fish reference clip not found: {self.ref_audio}. Run Breeze "
+                f"Fish reference clip not found: {ref}. Run Breeze "
                 "once to build breeze_lock.wav, or set fish.ref_audio + fish.ref_text."
             )
 
-    def _ensure_model(self):
-        if self._model is None:
-            print(f"Loading TTS model: {self.model_name}...", flush=True)
-            t0 = time.monotonic()
-            self._model = _load_model(self.model_name)
-            print(f"TTS model loaded ({time.monotonic() - t0:.1f}s)", flush=True)
-        if self.warmup and not self._warmed:
-            self._check_reference()
-            # Encodes the reference and caches the system-prompt prefix, so
-            # the first real request is not the slow one.
-            t0 = time.monotonic()
-            kwargs = self._generation_kwargs(WARMUP_TEXT)
-            for _ in self._model.generate(**kwargs):
+    def _load_for(self, cfg: _Cfg) -> None:
+        """Load (or swap) the model on the inference thread. The old model is
+        released first so two ~26 GB models are never resident together."""
+        if self._model is not None and self._model_key == cfg.model_name:
+            return
+        if self._model is not None:
+            self._driver = None
+            self._model = None
+            self._model_key = None
+            gc.collect()
+            try:
+                import mlx.core as mx
+                mx.clear_cache()
+            except ImportError:
                 pass
-            self._warmed = True
-            print(f"[fish] warm-up done ({time.monotonic() - t0:.1f}s)", flush=True)
+        print(f"Loading TTS model: {cfg.model_name}...", flush=True)
+        t0 = time.monotonic()
+        self._model = _load_model(cfg.model_name)
+        self._model_key = cfg.model_name
+        print(f"TTS model loaded ({time.monotonic() - t0:.1f}s)", flush=True)
+
+    def _signature(self, cfg: _Cfg) -> _Signature:
+        st = os.stat(cfg.ref_audio)
+        return _Signature(
+            cfg.model_name, cfg.ref_audio, cfg.ref_text, st.st_mtime_ns, st.st_size,
+            cfg.temperature, cfg.top_k, cfg.top_p, cfg.max_frames,
+        )
+
+    def _make_driver(self, model, signature: _Signature):
+        return _Drama3Driver(model, signature)
+
+    def _acquire_driver(self):
+        """The driver for the current config, built (and warmed) if needed.
+        Inference thread only."""
+        cfg = self._cfg           # one read: never a torn config
+        self._load_for(cfg)
+        self._check_reference(cfg)
+        sig = self._signature(cfg)
+        if self._driver is None or self._driver.signature != sig:
+            self._driver = self._make_driver(self._model, sig)
+            self._warm(self._driver)
+        return self._driver
+
+    def _warm(self, drv) -> None:
+        """Encode the reference and cache the system-prompt prefix."""
+        if not self.warmup:
+            return
+        t0 = time.monotonic()
+        for _ in drv.frames(WARMUP_TEXT, []):
+            pass
+        print(f"[fish] warm-up done ({time.monotonic() - t0:.1f}s)", flush=True)
+
+    def _ensure_model(self):
+        self._load_for(self._cfg)
+        if self.warmup:
+            self._acquire_driver()
 
     def _generation_kwargs(self, text: str, voice: str | None = None,
                            streaming_interval: float | None = None) -> dict | None:
@@ -340,77 +571,94 @@ class FishTTS:
         """
         if not _fish_text(_prepare_for_speech(text)):
             return
-        self._ensure_model()
-        self._check_reference()
         kwargs = self._generation_kwargs(
             text, voice=voice, streaming_interval=streaming_interval,
         )
         if kwargs is None:
             return
-        self._install_splitter()
-        in_rate = int(getattr(self._model, "sample_rate", 44100))
+        drv = self._acquire_driver()
+        in_rate = drv.sample_rate
         rs = _StreamResampler(in_rate, OUT_SAMPLE_RATE)
+        interval = max(1, round(kwargs["streaming_interval"] * drv.frame_rate))
+        first_frames = kwargs["first_chunk_frames"] or interval
+        pieces = self._split(kwargs["text"])
         print(f"[fish] generate chars={len(kwargs['text'])} "
               f"interval={kwargs['streaming_interval']}", flush=True)
         t_start = time.monotonic()
         n = 0
         audio_s = 0.0
-        text_left = kwargs["text"]
+        start = 0
         retried_piece = None
-        while text_left:
-            kwargs["text"] = text_left
-            pieces = self._split(text_left)
-            gen = self._model.generate(**kwargs)
+        while start < len(pieces):
+            # Each (re)start is a cold run, as the library's generate() was.
+            drv.codec_reset()
+            chunker = _Chunker(first_frames, interval)
+            pinned = latest = None
             held: list[np.ndarray] = []
             held_s = 0.0
             spoke: set[int] = set()
             stalled = None
-            cur_seg = None
-            try:
-                for result in gen:
-                    raw = np.asarray(result.audio, dtype=np.float32).reshape(-1)
-                    if raw.size == 0:
-                        continue
-                    seg = int(getattr(result, "segment_idx", 0) or 0)
-                    parts: list[np.ndarray] = []
-                    if cur_seg is not None and seg != cur_seg:
-                        # Piece boundary: its quiet tail, then the set pause.
-                        if held:
-                            parts.append(np.concatenate(held)[: int(PAUSE_CAP_S * in_rate)])
-                            held, held_s = [], 0.0
-                        prev = pieces[cur_seg] if cur_seg < len(pieces) else ""
-                        gap = _piece_pause(prev, self.sentence_pause, self.clause_pause)
-                        if gap > 0:
-                            parts.append(np.zeros(int(gap * in_rate), dtype=np.float32))
-                    cur_seg = seg
-                    if float(np.sqrt(np.mean(np.square(raw)))) < SILENT_RMS:
-                        held.append(raw)
-                        held_s += raw.size / in_rate
-                        if held_s >= SILENCE_ABORT_S:
-                            stalled = seg
-                            break
+            cur = None
+            for idx in range(start, len(pieces)):
+                piece = pieces[idx]
+                history = [t for t in (pinned, latest) if t is not None]
+                gen = drv.frames(piece, history)
+                codes: list = []
+                try:
+                    for chunk in chunker.cut(_collect(gen, codes)):
+                        raw = drv.decode(chunk)
+                        if raw.size == 0:
+                            continue
+                        parts: list[np.ndarray] = []
+                        if cur is not None and idx != cur:
+                            # Piece boundary: its quiet tail, then the set pause.
+                            if held:
+                                parts.append(np.concatenate(held)[: int(PAUSE_CAP_S * in_rate)])
+                                held, held_s = [], 0.0
+                            gap = _piece_pause(pieces[cur], self.sentence_pause,
+                                               self.clause_pause)
+                            if gap > 0:
+                                parts.append(np.zeros(int(gap * in_rate), dtype=np.float32))
+                        cur = idx
+                        if float(np.sqrt(np.mean(np.square(raw)))) < SILENT_RMS:
+                            held.append(raw)
+                            held_s += raw.size / in_rate
+                            if held_s >= SILENCE_ABORT_S:
+                                stalled = idx
+                                break
+                        else:
+                            if held:
+                                parts.append(np.concatenate(held)[: int(PAUSE_CAP_S * in_rate)])
+                                held, held_s = [], 0.0
+                            parts.append(raw)
+                            spoke.add(idx)
+                        if not parts:
+                            continue
+                        out = rs.process(np.concatenate(parts))
+                        if out.size == 0:
+                            continue
+                        n += 1
+                        now = time.monotonic()
+                        audio_s += out.size / OUT_SAMPLE_RATE
+                        if n == 1:
+                            print(f"[fish] first audio {now - t_start:.2f}s", flush=True)
+                        elif n % 10 == 0:
+                            print(f"[fish] chunk#{n} audio={audio_s:.1f}s "
+                                  f"rtf={audio_s / max(now - t_start, 1e-6):.2f}x",
+                                  flush=True)
+                        yield out
                     else:
-                        if held:
-                            parts.append(np.concatenate(held)[: int(PAUSE_CAP_S * in_rate)])
-                            held, held_s = [], 0.0
-                        parts.append(raw)
-                        spoke.add(seg)
-                    if not parts:
-                        continue
-                    out = rs.process(np.concatenate(parts))
-                    if out.size == 0:
-                        continue
-                    n += 1
-                    now = time.monotonic()
-                    audio_s += out.size / OUT_SAMPLE_RATE
-                    if n == 1:
-                        print(f"[fish] first audio {now - t_start:.2f}s", flush=True)
-                    elif n % 10 == 0:
-                        print(f"[fish] chunk#{n} audio={audio_s:.1f}s "
-                              f"rtf={audio_s / max(now - t_start, 1e-6):.2f}x", flush=True)
-                    yield out
-            finally:
-                gen.close()
+                        # Ran out on its own (EOS): the piece is history.
+                        if codes:
+                            turn = drv.turn(piece, codes)
+                            if pinned is None:
+                                pinned = turn
+                            else:
+                                latest = turn
+                finally:
+                    gen.close()
+                if stalled is not None:
+                    break
             if stalled is None:
                 if held and spoke:
                     out = rs.process(np.concatenate(held)[: int(PAUSE_CAP_S * in_rate)])
@@ -418,14 +666,14 @@ class FishTTS:
                     if out.size:
                         yield out
                 break
-            piece = pieces[stalled] if stalled < len(pieces) else ""
+            piece = pieces[stalled]
             if stalled not in spoke and piece != retried_piece:
                 retried_piece = piece
-                text_left = " ".join(pieces[stalled:])
+                start = stalled
                 print(f"[fish] stall before speech in piece {stalled}; retrying",
                       flush=True)
             else:
-                text_left = " ".join(pieces[stalled + 1:])
+                start = stalled + 1
                 print(f"[fish] stall in piece {stalled} after {SILENCE_ABORT_S}s "
                       f"silence; skipping to next piece", flush=True)
         tail = rs.flush()
