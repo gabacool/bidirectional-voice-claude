@@ -120,6 +120,10 @@ local:
     # stalled on this piece. (Old behaviour: silence_rms 0.01.)
     silence_rms: 0.001
     stall_seconds: 3.0
+    # Re-generations per stalled piece: resume from where the model stopped
+    # (twice), then repeat the piece once (repeats words), then skip it with
+    # an ERROR in the log. 0 = skip at the first stall (old behaviour).
+    stall_attempts: 3
     # Each request would start the codec cold (first ~0.5 s of speech +5 dB
     # louder: chat sends one request per sentence group, so the volume pumps).
     # true = carry the codec state across requests. false = old cold start.

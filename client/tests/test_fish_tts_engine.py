@@ -60,6 +60,7 @@ class FakeDriver:
             prefix_len=0 if not prefix else len(prefix),
             prefix=list(prefix) if prefix else None,
         ))
+        self.events.append(("frames", text, 0 if not prefix else len(prefix)))
         script = self.scripts.pop(0) if self.scripts else []
         try:
             for item in script:
@@ -94,6 +95,19 @@ class FakeDriver:
 
     def kinds(self):
         return [e[0] for e in self.events]
+
+    def snap_before_call(self, k):
+        """The last codec snapshot taken before the k-th frames() call: the
+        state a piece that just ended at EOS left behind."""
+        seen, last = -1, None
+        for e in self.events:
+            if e[0] == "frames":
+                seen += 1
+                if seen == k:
+                    return last
+            elif e[0] == "snapshot":
+                last = e[1]
+        raise AssertionError(f"fewer than {k + 1} frames() calls")
 
 
 def _loaded(config=None, driver=None, scripts=None):
@@ -340,7 +354,7 @@ def test_watchdog_aborts_stalled_piece_and_continues_with_next(monkeypatch):
     stall = [speech] * 5 + [quiet] * 200                    # speaks, then stalls
     rest = [speech] * 4                                      # next piece
     drv = FakeDriver([stall, rest])
-    tts = _loaded(driver=drv)
+    tts = _loaded({"fish_stall_attempts": 0}, driver=drv)    # skip, as before the ladder
     _text_pieces(monkeypatch, (first.strip(), second.strip()))
     out = list(tts.synthesize_stream(first + second))
     assert len(drv.calls) == 2
@@ -363,7 +377,7 @@ def test_watchdog_retries_piece_that_never_spoke(monkeypatch):
 def test_watchdog_gives_up_after_one_retry(monkeypatch):
     dead = [0.0] * 200
     drv = FakeDriver([dead, dead, dead])
-    tts = _loaded(driver=drv)
+    tts = _loaded({"fish_stall_attempts": 1}, driver=drv)
     _text_pieces(monkeypatch, ["Hello there."])
     out = list(tts.synthesize_stream("Hello there."))
     assert len(drv.calls) == 2
@@ -403,21 +417,24 @@ def test_quiet_speech_never_counts_as_stall(monkeypatch, capsys):
 
 def test_true_silence_still_stalls(monkeypatch, capsys):
     # The new threshold must not be so low that real silence goes unseen.
-    tts, drv = _paced(monkeypatch, ["Hello there."], [[0.3] * 3 + [0.0] * 20])
+    tts, drv = _paced(monkeypatch, ["Hello there."], [[0.3] * 3 + [0.0] * 20, [0.3] * 2])
     out = list(tts.synthesize_stream("Hello there."))
     log = capsys.readouterr().out
-    assert "ERROR giving up on piece 0/1" in log and "stalls=1" in log
-    assert _seconds(out) < 3 * 0.32 + 0.1       # the held silence is not played
+    assert "stall in piece 0/1 after 3s silence" in log and "stalls=1" in log
+    assert len(drv.calls) == 2                       # and it was recovered
+    # 3 voiced + the held silence capped at 0.6 s + 2 resumed chunks.
+    assert abs(_seconds(out) - (5 * 0.32 + 0.6)) < 0.05
 
 
 def test_stall_log_includes_piece_text(monkeypatch, capsys):
-    tts, _ = _paced(monkeypatch, ["C R W V at 61.39, down 11.9 percent,"],
-                    [[0.3] * 3 + [0.0] * 20])
+    text = "C R W V at 61.39, down 11.9 percent,"
+    tts, _ = _paced(monkeypatch, [text], [[0.3] * 3 + [0.0] * 20, [0.3] * 2],
+                    {"fish_stall_attempts": 3})
     list(tts.synthesize_stream("x"))
-    stall = [ln for ln in capsys.readouterr().out.splitlines() if "giving up" in ln]
+    stall = [ln for ln in capsys.readouterr().out.splitlines() if "stall in piece" in ln]
     assert len(stall) == 1
     assert "text='C R W V at 61.39, down 11.9 percent,'" in stall[0]
-    assert "piece 0/1" in stall[0]
+    assert "piece 0/1" in stall[0] and "resume 1/3" in stall[0]
 
 
 def test_new_config_keys_flatten():
@@ -445,8 +462,7 @@ def test_runaway_babble_is_cut_once_without_resume(monkeypatch, capsys):
     assert "budget 183" in log and "text='This second piece babbles on.'" in log
     assert [c.text for c in drv.calls] == list(pieces)    # no resume, no retry
     # The codec went back to the state after the last piece that ended at EOS.
-    snaps = [e[1] for e in drv.events if e[0] == "snapshot"]
-    assert ("restore", snaps[0], False) in drv.events
+    assert ("restore", drv.snap_before_call(1), False) in drv.events
     # A runaway never enters history: piece 2 sees only piece 0.
     assert drv.calls[2].history == [21]
     assert "runaway=1" in log and "stalls=0" in log
@@ -496,17 +512,20 @@ def test_aborted_request_does_not_poison_carry(monkeypatch):
     tts = _loaded(driver=drv)
     _text_pieces(monkeypatch, pieces)
     gen = tts.synthesize_stream("a")
-    for _ in range(5):
+    while len(drv.calls) < 2:
+        next(gen)                # until piece 1 starts: piece 0 ended at EOS
+    carry = tts._carry
+    assert carry == (drv.signature, drv.snap_before_call(1))
+    n_snaps = drv.kinds().count("snapshot")
+    for _ in range(3):
         next(gen)
-    assert drv.yielded > 21      # well into piece 1, which has not ended
+    assert drv.kinds().count("snapshot") > n_snaps     # mid-piece voiced snapshots exist
     gen.close()                  # client disconnect / Stop mid-piece
-    eos_snaps = _snapshots(drv)
-    assert len(eos_snaps) == 1   # only piece 0 ended at EOS
-    assert tts._carry == (drv.signature, eos_snaps[0])
+    assert tts._carry is carry   # ...but none of them reached the carry
     n = len(drv.events)
     drv.scripts[:] = [[0.3] * 3]
     list(tts.synthesize_stream("b"))
-    assert drv.events[n] == ("restore", eos_snaps[0], False)
+    assert drv.events[n] == ("restore", carry[1], False)
 
 
 def _warm_tts(monkeypatch, config=None, pieces=("Only piece here.",), pool=12):
@@ -607,6 +626,121 @@ def test_carry_config_key_flattens():
     assert flat["fish_carry_codec_state"] is False
     assert FishTTS(flat).carry_codec_state is False
     assert FishTTS({}).carry_codec_state is True
+
+
+# --- the stall recovery ladder --------------------------------------------------
+
+P_A = "Alpha piece comes first today."
+P_B = "Bravo piece stalls after speech."
+P_C = "Charlie piece follows after that."
+STALL = [0.3] * 3 + [0.0] * 12        # 21 voiced frames, then 10+ silent chunks
+
+
+def _restores(drv, drop_overlap):
+    return [(i, e) for i, e in enumerate(drv.events)
+            if e[0] == "restore" and e[2] is drop_overlap]
+
+
+def _last_snapshot_before(drv, index):
+    return [e[1] for e in drv.events[:index] if e[0] == "snapshot"][-1]
+
+
+def test_stall_after_speech_resumes_in_place(monkeypatch):
+    scripts = [[0.3] * 3, STALL, [0.3] * 2, [0.3] * 3]
+    tts, drv = _paced(monkeypatch, [P_A, P_B, P_C], scripts)
+    out = list(tts.synthesize_stream("x"))
+    # Same text, same history, and the prefix is the voiced frames only: the
+    # 70 trailing silent frames of the stalled attempt are not in it.
+    assert [(c.text, c.history, c.prefix_len) for c in drv.calls] == [
+        (P_A, [], 0), (P_B, [21], 0), (P_B, [21], 21), (P_C, [21, 35], 0)]
+    # The codec went back to the state after the last voiced chunk, with the
+    # overlap tail dropped (the held silence played already contains it).
+    (i, restore), = _restores(drv, True)
+    assert restore[1] == _last_snapshot_before(drv, i)
+    # Audio: A, pause, B's speech, the held silence (<= 0.6 s), the resumed
+    # words, pause, C. Nothing repeated.
+    expected = 3 * 0.32 + 0.5 + 3 * 0.32 + 0.6 + 2 * 0.32 + 0.5 + 3 * 0.32
+    assert abs(_seconds(out) - expected) < 0.06
+
+
+def test_resumed_turn_is_prefix_plus_resumed_frames(monkeypatch):
+    # What the next piece is conditioned on is the whole piece as played:
+    # the 21 prefix frames plus the 14 resumed ones, not just the resumed 14.
+    scripts = [STALL, [0.3] * 2, [0.3] * 3]
+    tts, drv = _paced(monkeypatch, [P_B, P_C], scripts)
+    list(tts.synthesize_stream("x"))
+    resume, nxt = drv.calls[1], drv.calls[2]
+    assert nxt.text == P_C
+    assert nxt.history[-1] == resume.prefix_len + 14 == 35
+
+
+def test_recovery_ladder_matches_state_table(monkeypatch, capsys):
+    scripts = [STALL, [0.0] * 12, [0.0] * 12, [0.3] * 2 + [0.0] * 12, [0.3] * 3]
+    tts, drv = _paced(monkeypatch, [P_B], scripts)
+    out = list(tts.synthesize_stream("x"))
+    log = capsys.readouterr().out
+    # initial -> resume -> resume -> full retry -> skip: 1 + stall_attempts.
+    assert [c.prefix_len for c in drv.calls] == [0, 21, 21, 0]
+    assert drv.calls[3].prefix is None
+    assert len(drv.calls) == 1 + tts.stall_attempts
+    assert "resume 1/3" in log and "resume 2/3" in log
+    assert f"WARNING piece 0/1 resumes failed; repeating from start 3/3 text={P_B!r}" in log
+    assert f"ERROR giving up on piece 0/1 after 3 attempts; skipping text={P_B!r}" in log
+    assert "stalls=4 resumed=2 retried=1 skipped=1" in log
+    assert len(_restores(drv, True)) == 4        # R2, R2, R3 and the final skip
+    assert _seconds(out) < 9      # the stalled silence itself is never played
+
+
+def test_recovery_ladder_for_a_piece_that_never_speaks(monkeypatch, capsys):
+    tts, drv = _paced(monkeypatch, [P_B], [[0.0] * 12] * 5)
+    out = list(tts.synthesize_stream("x"))
+    log = capsys.readouterr().out
+    assert len(drv.calls) == 4 and all(c.prefix is None for c in drv.calls)
+    assert [ln.split(" text=")[0] for ln in log.splitlines() if "retry" in ln] == [
+        f"[fish] stall before speech in piece 0/1; retry {k}/3" for k in (1, 2, 3)]
+    assert f"ERROR giving up on piece 0/1 after 3 attempts; skipping text={P_B!r}" in log
+    assert "retried=3 skipped=1" in log
+    assert not _restores(drv, True)              # nothing was played: no overlap to drop
+    assert _seconds(out) < 0.1
+
+
+def test_stall_attempts_zero_skips_like_today(monkeypatch, capsys):
+    tts, drv = _paced(monkeypatch, [P_A, P_B, P_C], [[0.3] * 3, STALL, [0.3] * 3],
+                      {"fish_stall_attempts": 0})
+    list(tts.synthesize_stream("x"))
+    log = capsys.readouterr().out
+    assert [c.text for c in drv.calls] == [P_A, P_B, P_C]     # no extra frames() call
+    assert drv.calls[2].history == [21]            # the skipped piece is not history
+    assert drv.kinds().count("reset") == 1         # only the request start: warm codec kept
+    (i, restore), = _restores(drv, True)
+    assert restore[1] == _last_snapshot_before(drv, i)
+    assert f"ERROR giving up on piece 1/3 after 0 attempts; skipping text={P_B!r}" in log
+
+
+def test_engine_feeds_its_own_pieces_in_order(capsys):
+    text = ("First sentence is right here. Second sentence follows it. "
+            "Third sentence ends here too. Fourth one closes the text.")
+    pieces = fish_tts_engine.split_text(text, clauses=True)
+    assert len(pieces) == 4
+    drv = FakeDriver([[0.3] * 3 for _ in pieces])
+    list(_loaded(driver=drv).synthesize_stream(text))
+    assert [c.text for c in drv.calls] == pieces
+    assert [c.history for c in drv.calls] == [[], [21], [21, 21], [21, 21]]
+    # A skipped piece (even one that produced codes) is never pinned or latest.
+    scripts = [[0.3] * 3, STALL, [0.3] * 3, [0.3] * 3]
+    drv = FakeDriver(scripts)
+    list(_loaded({"fish_stall_attempts": 0}, driver=drv).synthesize_stream(text))
+    assert [c.text for c in drv.calls] == pieces
+    assert [c.history for c in drv.calls] == [[], [21], [21], [21, 21]]
+
+
+def test_stall_attempts_config_key_flattens():
+    from tts_client import flatten_local_tts_config
+    flat = flatten_local_tts_config(
+        {"tts_engine": "fish", "fish": {"stall_attempts": 0}})
+    assert flat["fish_stall_attempts"] == 0
+    assert FishTTS(flat).stall_attempts == 0
+    assert FishTTS({}).stall_attempts == 3
 
 
 # --- pieces, pauses, and the last word -------------------------------------

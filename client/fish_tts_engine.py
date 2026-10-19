@@ -50,6 +50,7 @@ DEFAULT_MAX_FRAMES = 1024  # Drama 3's own cap on the frames of one piece
 # "October sixteenth.") sits at 0.003-0.01 — so the line is 0.001, not 0.01.
 DEFAULT_SILENCE_RMS = 0.001  # per streamed chunk (~0.32s); below it = silent
 DEFAULT_STALL_S = 3.0        # continuous silence that counts as a stall
+DEFAULT_STALL_ATTEMPTS = 3   # re-generations per stalled piece before skipping it
 PAUSE_CAP_S = 0.6            # longest pause we ever play
 # A piece's voiced frames are bounded by its text; babble at 0.001-0.01 RMS is
 # "voiced" now, so this is what stops a runaway (593 real pieces: 1/593 over).
@@ -426,6 +427,7 @@ class _Params(NamedTuple):
     interval: int
     silence_rms: float
     stall_seconds: float
+    stall_attempts: int
     sentence_pause: float
     clause_pause: float
 
@@ -488,6 +490,8 @@ class FishTTS:
         self.carry_codec_state = bool(config.get("fish_carry_codec_state", True))
         self.silence_rms = float(config.get("fish_silence_rms", DEFAULT_SILENCE_RMS))
         self.stall_seconds = float(config.get("fish_stall_seconds", DEFAULT_STALL_S))
+        self.stall_attempts = max(0, int(config.get("fish_stall_attempts",
+                                                    DEFAULT_STALL_ATTEMPTS)))
         self.speed = config.get("tts_speed", 1.0)
         self.seek_seconds = config.get("tts_seek_seconds", 15)
         # LAST: one assignment publishes the whole signature half at once.
@@ -589,6 +593,7 @@ class FishTTS:
             interval=interval,
             silence_rms=self.silence_rms,
             stall_seconds=self.stall_seconds,
+            stall_attempts=self.stall_attempts,
             sentence_pause=self.sentence_pause,
             clause_pause=self.clause_pause,
         )
@@ -630,8 +635,9 @@ class FishTTS:
         the configured pause appended.
         Silence watchdog: a chunk is silent below ``silence_rms``; silent
         chunks are held back and capped at PAUSE_CAP_S when speech resumes,
-        and ``stall_seconds`` of them in a row is a stall. A piece that
-        stalls before saying anything is retried once, otherwise skipped.
+        and ``stall_seconds`` of them in a row is a stall, recovered in place
+        (resume where the model stopped, see ``_run_pieces``) up to
+        ``stall_attempts`` times before the piece is skipped.
         A piece whose voiced frames outgrow its text is a runaway and is cut.
         Quiet audio held at the very end is the last word's fade-out and is
         played, not dropped.
@@ -700,12 +706,22 @@ class FishTTS:
         """The piece loop: yields mono float32 audio at the model's rate.
 
         The codec starts from ``start_snap`` (None = reset). After every piece
-        that ended at EOS its state is snapshotted: that is the carry for the
-        next request (tagged with ``sig``) and the restore point if a later
-        piece is skipped or cut. Nothing is ever snapshotted mid-piece.
+        that ended at EOS (or was completed by recovery) its state is
+        snapshotted: that is the carry for the next request (tagged with
+        ``sig``) and the restore point if a later piece is skipped or cut.
+        Nothing is ever snapshotted mid-piece for the carry.
 
         History: the first piece that ended at EOS is pinned, the previous one
         is latest; skipped and runaway pieces never enter it.
+
+        A stall (``stall_seconds`` of silent chunks) is recovered in place, in
+        this order, up to ``stall_attempts`` re-generations per piece:
+          R1  nothing played yet: regenerate the piece from scratch;
+          R2  speech played: regenerate with the played frames as the
+              assistant prefix, so the model continues where it stopped;
+          R3  last attempt after speech: repeat the piece from the start
+              (repeats words, logged as a WARNING);
+          R0  no attempts left: skip the piece (ERROR with its text).
         """
         in_rate = drv.sample_rate
         cap = int(PAUSE_CAP_S * in_rate)
@@ -725,26 +741,35 @@ class FishTTS:
             else:
                 drv.codec_restore(eos_snap)
 
+        def pause_of(piece):
+            return _piece_pause(piece, p.sentence_pause, p.clause_pause)
+
         for idx, piece in enumerate(pieces):
             history = [t for t in (pinned, latest) if t is not None]
             budget = min(drv.max_frames,
                          int(RUNAWAY_MIN_FRAMES + RUNAWAY_FRAMES_PER_CHAR * len(piece)))
             where = f"piece {idx}/{total}"
             shown = f"text={repr(piece)[:200]}"
-            spoke = False
-            attempts = 0
+            left = p.stall_attempts      # re-generations still allowed for this piece
+            used = 0
+            spoke = False                # any voiced chunk, in any attempt
+            content: list = []           # this piece's frames so far (prefix + new)
+            prefix_len = 0               # of `content`: through the last voiced chunk
+            voiced = 0                   # voiced frames in `content`
+            voiced_snap = None           # codec state after the last voiced chunk
+            held: list[np.ndarray] = []  # silent chunks since the last voiced one
+            prefix = None                # frames handed to the model as the prefix
             while True:
-                held: list[np.ndarray] = []
-                held_s = 0.0
-                voiced = 0
-                codes: list = []
+                silent_s = 0.0           # per generation: a stall is silence in ONE run
+                new: list = []
                 outcome = None
-                gen = drv.frames(piece, history)
+                gen = drv.frames(piece, history, prefix)
                 try:
-                    for chunk in chunker.cut(_collect(gen, codes)):
+                    for chunk in chunker.cut(_collect(gen, new)):
                         raw = drv.decode(chunk)
                         if raw.size == 0:
                             continue
+                        content.extend(chunk)
                         parts: list[np.ndarray] = []
                         if pending is not None:
                             tail, pause = pending
@@ -759,26 +784,29 @@ class FishTTS:
                                 break
                             if held:
                                 parts.append(np.concatenate(held)[:cap])
-                                held, held_s = [], 0.0
+                                held = []
+                            silent_s = 0.0
                             parts.append(raw)
                             spoke = True
+                            prefix_len = len(content)
+                            voiced_snap = drv.codec_snapshot()
                         else:
                             held.append(raw)
-                            held_s += raw.size / in_rate
-                            if held_s >= p.stall_seconds:
+                            silent_s += raw.size / in_rate
+                            if silent_s >= p.stall_seconds:
                                 outcome = "stall"
                                 break
                         if parts:
                             pending = None
                             yield np.concatenate(parts)
                     else:
-                        outcome = "eos" if len(codes) < drv.max_frames else "runaway"
+                        outcome = "eos" if len(new) < drv.max_frames else "runaway"
                 finally:
                     gen.close()
 
                 if outcome == "eos":
-                    if codes:
-                        turn = drv.turn(piece, codes)
+                    if content:
+                        turn = drv.turn(piece, content)
                         if pinned is None:
                             pinned = turn
                         else:
@@ -787,31 +815,53 @@ class FishTTS:
                     if sig.carry:
                         self._carry = (sig, eos_snap)
                     pending = (np.concatenate(held)[:cap] if held and spoke else None,
-                               _piece_pause(piece, p.sentence_pause, p.clause_pause))
+                               pause_of(piece))
                     break
                 if outcome == "runaway":
                     stats.runaway += 1
                     print(f"[fish] ERROR runaway in {where} ({voiced} voiced frames "
                           f"> budget {budget}); skipping {shown}", flush=True)
                     restore_eos()
-                    pending = (None, _piece_pause(piece, p.sentence_pause, p.clause_pause))
+                    pending = (None, pause_of(piece))
                     break
-                # stall
+
+                # --- stall: the recovery ladder -------------------------------
                 stats.stalls += 1
-                if not spoke and attempts == 0:
-                    attempts = 1
+                if left == 0:                                           # R0
+                    stats.skipped += 1
+                    print(f"[fish] ERROR giving up on {where} after {used} attempts; "
+                          f"skipping {shown}", flush=True)
+                    if spoke:
+                        # The silence played so far already holds the tail of
+                        # the last voiced chunk: don't add it a second time.
+                        drv.codec_restore(voiced_snap, drop_overlap=True)
+                        # That silence (<= PAUSE_CAP_S) is the gap to the next piece.
+                        pending = (np.concatenate(held)[:cap] if held else None, 0.0)
+                    else:
+                        restore_eos()
+                    break
+                left -= 1
+                used += 1
+                if not spoke:                                           # R1
                     stats.retried += 1
-                    print(f"[fish] stall before speech in {where}; retry 1/1 {shown}",
-                          flush=True)
+                    print(f"[fish] stall before speech in {where}; "
+                          f"retry {used}/{p.stall_attempts} {shown}", flush=True)
                     restore_eos()
-                    continue
-                stats.skipped += 1
-                print(f"[fish] ERROR giving up on {where} after {attempts} attempts; "
-                      f"skipping {shown}", flush=True)
-                restore_eos()
-                if spoke:
-                    pending = (None, _piece_pause(piece, p.sentence_pause, p.clause_pause))
-                break
+                    content, prefix_len, voiced, held, prefix = [], 0, 0, [], None
+                elif left >= 1:                                         # R2
+                    stats.resumed += 1
+                    print(f"[fish] stall in {where} after {p.stall_seconds:g}s silence "
+                          f"(spoke {voiced / drv.frame_rate:.1f}s); "
+                          f"resume {used}/{p.stall_attempts} {shown}", flush=True)
+                    drv.codec_restore(voiced_snap, drop_overlap=True)
+                    content = content[:prefix_len]      # trailing silent frames dropped
+                    prefix = list(content)
+                else:                                                   # R3
+                    stats.retried += 1
+                    print(f"[fish] WARNING {where} resumes failed; repeating from "
+                          f"start {used}/{p.stall_attempts} {shown}", flush=True)
+                    drv.codec_restore(voiced_snap, drop_overlap=True)
+                    content, prefix_len, voiced, prefix = [], 0, 0, None
         if pending is not None and pending[0] is not None and pending[0].size:
             yield pending[0]
 
