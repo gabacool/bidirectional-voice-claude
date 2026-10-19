@@ -983,7 +983,7 @@ def test_driver_matches_generate_real_model():
         yaml.safe_load(open(Path(__file__).resolve().parent.parent / "config.yaml"))["local"])
     tts = FishTTS(cfg)
     tts._ensure_model()
-    model, drv = tts._model, tts._acquire_driver()
+    model, (drv, _sig) = tts._model, tts._acquire_driver()
     text = "The market closed higher on Friday."
     mx.random.seed(1234)
     ref = np.concatenate([
