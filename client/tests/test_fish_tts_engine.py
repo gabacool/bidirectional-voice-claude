@@ -362,6 +362,80 @@ def test_natural_pauses_are_kept_but_capped(monkeypatch):
     assert 6 * 0.32 + 0.4 < total < 6 * 0.32 + 0.8
 
 
+# --- quiet speech is not silence; runaways are cut ---------------------------
+
+def test_quiet_speech_inside_piece_is_played_in_full(monkeypatch):
+    # 1.28 s of quiet speech (RMS 0.005) between two words: all of it plays.
+    # (The 0.01 threshold cut it to the 0.6 s pause cap and lost words.)
+    script = [0.3] * 3 + [0.005] * 4 + [0.3] * 3
+    tts, drv = _paced(monkeypatch, ["Hi. There."], [script])
+    out = list(tts.synthesize_stream("Hi. There."))
+    assert len(drv.calls) == 1
+    assert abs(_seconds(out) - 10 * 0.32) < 0.03
+
+
+def test_quiet_speech_never_counts_as_stall(monkeypatch, capsys):
+    # 4 s at RMS 0.005, then EOS: not a stall, no extra generation, all played.
+    tts, drv = _paced(monkeypatch, ["Hello there."], [[0.005] * 13])
+    out = list(tts.synthesize_stream("Hello there."))
+    assert len(drv.calls) == 1
+    assert abs(_seconds(out) - 13 * 0.32) < 0.03
+    assert "stalls=0" in capsys.readouterr().out
+
+
+def test_true_silence_still_stalls(monkeypatch, capsys):
+    # The new threshold must not be so low that real silence goes unseen.
+    tts, drv = _paced(monkeypatch, ["Hello there."], [[0.3] * 3 + [0.0] * 20])
+    out = list(tts.synthesize_stream("Hello there."))
+    log = capsys.readouterr().out
+    assert "ERROR giving up on piece 0/1" in log and "stalls=1" in log
+    assert _seconds(out) < 3 * 0.32 + 0.1       # the held silence is not played
+
+
+def test_stall_log_includes_piece_text(monkeypatch, capsys):
+    tts, _ = _paced(monkeypatch, ["C R W V at 61.39, down 11.9 percent,"],
+                    [[0.3] * 3 + [0.0] * 20])
+    list(tts.synthesize_stream("x"))
+    stall = [ln for ln in capsys.readouterr().out.splitlines() if "giving up" in ln]
+    assert len(stall) == 1
+    assert "text='C R W V at 61.39, down 11.9 percent,'" in stall[0]
+    assert "piece 0/1" in stall[0]
+
+
+def test_new_config_keys_flatten():
+    from tts_client import flatten_local_tts_config
+    flat = flatten_local_tts_config({
+        "tts_engine": "fish",
+        "fish": {"silence_rms": 0.002, "stall_seconds": 2.5},
+    })
+    assert flat["fish_silence_rms"] == 0.002 and flat["fish_stall_seconds"] == 2.5
+    tts = FishTTS(flat)
+    assert (tts.silence_rms, tts.stall_seconds) == (0.002, 2.5)
+    defaults = FishTTS({})
+    assert (defaults.silence_rms, defaults.stall_seconds) == (0.001, 3.0)
+
+
+def test_runaway_babble_is_cut_once_without_resume(monkeypatch, capsys):
+    pieces = ("Alpha one is fine here ok.", "This second piece babbles on.",
+              "Omega three is fine too.")
+    # Piece 1: 40 quiet voiced chunks = 280 frames > its budget (96 + 3 * 29).
+    scripts = [[0.3] * 3, [0.005] * 40, [0.3] * 3]
+    tts, drv = _paced(monkeypatch, pieces, scripts)
+    out = list(tts.synthesize_stream(" ".join(pieces)))
+    log = capsys.readouterr().out
+    assert log.count("ERROR runaway") == 1
+    assert "budget 183" in log and "text='This second piece babbles on.'" in log
+    assert [c.text for c in drv.calls] == list(pieces)    # no resume, no retry
+    # The codec went back to the state after the last piece that ended at EOS.
+    snaps = [e[1] for e in drv.events if e[0] == "snapshot"]
+    assert ("restore", snaps[0], False) in drv.events
+    # A runaway never enters history: piece 2 sees only piece 0.
+    assert drv.calls[2].history == [21]
+    assert "runaway=1" in log and "stalls=0" in log
+    # Voiced audio up to the budget was played, the rest cut: far short of 40 chunks.
+    assert _seconds(out) < (3 + 27 + 3) * 0.32 + 1.5
+
+
 # --- pieces, pauses, and the last word -------------------------------------
 
 from fish_tts_engine import split_text  # noqa: E402

@@ -43,9 +43,16 @@ DEFAULT_MAX_FRAMES = 1024  # Drama 3's own cap on the frames of one piece
 # Silence watchdog. Drama 3 sometimes stops emitting EOS and samples silence
 # until its 1024-frame cap (~47s) — reliably after a blank line inside one of
 # its ~300-byte text pieces. Pauses are capped; a long stall abandons the piece.
-SILENT_RMS = 0.01          # per streamed chunk (~0.32s)
-PAUSE_CAP_S = 0.6          # longest pause we ever play
-SILENCE_ABORT_S = 3.0      # continuous silence that counts as a stall
+# Measured on real output: true silence is <= 0.0004 RMS per chunk, natural
+# word gaps 0.0001-0.0003, but the quiet end of a sentence ("Fifty five.",
+# "October sixteenth.") sits at 0.003-0.01 — so the line is 0.001, not 0.01.
+DEFAULT_SILENCE_RMS = 0.001  # per streamed chunk (~0.32s); below it = silent
+DEFAULT_STALL_S = 3.0        # continuous silence that counts as a stall
+PAUSE_CAP_S = 0.6            # longest pause we ever play
+# A piece's voiced frames are bounded by its text; babble at 0.001-0.01 RMS is
+# "voiced" now, so this is what stops a runaway (593 real pieces: 1/593 over).
+RUNAWAY_MIN_FRAMES = 96      # ~4.5 s
+RUNAWAY_FRAMES_PER_CHAR = 3.0
 _SEPARATOR_LINE = re.compile(r"^[\s\-_=*~#•·—–]+$")
 _BULLET = re.compile(r"^(?:[-•·*–—]+|\d{1,3}[.)])\s+")
 _TERMINATED = re.compile(r"[.!?;:…。！？；：][\"'”’)\]]*$")
@@ -404,6 +411,24 @@ class _Chunker:
             yield pend
 
 
+class _Params(NamedTuple):
+    """Per-request knobs, read once so a config change never lands mid-request."""
+
+    first_frames: int
+    interval: int
+    silence_rms: float
+    stall_seconds: float
+    sentence_pause: float
+    clause_pause: float
+
+
+class _Stats:
+    """Per-request event counters for the ``done`` log line."""
+
+    def __init__(self):
+        self.stalls = self.resumed = self.retried = self.skipped = self.runaway = 0
+
+
 class FishTTS:
     """On-device Fish Audio Drama 3 (MLX 4-bit by default)."""
 
@@ -451,6 +476,8 @@ class FishTTS:
         self.clause_pause = float(
             config.get("fish_clause_pause_seconds", DEFAULT_CLAUSE_PAUSE_S)
         )
+        self.silence_rms = float(config.get("fish_silence_rms", DEFAULT_SILENCE_RMS))
+        self.stall_seconds = float(config.get("fish_stall_seconds", DEFAULT_STALL_S))
         self.speed = config.get("tts_speed", 1.0)
         self.seek_seconds = config.get("tts_seek_seconds", 15)
         # LAST: one assignment publishes the whole signature half at once.
@@ -561,13 +588,16 @@ class FishTTS:
                           ) -> Iterator[np.ndarray]:
         """Yield mono float32 24 kHz chunks as Drama 3 generates them.
 
-        Pieces are sentences (or clauses); where the piece index changes, the
-        piece's quiet tail is played and the configured pause appended.
-        Silence watchdog: pauses are held back and capped at PAUSE_CAP_S; if a
-        text piece stalls (SILENCE_ABORT_S of silence) the generator is closed
-        and generation restarts from the next piece. A piece that stalls
-        before saying anything is retried once. Quiet audio held at the very
-        end is the last word's fade-out and is played, not dropped.
+        Pieces are sentences (or clauses) fed to the model one at a time;
+        where the piece index changes, the piece's quiet tail is played and
+        the configured pause appended.
+        Silence watchdog: a chunk is silent below ``silence_rms``; silent
+        chunks are held back and capped at PAUSE_CAP_S when speech resumes,
+        and ``stall_seconds`` of them in a row is a stall. A piece that
+        stalls before saying anything is retried once, otherwise skipped.
+        A piece whose voiced frames outgrow its text is a runaway and is cut.
+        Quiet audio held at the very end is the last word's fade-out and is
+        played, not dropped.
         """
         if not _fish_text(_prepare_for_speech(text)):
             return
@@ -577,111 +607,159 @@ class FishTTS:
         if kwargs is None:
             return
         drv = self._acquire_driver()
-        in_rate = drv.sample_rate
-        rs = _StreamResampler(in_rate, OUT_SAMPLE_RATE)
+        rs = _StreamResampler(drv.sample_rate, OUT_SAMPLE_RATE)
         interval = max(1, round(kwargs["streaming_interval"] * drv.frame_rate))
-        first_frames = kwargs["first_chunk_frames"] or interval
+        params = _Params(
+            first_frames=kwargs["first_chunk_frames"] or interval,
+            interval=interval,
+            silence_rms=self.silence_rms,
+            stall_seconds=self.stall_seconds,
+            sentence_pause=self.sentence_pause,
+            clause_pause=self.clause_pause,
+        )
         pieces = self._split(kwargs["text"])
+        stats = _Stats()
         print(f"[fish] generate chars={len(kwargs['text'])} "
               f"interval={kwargs['streaming_interval']}", flush=True)
         t_start = time.monotonic()
         n = 0
         audio_s = 0.0
-        start = 0
-        retried_piece = None
-        while start < len(pieces):
-            # Each (re)start is a cold run, as the library's generate() was.
-            drv.codec_reset()
-            chunker = _Chunker(first_frames, interval)
-            pinned = latest = None
-            held: list[np.ndarray] = []
-            held_s = 0.0
-            spoke: set[int] = set()
-            stalled = None
-            cur = None
-            for idx in range(start, len(pieces)):
-                piece = pieces[idx]
-                history = [t for t in (pinned, latest) if t is not None]
-                gen = drv.frames(piece, history)
+        run = self._run_pieces(drv, pieces, params, stats)
+        try:
+            for raw in run:
+                out = rs.process(raw)
+                if out.size == 0:
+                    continue
+                n += 1
+                now = time.monotonic()
+                audio_s += out.size / OUT_SAMPLE_RATE
+                if n == 1:
+                    print(f"[fish] first audio {now - t_start:.2f}s", flush=True)
+                elif n % 10 == 0:
+                    print(f"[fish] chunk#{n} audio={audio_s:.1f}s "
+                          f"rtf={audio_s / max(now - t_start, 1e-6):.2f}x", flush=True)
+                yield out
+        finally:
+            run.close()
+        tail = rs.flush()
+        if tail.size:
+            yield tail
+        wall = time.monotonic() - t_start
+        print(f"[fish] done audio={audio_s:.1f}s wall={wall:.1f}s "
+              f"rtf={audio_s / max(wall, 1e-6):.2f}x "
+              f"stalls={stats.stalls} resumed={stats.resumed} "
+              f"retried={stats.retried} skipped={stats.skipped} "
+              f"runaway={stats.runaway}", flush=True)
+
+    def _run_pieces(self, drv, pieces: list[str], p: "_Params", stats: "_Stats"
+                    ) -> Iterator[np.ndarray]:
+        """The piece loop: yields mono float32 audio at the model's rate.
+
+        History: the first piece that ended at EOS is pinned, the previous one
+        is latest; skipped and runaway pieces never enter it.
+        """
+        in_rate = drv.sample_rate
+        cap = int(PAUSE_CAP_S * in_rate)
+        total = len(pieces)
+        chunker = _Chunker(p.first_frames, p.interval)
+        pinned = latest = None
+        eos_snap = None          # codec state after the last piece that ended at EOS
+        drv.codec_reset()        # None above means "the reset state"
+        pending = None           # (quiet tail, pause seconds) owed before the next audio
+
+        def restore_eos():
+            if eos_snap is None:
+                drv.codec_reset()
+            else:
+                drv.codec_restore(eos_snap)
+
+        for idx, piece in enumerate(pieces):
+            history = [t for t in (pinned, latest) if t is not None]
+            budget = min(drv.max_frames,
+                         int(RUNAWAY_MIN_FRAMES + RUNAWAY_FRAMES_PER_CHAR * len(piece)))
+            where = f"piece {idx}/{total}"
+            shown = f"text={repr(piece)[:200]}"
+            spoke = False
+            attempts = 0
+            while True:
+                held: list[np.ndarray] = []
+                held_s = 0.0
+                voiced = 0
                 codes: list = []
+                outcome = None
+                gen = drv.frames(piece, history)
                 try:
                     for chunk in chunker.cut(_collect(gen, codes)):
                         raw = drv.decode(chunk)
                         if raw.size == 0:
                             continue
                         parts: list[np.ndarray] = []
-                        if cur is not None and idx != cur:
-                            # Piece boundary: its quiet tail, then the set pause.
-                            if held:
-                                parts.append(np.concatenate(held)[: int(PAUSE_CAP_S * in_rate)])
-                                held, held_s = [], 0.0
-                            gap = _piece_pause(pieces[cur], self.sentence_pause,
-                                               self.clause_pause)
-                            if gap > 0:
-                                parts.append(np.zeros(int(gap * in_rate), dtype=np.float32))
-                        cur = idx
-                        if float(np.sqrt(np.mean(np.square(raw)))) < SILENT_RMS:
-                            held.append(raw)
-                            held_s += raw.size / in_rate
-                            if held_s >= SILENCE_ABORT_S:
-                                stalled = idx
+                        if pending is not None:
+                            tail, pause = pending
+                            if tail is not None and tail.size:
+                                parts.append(tail)
+                            if pause > 0:
+                                parts.append(np.zeros(int(pause * in_rate), dtype=np.float32))
+                        if float(np.sqrt(np.mean(np.square(raw)))) >= p.silence_rms:
+                            voiced += len(chunk)
+                            if voiced > budget:
+                                outcome = "runaway"
                                 break
-                        else:
                             if held:
-                                parts.append(np.concatenate(held)[: int(PAUSE_CAP_S * in_rate)])
+                                parts.append(np.concatenate(held)[:cap])
                                 held, held_s = [], 0.0
                             parts.append(raw)
-                            spoke.add(idx)
-                        if not parts:
-                            continue
-                        out = rs.process(np.concatenate(parts))
-                        if out.size == 0:
-                            continue
-                        n += 1
-                        now = time.monotonic()
-                        audio_s += out.size / OUT_SAMPLE_RATE
-                        if n == 1:
-                            print(f"[fish] first audio {now - t_start:.2f}s", flush=True)
-                        elif n % 10 == 0:
-                            print(f"[fish] chunk#{n} audio={audio_s:.1f}s "
-                                  f"rtf={audio_s / max(now - t_start, 1e-6):.2f}x",
-                                  flush=True)
-                        yield out
+                            spoke = True
+                        else:
+                            held.append(raw)
+                            held_s += raw.size / in_rate
+                            if held_s >= p.stall_seconds:
+                                outcome = "stall"
+                                break
+                        if parts:
+                            pending = None
+                            yield np.concatenate(parts)
                     else:
-                        # Ran out on its own (EOS): the piece is history.
-                        if codes:
-                            turn = drv.turn(piece, codes)
-                            if pinned is None:
-                                pinned = turn
-                            else:
-                                latest = turn
+                        outcome = "eos" if len(codes) < drv.max_frames else "runaway"
                 finally:
                     gen.close()
-                if stalled is not None:
+
+                if outcome == "eos":
+                    if codes:
+                        turn = drv.turn(piece, codes)
+                        if pinned is None:
+                            pinned = turn
+                        else:
+                            latest = turn
+                    eos_snap = drv.codec_snapshot()
+                    pending = (np.concatenate(held)[:cap] if held and spoke else None,
+                               _piece_pause(piece, p.sentence_pause, p.clause_pause))
                     break
-            if stalled is None:
-                if held and spoke:
-                    out = rs.process(np.concatenate(held)[: int(PAUSE_CAP_S * in_rate)])
-                    audio_s += out.size / OUT_SAMPLE_RATE
-                    if out.size:
-                        yield out
+                if outcome == "runaway":
+                    stats.runaway += 1
+                    print(f"[fish] ERROR runaway in {where} ({voiced} voiced frames "
+                          f"> budget {budget}); skipping {shown}", flush=True)
+                    restore_eos()
+                    pending = (None, _piece_pause(piece, p.sentence_pause, p.clause_pause))
+                    break
+                # stall
+                stats.stalls += 1
+                if not spoke and attempts == 0:
+                    attempts = 1
+                    stats.retried += 1
+                    print(f"[fish] stall before speech in {where}; retry 1/1 {shown}",
+                          flush=True)
+                    restore_eos()
+                    continue
+                stats.skipped += 1
+                print(f"[fish] ERROR giving up on {where} after {attempts} attempts; "
+                      f"skipping {shown}", flush=True)
+                restore_eos()
+                if spoke:
+                    pending = (None, _piece_pause(piece, p.sentence_pause, p.clause_pause))
                 break
-            piece = pieces[stalled]
-            if stalled not in spoke and piece != retried_piece:
-                retried_piece = piece
-                start = stalled
-                print(f"[fish] stall before speech in piece {stalled}; retrying",
-                      flush=True)
-            else:
-                start = stalled + 1
-                print(f"[fish] stall in piece {stalled} after {SILENCE_ABORT_S}s "
-                      f"silence; skipping to next piece", flush=True)
-        tail = rs.flush()
-        if tail.size:
-            yield tail
-        wall = time.monotonic() - t_start
-        print(f"[fish] done audio={audio_s:.1f}s wall={wall:.1f}s "
-              f"rtf={audio_s / max(wall, 1e-6):.2f}x", flush=True)
+        if pending is not None and pending[0] is not None and pending[0].size:
+            yield pending[0]
 
     def _stretch(self, audio: np.ndarray) -> np.ndarray:
         # Tiny soxr flush tails (<0.1s) are below librosa's FFT window.

@@ -376,6 +376,8 @@ _ENGINE_KEY_MAP = {
         "sentence_pause_seconds": "fish_sentence_pause_seconds",
         "clause_pause_seconds": "fish_clause_pause_seconds",
         "warmup": "fish_warmup",
+        "silence_rms": "fish_silence_rms",
+        "stall_seconds": "fish_stall_seconds",
         "seed": "tts_seed",
         "speaker": "tts_speaker",
     },
