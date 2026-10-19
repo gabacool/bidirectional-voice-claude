@@ -8,6 +8,7 @@ including paused time.
 """
 
 import http.client
+import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -207,3 +208,30 @@ def test_generation_error_is_reported_after_split(served):
     status, body = _post(port, "/speak", b"This will not be spoken at all.")
     assert (status, body) == (500, "model exploded")
     assert not server.playing.is_set()
+
+
+def test_status_shows_paused_read_with_worker_free(served):
+    """F1 seen through GET /status: playing + paused, no job on the worker."""
+    server, port = served
+    speak = threading.Thread(
+        target=_post, args=(port, "/speak", b"A sentence that is read aloud."),
+        daemon=True)
+    speak.start()
+    assert server.audible.wait(5)
+    assert _post(port, "/speak") == (200, "paused")
+    assert server.tts._model.finished.wait(2)
+    deadline = time.monotonic() + 2
+    while True:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/status")
+        status = json.loads(conn.getresponse().read())
+        if status["current_job"] is None or time.monotonic() > deadline:
+            break
+        time.sleep(0.02)
+    print("PAUSED /status:", json.dumps(status))
+    assert status["current_job"] is None
+    assert status["playing"] is True and status["paused"] is True
+    assert status["queue"] == {"total": 0, "by_endpoint": {}}
+    assert isinstance(status["last_success_ts"], float)
+    assert _post(port, "/stop") == (200, "stopped")
+    speak.join(5)

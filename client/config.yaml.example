@@ -27,6 +27,13 @@ local:
   # LAN voice API (voice_api.py)
   voice_api_port: 9900              # OpenAI-compatible: POST /v1/audio/transcriptions,
                                     # POST /v1/audio/speech. Legacy: /transcribe, /synthesize.
+                                    # GET /status: TTS queue + current job (JSON).
+  # Stall alert for a TTS job (read at startup). A job may run
+  # (chars / 15) / 2 + stall_slack_seconds before a "[stall]" line is logged
+  # (~120s for a 3-minute read, which really takes ~90s). Option+S jobs on
+  # engines that play inside the job (not fish) are not timed.
+  stall_slack_seconds: 30
+  stall_auto_restart: false         # true = on a stall, exit so launchd restarts the API
 
   # Playback shared by every TTS engine
   tts_speed: 1.0                    # Playback speed, pitch preserved (1.0 normal, 1.5 faster)

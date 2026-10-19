@@ -479,22 +479,25 @@ class FishTTS:
     # playback: the generation loop below never looks at pause_event.
 
     def generate_into_tape(self, text: str, tape: AudioTape, gen_error: list,
-                           stop_event=None, on_chunk=None) -> None:
+                           stop_event=None, on_chunk=None) -> bool:
         """Generation half: fill ``tape`` on the TTS infer thread, then finish it.
 
         Errors land in ``gen_error[0]`` for the player to raise; ``stop_event``
-        ends generation within one chunk.
+        ends generation within one chunk. True only if the text was generated
+        to the end.
         """
         try:
             for chunk in self.synthesize_stream(text):
                 if stop_event is not None and stop_event.is_set():
-                    break
+                    return False
                 if chunk.size:
                     tape.append(self._stretch(chunk))
                 if on_chunk is not None:
                     on_chunk()
+            return True
         except Exception as e:
             gen_error[0] = e
+            return False
         finally:
             tape.finish()
 

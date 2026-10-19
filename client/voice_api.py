@@ -24,7 +24,11 @@ Endpoints (bound to 0.0.0.0 — LAN only, no auth):
                         16-bit; "wav" prepends a streaming WAV header, "pcm" is
                         raw 16-bit LE PCM
 
-  GET  /health       -> "ok tts=<engine> voice=<name>"
+  GET  /health       -> "ok tts=<engine> voice=<name>"   (exact text; clients match it)
+
+  GET  /status       -> JSON: TTS queue depth (total + by endpoint), the job on
+                        the inference thread (endpoint, chars, age_s,
+                        since_last_chunk_s), last_success_ts, playing, paused
 
 Local-speaker control (Option+S). Same process, but localhost-only — LAN
 clients get 403. Toggle/pause/seek behavior is unchanged from tts_daemon.py:
@@ -55,7 +59,7 @@ import threading
 import time
 import wave
 from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -95,6 +99,158 @@ STREAM_QUEUE_MAXSIZE = 4
 # Playback seek step is in samples at the local TTS rate (24 kHz).
 SPEAK_SAMPLE_RATE = 24000
 SPEAKER_PATHS = ('/speak', '/stop', '/seek/back', '/seek/forward', '/save')
+
+# Stall alert for a job on the TTS inference thread. Length-based, because a
+# legitimate 3-minute read holds the GPU ~90s: text speaks at ~15 chars/s and
+# generates at ~2x realtime, so a job may take (chars/15)/2 + slack seconds.
+STALL_CHARS_PER_S = 15.0
+STALL_REALTIME = 2.0
+DEFAULT_STALL_SLACK_S = 30.0
+STALL_EXIT_CODE = 75     # launchd KeepAlive relaunches on any exit
+
+
+def stall_budget_s(chars: int, slack_s: float = DEFAULT_STALL_SLACK_S) -> float:
+    """Seconds a TTS job for ``chars`` characters may run before it is a stall."""
+    return (chars / STALL_CHARS_PER_S) / STALL_REALTIME + slack_s
+
+
+class JobTracker:
+    """What runs on (and waits for) the single TTS inference thread.
+
+    Every TTS job is submitted through ``submit`` so /status can report the
+    queue by endpoint, the current job, and the last success. A job with
+    ``stall_watch`` arms a timer for its length-based budget when it starts;
+    if it is still running when the timer fires, a [stall] warning is logged
+    and, only with ``auto_restart``, the process exits for launchd to restart.
+    """
+
+    def __init__(self, slack_s: float = DEFAULT_STALL_SLACK_S,
+                 auto_restart: bool = False, restart: Callable[[], None] | None = None,
+                 clock: Callable[[], float] = time.time,
+                 mono: Callable[[], float] = time.monotonic):
+        self.slack_s = float(slack_s)
+        self.auto_restart = bool(auto_restart)
+        self._restart = restart or (lambda: os._exit(STALL_EXIT_CODE))
+        self._clock = clock
+        self._mono = mono
+        self._lock = threading.Lock()
+        self._queued: dict[str, int] = {}
+        self._current: dict | None = None
+        self._last_success: float | None = None
+        self._next_id = 0
+
+    def submit(self, executor: ThreadPoolExecutor, endpoint: str, chars: int,
+               fn: Callable, *args, stall_watch: bool = True) -> Future:
+        """``executor.submit(fn, *args)``, tracked. ``fn`` returning False = failed."""
+        with self._lock:
+            self._next_id += 1
+            job_id = self._next_id
+            self._queued[endpoint] = self._queued.get(endpoint, 0) + 1
+
+        def run():
+            now = self._mono()
+            with self._lock:
+                self._unqueue(endpoint)
+                self._current = {"id": job_id, "endpoint": endpoint,
+                                 "chars": int(chars), "started": now,
+                                 "last_chunk": None, "blocked_s": 0.0,
+                                 "timer": None}
+            if stall_watch:
+                self._arm(job_id, stall_budget_s(chars, self.slack_s))
+            ok = False
+            try:
+                result = fn(*args)
+                ok = result is not False
+                return result
+            finally:
+                with self._lock:
+                    cur, self._current = self._current, None
+                    if ok:
+                        self._last_success = self._clock()
+                if cur is not None and cur["timer"] is not None:
+                    cur["timer"].cancel()
+
+        future = executor.submit(run)
+
+        def _done(f: Future) -> None:
+            if f.cancelled():          # never started: it left the queue here
+                with self._lock:
+                    self._unqueue(endpoint)
+        future.add_done_callback(_done)
+        return future
+
+    def _unqueue(self, endpoint: str) -> None:
+        n = self._queued.get(endpoint, 0) - 1
+        if n > 0:
+            self._queued[endpoint] = n
+        else:
+            self._queued.pop(endpoint, None)
+
+    def _arm(self, job_id: int, delay_s: float) -> None:
+        timer = threading.Timer(max(delay_s, 0.0), self._stalled, (job_id,))
+        timer.daemon = True
+        with self._lock:
+            if self._current is None or self._current["id"] != job_id:
+                return
+            self._current["timer"] = timer
+            timer.start()
+
+    def note_wait(self, seconds: float) -> None:
+        """Time the producer sat blocked on a slow client: not a stall."""
+        with self._lock:
+            if self._current is not None:
+                self._current["blocked_s"] += seconds
+
+    def note_chunk(self) -> None:
+        with self._lock:
+            if self._current is not None:
+                self._current["last_chunk"] = self._mono()
+
+    def _stalled(self, job_id: int) -> None:
+        with self._lock:
+            cur = self._current
+            if cur is None or cur["id"] != job_id:
+                return
+            now = self._mono()
+            age = now - cur["started"]
+            busy = age - cur["blocked_s"]
+            quiet = None if cur["last_chunk"] is None else now - cur["last_chunk"]
+        budget = stall_budget_s(cur["chars"], self.slack_s)
+        if busy < budget:
+            # Part of the time went to waiting on the client: check again
+            # once the remaining working time is used up.
+            self._arm(job_id, budget - busy)
+            return
+        quiet_txt = "no chunk yet" if quiet is None else f"last chunk {quiet:.1f}s ago"
+        print(f"{log_ts()} [stall] {cur['endpoint']} chars={cur['chars']} "
+              f"running {age:.1f}s (working {busy:.1f}s) > budget {budget:.1f}s "
+              f"({quiet_txt})",
+              file=sys.stderr, flush=True)
+        if self.auto_restart:
+            print(f"{log_ts()} [stall] stall_auto_restart on: exiting for launchd",
+                  file=sys.stderr, flush=True)
+            self._restart()
+
+    def snapshot(self) -> dict:
+        now = self._mono()
+        with self._lock:
+            queued = dict(self._queued)
+            cur = None
+            if self._current is not None:
+                c = self._current
+                cur = {
+                    "endpoint": c["endpoint"],
+                    "chars": c["chars"],
+                    "age_s": round(now - c["started"], 3),
+                    "since_last_chunk_s": (None if c["last_chunk"] is None
+                                           else round(now - c["last_chunk"], 3)),
+                }
+            last = self._last_success
+        return {
+            "queue": {"total": sum(queued.values()), "by_endpoint": queued},
+            "current_job": cur,
+            "last_success_ts": last,
+        }
 DEFAULT_TTS_DOWNLOADS = Path.home() / 'Downloads'
 
 
@@ -398,6 +554,9 @@ def run_generator_on(
     gen_factory: Callable[[], Iterator[np.ndarray]],
     maxsize: int = STREAM_QUEUE_MAXSIZE,
     cancelled: Callable[[], bool] | None = None,
+    submit: Callable[[Callable[[], bool]], Future] | None = None,
+    on_chunk: Callable[[], None] | None = None,
+    on_wait: Callable[[float], None] | None = None,
 ) -> Iterator[np.ndarray]:
     """Pump ``gen_factory()`` on ``executor``'s thread, yield chunks on the caller's.
 
@@ -430,6 +589,12 @@ def run_generator_on(
             (deferred so its lazy model work also runs on the inference thread).
         maxsize: Bounded hand-off queue depth.
         cancelled: Optional zero-arg check, run on both threads.
+        submit: Optional ``fn -> Future`` used instead of ``executor.submit``
+            (``JobTracker`` routing). The producer returns True only when the
+            stream ran to its end.
+        on_chunk: Optional callback on the inference thread after each chunk.
+        on_wait: Optional callback with the seconds the producer just spent
+            blocked on a full hand-off queue (a client reading at its own pace).
 
     Yields:
         The chunks produced by ``gen_factory()``, in order.
@@ -440,19 +605,25 @@ def run_generator_on(
     def _put(item: object) -> bool:
         # Block for space, but wake every 0.1s to honour an early-stop request so
         # a full queue can never wedge the producer after the consumer is gone.
+        t0 = time.monotonic()
+        blocked = False
         while not stop.is_set():
             try:
                 handoff.put(item, timeout=0.1)
+                if blocked and on_wait is not None:
+                    on_wait(time.monotonic() - t0)
                 return True
             except queue.Full:
+                blocked = True
                 continue
         return False
 
-    def _produce() -> None:
+    def _produce() -> bool:
         gen: Iterator[np.ndarray] | None = None
+        completed = False
         try:
             if stop.is_set():
-                return  # consumer left while this job waited in the queue
+                return False  # consumer left while this job waited in the queue
             if cancelled is not None and cancelled():
                 raise ClientDisconnected()  # client left before its turn came
             gen = gen_factory()
@@ -461,8 +632,12 @@ def run_generator_on(
                     break
                 if cancelled is not None and cancelled():
                     raise ClientDisconnected()
+                if on_chunk is not None:
+                    on_chunk()
                 if not _put(chunk):
                     break
+            else:
+                completed = True
         except BaseException as exc:  # noqa: BLE001 - relayed to the consumer
             _put(_GeneratorError(exc))
         finally:
@@ -473,8 +648,9 @@ def run_generator_on(
                 if callable(close):
                     close()
             _put(_STREAM_SENTINEL)
+        return completed
 
-    future = executor.submit(_produce)
+    future = submit(_produce) if submit is not None else executor.submit(_produce)
     try:
         while True:
             if cancelled is None:
@@ -514,6 +690,8 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             engine = getattr(tts, 'engine', '?') if tts else '?'
             speaker = getattr(tts, 'speaker', '?') if tts else '?'
             self._respond_text(200, f'ok tts={engine} voice={speaker}')
+        elif self.path == '/status':
+            self._respond_json(200, self._status())
         else:
             self._respond_json(404, {"error": "not found"})
 
@@ -605,13 +783,18 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
                     self._respond_text(200, 'ok')
                     return
                 # Qwen must generate on the TTS infer thread (mlx stream affinity).
-                self.server.tts_executor.submit(
-                    self.server.tts.synthesize_and_play,
-                    text,
-                    self.server.stop_event,
-                    self.server.pause_event,
-                    self.server.seek,
-                    self.server.audible,
+                # This job includes playback and pauses: no stall budget.
+                server = self.server
+
+                def speak_and_play() -> bool:
+                    server.tts.synthesize_and_play(
+                        text, server.stop_event, server.pause_event,
+                        server.seek, server.audible)
+                    return not server.stop_event.is_set()   # stopped != success
+
+                self._jobs().submit(
+                    server.tts_executor, "speak", len(text), speak_and_play,
+                    stall_watch=False,
                 ).result()
                 self._respond_text(200, 'ok')
             except Exception as e:
@@ -634,14 +817,16 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
         tape = AudioTape()
         gen_error: list = [None]
         gen_started = threading.Event()
+        jobs = self._jobs()
 
         def generate():
             gen_started.set()
             if server.stop_event.is_set():
                 return False
-            return tts.generate_into_tape(text, tape, gen_error, server.stop_event)
+            return tts.generate_into_tape(
+                text, tape, gen_error, server.stop_event, jobs.note_chunk)
 
-        gen = server.tts_executor.submit(generate)
+        gen = jobs.submit(server.tts_executor, "speak", len(text), generate)
         try:
             # Playback's prime / max-wait clock must start with generation,
             # not while this job waits behind another one on the worker.
@@ -681,7 +866,8 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             maybe_reload_config(self.server)
 
         try:
-            audio = self.server.tts_executor.submit(
+            audio = self._jobs().submit(
+                self.server.tts_executor, "save", len(text),
                 self.server.tts.synthesize_to_array, text).result()
         except Exception as e:
             print(f"[save error] {e}", file=sys.stderr, flush=True)
@@ -784,10 +970,15 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
         # is still one WAV with Content-Length, written only at the end.
         tts = self.server.tts
         t0 = time.monotonic()
+        jobs = self._jobs()
         stream = run_generator_on(
             self.server.tts_executor,
             lambda: tts.synthesize_stream(text),
             cancelled=self._client_gone,
+            submit=lambda fn: jobs.submit(
+                self.server.tts_executor, "synthesize", len(text), fn),
+            on_chunk=jobs.note_chunk,
+            on_wait=jobs.note_wait,
         )
         try:
             audio = tts.array_from_chunks(stream)
@@ -841,11 +1032,16 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
         # closing the returned generator aborts the producer (no orphan) — so we
         # close it in every exit path below. Submit generation *before* writing
         # headers so clone prefill overlaps the round-trip.
+        jobs = self._jobs()
         stream = run_generator_on(
             self.server.tts_executor,
             lambda: self.server.tts.synthesize_stream(
                 text, voice=voice, streaming_interval=SPEECH_STREAMING_INTERVAL),
             cancelled=self._client_gone,
+            submit=lambda fn: jobs.submit(
+                self.server.tts_executor, "speech", len(text), fn),
+            on_chunk=jobs.note_chunk,
+            on_wait=jobs.note_wait,
         )
         try:
             self.send_response(200)
@@ -891,6 +1087,21 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
         finally:
             # Stop the producer (aborts generation if we exited early) and join it.
             stream.close()
+
+    def _jobs(self) -> JobTracker:
+        jobs = getattr(self.server, 'jobs', None)
+        if jobs is None:            # servers built without main() (tests)
+            jobs = self.server.jobs = JobTracker()
+        return jobs
+
+    def _status(self) -> dict:
+        status = self._jobs().snapshot()
+        playing = getattr(self.server, 'playing', None)
+        paused = getattr(self.server, 'pause_event', None)
+        status["playing"] = bool(playing is not None and playing.is_set())
+        status["paused"] = bool(status["playing"] and paused is not None
+                                and paused.is_set())
+        return status
 
     def _client_gone(self) -> bool:
         return client_disconnected(self.connection)
@@ -985,6 +1196,10 @@ def main():
     server.seek = SeekControl()
     server.playing = threading.Event()
     server.tts_downloads = DEFAULT_TTS_DOWNLOADS
+    server.jobs = JobTracker(
+        slack_s=local_cfg.get('stall_slack_seconds', DEFAULT_STALL_SLACK_S),
+        auto_restart=bool(local_cfg.get('stall_auto_restart', False)),
+    )
     try:
         server.config_mtime = CONFIG_PATH.stat().st_mtime
     except OSError:
