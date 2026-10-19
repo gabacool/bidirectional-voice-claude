@@ -54,6 +54,7 @@ DEFAULT_STALL_ATTEMPTS = 3   # re-generations per stalled piece before skipping 
 PAUSE_CAP_S = 0.6            # longest pause we ever play
 # A piece's voiced frames are bounded by its text; babble at 0.001-0.01 RMS is
 # "voiced" now, so this is what stops a runaway (593 real pieces: 1/593 over).
+QUIET_RMS = 0.01             # the old silence line; quiet speech sits below it
 RUNAWAY_MIN_FRAMES = 96      # ~4.5 s
 RUNAWAY_FRAMES_PER_CHAR = 3.0
 _SEPARATOR_LINE = re.compile(r"^[\s\-_=*~#•·—–]+$")
@@ -437,6 +438,10 @@ class _Stats:
 
     def __init__(self):
         self.stalls = self.resumed = self.retried = self.skipped = self.runaway = 0
+        # Seconds of quiet-but-voiced audio (silence_rms..0.01, the range the old
+        # threshold wrongly cut) that was decoded and then not played. 0 is the
+        # goal; only a runaway cut can make it non-zero.
+        self.quiet_dropped_s = 0.0
 
 
 class FishTTS:
@@ -685,7 +690,8 @@ class FishTTS:
               f"rtf={audio_s / max(wall, 1e-6):.2f}x "
               f"stalls={stats.stalls} resumed={stats.resumed} "
               f"retried={stats.retried} skipped={stats.skipped} "
-              f"runaway={stats.runaway}", flush=True)
+              f"runaway={stats.runaway} quiet_dropped_s={stats.quiet_dropped_s:.1f}",
+              flush=True)
 
     def _carry_for(self, sig: _Signature, drv):
         """The codec snapshot this request starts from, or None for a reset.
@@ -777,10 +783,13 @@ class FishTTS:
                                 parts.append(tail)
                             if pause > 0:
                                 parts.append(np.zeros(int(pause * in_rate), dtype=np.float32))
-                        if float(np.sqrt(np.mean(np.square(raw)))) >= p.silence_rms:
+                        rms = float(np.sqrt(np.mean(np.square(raw))))
+                        if rms >= p.silence_rms:
                             voiced += len(chunk)
                             if voiced > budget:
                                 outcome = "runaway"
+                                if rms < QUIET_RMS:
+                                    stats.quiet_dropped_s += raw.size / in_rate
                                 break
                             if held:
                                 parts.append(np.concatenate(held)[:cap])

@@ -412,7 +412,8 @@ def test_quiet_speech_never_counts_as_stall(monkeypatch, capsys):
     out = list(tts.synthesize_stream("Hello there."))
     assert len(drv.calls) == 1
     assert abs(_seconds(out) - 13 * 0.32) < 0.03
-    assert "stalls=0" in capsys.readouterr().out
+    log = capsys.readouterr().out
+    assert "stalls=0" in log and "quiet_dropped_s=0.0" in log
 
 
 def test_true_silence_still_stalls(monkeypatch, capsys):
@@ -467,6 +468,7 @@ def test_runaway_babble_is_cut_once_without_resume(monkeypatch, capsys):
     # A runaway never enters history: piece 2 sees only piece 0.
     assert drv.calls[2].history == [21]
     assert "runaway=1" in log and "stalls=0" in log
+    assert "quiet_dropped_s=0.3" in log           # the one babble chunk that was cut
     # Voiced audio up to the budget was played, the rest cut: far short of 40 chunks.
     assert _seconds(out) < (3 + 27 + 3) * 0.32 + 1.5
 
