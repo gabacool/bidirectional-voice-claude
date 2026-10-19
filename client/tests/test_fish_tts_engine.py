@@ -417,7 +417,8 @@ def test_quiet_speech_never_counts_as_stall(monkeypatch, capsys):
 
 def test_true_silence_still_stalls(monkeypatch, capsys):
     # The new threshold must not be so low that real silence goes unseen.
-    tts, drv = _paced(monkeypatch, ["Hello there."], [[0.3] * 3 + [0.0] * 20, [0.3] * 2])
+    # True stall silence measured at <= 0.0004 RMS per chunk (often 0.0000).
+    tts, drv = _paced(monkeypatch, ["Hello there."], [[0.3] * 3 + [0.0004] * 20, [0.3] * 2])
     out = list(tts.synthesize_stream("Hello there."))
     log = capsys.readouterr().out
     assert "stall in piece 0/1 after 3s silence" in log and "stalls=1" in log
@@ -572,14 +573,31 @@ def test_reference_rerecorded_in_place_invalidates_voice_and_carry(monkeypatch, 
 
 
 def test_apply_config_publishes_one_immutable_tuple():
-    tts = _loaded()
+    class Recording(FishTTS):
+        """Records every assignment of the published config."""
+        assigned: list = []
+
+        @property
+        def _cfg(self):
+            return self.__dict__["_cfg_value"]
+
+        @_cfg.setter
+        def _cfg(self, value):
+            Recording.assigned.append(value)
+            self.__dict__["_cfg_value"] = value
+
+    tts = Recording({"fish_ref_audio": str(REF), "fish_ref_text": "x"})
     before = tts._cfg
+    Recording.assigned.clear()
     tts.apply_config({"fish_ref_audio": "/tmp/a.wav", "fish_ref_text": "aa",
                       "fish_warmup": False})
-    after = tts._cfg
-    assert isinstance(after, tuple) and before is not after
-    assert (after.ref_audio, after.ref_text) == ("/tmp/a.wav", "aa")
-    assert before.ref_audio == str(REF)                    # the old tuple is untouched
+    # ONE assignment carries the whole new config: a request reading it from
+    # another thread sees all of it or none of it, never new ref_audio with
+    # the old ref_text.
+    assert len(Recording.assigned) == 1
+    after = Recording.assigned[0]
+    assert isinstance(after, tuple) and (after.ref_audio, after.ref_text) == ("/tmp/a.wav", "aa")
+    assert before.ref_audio == str(REF) and before.ref_text == "x"   # old tuple untouched
     with pytest.raises(AttributeError):
         after.ref_audio = "/tmp/b.wav"
 
@@ -596,16 +614,18 @@ def test_first_chunk_not_held(monkeypatch):
 
 
 def test_config_change_during_open_stream(monkeypatch, tmp_path):
-    tts = _loaded(scripts=[[0.3] * 3, [0.3] * 6] + [[0.3] * 3 for _ in range(10)])
-    _text_pieces(monkeypatch, ["First piece here today.", "Second piece follows it."])
+    tts = _warm_tts(monkeypatch, pieces=("First piece here today.", "Second piece follows it."),
+                    pool=20)
+    list(tts.synthesize_stream("seed the carry"))          # a carry exists and is valid
     gen = tts.synthesize_stream("a")
     next(gen)
     old = tts.made[0]
     carry_before, n_events = tts._carry, len(old.events)
+    assert carry_before is not None
     other = tmp_path / "other.wav"
     _write_clip(other, 4)
     tts.apply_config({"fish_ref_audio": str(other), "fish_ref_text": "another voice",
-                      "fish_first_chunk_frames": FPC, "fish_warmup": False})
+                      "fish_first_chunk_frames": FPC, "fish_warmup": True})
     # apply_config made no driver or codec call and touched no carry.
     assert len(tts.made) == 1 and tts._driver is old and tts._carry is carry_before
     assert len(old.events) == n_events
@@ -617,6 +637,20 @@ def test_config_change_during_open_stream(monkeypatch, tmp_path):
     assert new.signature.ref_audio == str(other)
     assert new.events[0] == ("reset",)
     assert not any(e[0] == "restore" and e[1] in old_snaps for e in new.events)
+
+
+def test_carry_written_for_another_signature_is_never_restored(monkeypatch):
+    # The tag is the guard if a carry ever outlives the driver it came from
+    # (a late write by an older stream): restore only on an exact match.
+    tts = _warm_tts(monkeypatch)
+    list(tts.synthesize_stream("a"))
+    drv = tts.made[0]
+    stale_sig = drv.signature._replace(ref_text="an older voice")
+    tts._carry = (stale_sig, ("snap", "stale"))
+    n = len(drv.events)
+    list(tts.synthesize_stream("b"))
+    assert ("restore", ("snap", "stale"), False) not in drv.events
+    assert drv.events[n] == ("reset",)
 
 
 def test_carry_config_key_flattens():
