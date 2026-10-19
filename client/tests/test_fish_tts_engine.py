@@ -290,6 +290,42 @@ def test_warmup_seeds_the_codec_with_the_voices_own_speech(monkeypatch):
     assert drv.events[n] == ("restore", seed_last, False)
 
 
+class _FailOnceDriver(FakeDriver):
+    """The first frames() call (the warm-up seed's first piece) raises."""
+
+    failed = False
+
+    def frames(self, text, history, prefix=None):
+        if not _FailOnceDriver.failed:
+            _FailOnceDriver.failed = True
+            raise RuntimeError("warm-up blew up")
+        yield from super().frames(text, history, prefix)
+
+
+def test_failed_warmup_is_retried_not_skipped(monkeypatch):
+    warm_pieces = fish_tts_engine.split_text(fish_tts_engine.WARMUP_TEXT, clauses=True)
+    _FailOnceDriver.failed = False
+    shared = [[0.3] * 3 for _ in range(len(warm_pieces) + 2)]
+    tts = _loaded({"fish_warmup": True})
+    made = []
+
+    def make(model, signature):
+        drv = _FailOnceDriver(shared, signature)
+        made.append(drv)
+        return drv
+
+    tts._make_driver = make
+    with pytest.raises(RuntimeError, match="warm-up blew up"):
+        list(tts.synthesize_stream("Hello there."))
+    # A driver whose warm-up failed is never published...
+    assert tts._driver is None and tts._carry is None
+    list(tts.synthesize_stream("Hello there."))
+    # ...so the next request builds a new one and runs the whole seed first.
+    assert len(made) == 2
+    assert [c.text for c in made[1].calls] == warm_pieces + ["Hello there."]
+    assert tts._driver is made[1]
+
+
 def test_model_swap_releases_the_old_model_before_loading_the_new(monkeypatch):
     seen = []
 

@@ -564,8 +564,12 @@ class FishTTS:
             if drv is not None or self._carry is not None:
                 print("[fish] carry: reset (signature changed)", flush=True)
             self._carry = None
-            drv = self._driver = self._make_driver(self._model, sig)
+            self._driver = None
+            drv = self._make_driver(self._model, sig)
+            # Published only once warmed: if the warm-up raises, the next
+            # request builds and warms again instead of running cold.
             self._warm(drv, sig)
+            self._driver = drv
         return drv, sig
 
     def _warm(self, drv, sig: _Signature) -> None:
