@@ -38,7 +38,9 @@ OUT_SAMPLE_RATE = 24000
 DEFAULT_PLAY_PRIME_SECONDS = 0.5
 PLAY_MAX_WAIT_S = 1.5    # never hold Option+S longer than this once audio exists
 PLAY_MIN_REALTIME = 1.2  # start early only if generation is clearly ahead
-WARMUP_TEXT = "Okay."
+# Seed for the codec: ~8+ s of the voice's own neutral speech (>= ~170 frames).
+WARMUP_TEXT = ("Okay. This is a short warm-up so the voice settles before the "
+               "first real request. Everything is ready now.")
 DEFAULT_MAX_FRAMES = 1024  # Drama 3's own cap on the frames of one piece
 # Silence watchdog. Drama 3 sometimes stops emitting EOS and samples silence
 # until its 1024-frame cap (~47s) — reliably after a blank line inside one of
@@ -233,6 +235,7 @@ class _Signature(NamedTuple):
     top_k: int
     top_p: float
     max_frames: int
+    carry: bool          # carry the codec state across requests
 
 
 class _Cfg(NamedTuple):
@@ -246,6 +249,7 @@ class _Cfg(NamedTuple):
     top_k: int
     top_p: float
     max_frames: int
+    carry: bool
 
 
 class _Drama3Driver:
@@ -370,6 +374,10 @@ class _Drama3Driver:
     def codec_reset(self) -> None:
         self._codec.reset_streaming_state()
 
+    def codec_position(self) -> int:
+        """Frames the codec's post transformer has advanced (for the log)."""
+        return int(getattr(self._codec.quantizer.post_module, "_position", 0))
+
     def codec_snapshot(self):
         """Streaming state as (module, {attr: value}). The codec step functions
         reassign these attributes and never mutate them in place, so holding
@@ -438,6 +446,7 @@ class FishTTS:
         self._model = None
         self._model_key = None     # model name _model was loaded for
         self._driver = None
+        self._carry = None         # (signature, codec snapshot after the last EOS)
         self.model_name = None
         self.apply_config(config)
 
@@ -476,6 +485,7 @@ class FishTTS:
         self.clause_pause = float(
             config.get("fish_clause_pause_seconds", DEFAULT_CLAUSE_PAUSE_S)
         )
+        self.carry_codec_state = bool(config.get("fish_carry_codec_state", True))
         self.silence_rms = float(config.get("fish_silence_rms", DEFAULT_SILENCE_RMS))
         self.stall_seconds = float(config.get("fish_stall_seconds", DEFAULT_STALL_S))
         self.speed = config.get("tts_speed", 1.0)
@@ -484,6 +494,7 @@ class FishTTS:
         self._cfg = _Cfg(
             self.model_name, self.ref_audio, self.ref_text, self.temperature,
             self.top_k, self.top_p, self.max_tokens or DEFAULT_MAX_FRAMES,
+            self.carry_codec_state,
         )
 
     # --- model ---------------------------------------------------------------
@@ -506,6 +517,7 @@ class FishTTS:
             return
         if self._model is not None:
             self._driver = None
+            self._carry = None
             self._model = None
             self._model_key = None
             gc.collect()
@@ -524,30 +536,41 @@ class FishTTS:
         st = os.stat(cfg.ref_audio)
         return _Signature(
             cfg.model_name, cfg.ref_audio, cfg.ref_text, st.st_mtime_ns, st.st_size,
-            cfg.temperature, cfg.top_k, cfg.top_p, cfg.max_frames,
+            cfg.temperature, cfg.top_k, cfg.top_p, cfg.max_frames, cfg.carry,
         )
 
     def _make_driver(self, model, signature: _Signature):
         return _Drama3Driver(model, signature)
 
     def _acquire_driver(self):
-        """The driver for the current config, built (and warmed) if needed.
-        Inference thread only."""
+        """``(driver, signature)`` for the current config, built and seeded if
+        needed. Inference thread only. A stream keeps these two locals until
+        it ends, whatever ``apply_config`` does meanwhile."""
         cfg = self._cfg           # one read: never a torn config
         self._load_for(cfg)
         self._check_reference(cfg)
         sig = self._signature(cfg)
-        if self._driver is None or self._driver.signature != sig:
-            self._driver = self._make_driver(self._model, sig)
-            self._warm(self._driver)
-        return self._driver
+        drv = self._driver
+        if drv is None or drv.signature != sig:
+            if drv is not None or self._carry is not None:
+                print("[fish] carry: reset (signature changed)", flush=True)
+            self._carry = None
+            drv = self._driver = self._make_driver(self._model, sig)
+            self._warm(drv, sig)
+        return drv, sig
 
-    def _warm(self, drv) -> None:
-        """Encode the reference and cache the system-prompt prefix."""
+    def _warm(self, drv, sig: _Signature) -> None:
+        """Encode the reference, cache the system-prompt prefix, and settle the
+        codec on the voice's own speech: generate WARMUP_TEXT and throw the
+        audio and history away. Only the carry it leaves behind is kept (the
+        codec's first half-second is +5 dB hot from a cold start; ~8 s of the
+        voice's own speech warms it, silence or the reference clip does not).
+        """
         if not self.warmup:
             return
         t0 = time.monotonic()
-        for _ in drv.frames(WARMUP_TEXT, []):
+        for _ in self._run_pieces(drv, sig, self._split(WARMUP_TEXT),
+                                  self._params(drv), _Stats(), None):
             pass
         print(f"[fish] warm-up done ({time.monotonic() - t0:.1f}s)", flush=True)
 
@@ -555,6 +578,20 @@ class FishTTS:
         self._load_for(self._cfg)
         if self.warmup:
             self._acquire_driver()
+
+    def _params(self, drv, streaming_interval: float | None = None) -> "_Params":
+        interval_s = self.streaming_interval
+        if streaming_interval is not None:
+            interval_s = min(interval_s, float(streaming_interval))
+        interval = max(1, round(interval_s * drv.frame_rate))
+        return _Params(
+            first_frames=self.first_chunk_frames or interval,
+            interval=interval,
+            silence_rms=self.silence_rms,
+            stall_seconds=self.stall_seconds,
+            sentence_pause=self.sentence_pause,
+            clause_pause=self.clause_pause,
+        )
 
     def _generation_kwargs(self, text: str, voice: str | None = None,
                            streaming_interval: float | None = None) -> dict | None:
@@ -606,17 +643,10 @@ class FishTTS:
         )
         if kwargs is None:
             return
-        drv = self._acquire_driver()
+        drv, sig = self._acquire_driver()
         rs = _StreamResampler(drv.sample_rate, OUT_SAMPLE_RATE)
-        interval = max(1, round(kwargs["streaming_interval"] * drv.frame_rate))
-        params = _Params(
-            first_frames=kwargs["first_chunk_frames"] or interval,
-            interval=interval,
-            silence_rms=self.silence_rms,
-            stall_seconds=self.stall_seconds,
-            sentence_pause=self.sentence_pause,
-            clause_pause=self.clause_pause,
-        )
+        params = self._params(drv, streaming_interval)
+        start_snap = self._carry_for(sig, drv)
         pieces = self._split(kwargs["text"])
         stats = _Stats()
         print(f"[fish] generate chars={len(kwargs['text'])} "
@@ -624,7 +654,7 @@ class FishTTS:
         t_start = time.monotonic()
         n = 0
         audio_s = 0.0
-        run = self._run_pieces(drv, pieces, params, stats)
+        run = self._run_pieces(drv, sig, pieces, params, stats, start_snap)
         try:
             for raw in run:
                 out = rs.process(raw)
@@ -651,9 +681,28 @@ class FishTTS:
               f"retried={stats.retried} skipped={stats.skipped} "
               f"runaway={stats.runaway}", flush=True)
 
-    def _run_pieces(self, drv, pieces: list[str], p: "_Params", stats: "_Stats"
-                    ) -> Iterator[np.ndarray]:
+    def _carry_for(self, sig: _Signature, drv):
+        """The codec snapshot this request starts from, or None for a reset.
+        Only a carry written for this exact signature is ever restored."""
+        if not sig.carry:
+            return None
+        carry = self._carry
+        if carry is not None and carry[0] == sig:
+            pos = getattr(drv, "codec_position", None)
+            print(f"[fish] carry: restored (codec position "
+                  f"{pos() if pos else '?'})", flush=True)
+            return carry[1]
+        print("[fish] carry: reset (nothing carried)", flush=True)
+        return None
+
+    def _run_pieces(self, drv, sig: _Signature, pieces: list[str], p: "_Params",
+                    stats: "_Stats", start_snap) -> Iterator[np.ndarray]:
         """The piece loop: yields mono float32 audio at the model's rate.
+
+        The codec starts from ``start_snap`` (None = reset). After every piece
+        that ended at EOS its state is snapshotted: that is the carry for the
+        next request (tagged with ``sig``) and the restore point if a later
+        piece is skipped or cut. Nothing is ever snapshotted mid-piece.
 
         History: the first piece that ended at EOS is pinned, the previous one
         is latest; skipped and runaway pieces never enter it.
@@ -663,8 +712,11 @@ class FishTTS:
         total = len(pieces)
         chunker = _Chunker(p.first_frames, p.interval)
         pinned = latest = None
-        eos_snap = None          # codec state after the last piece that ended at EOS
-        drv.codec_reset()        # None above means "the reset state"
+        eos_snap = start_snap    # codec state after the last piece that ended at EOS
+        if start_snap is None:   # None means "the reset state"
+            drv.codec_reset()
+        else:
+            drv.codec_restore(start_snap)
         pending = None           # (quiet tail, pause seconds) owed before the next audio
 
         def restore_eos():
@@ -732,6 +784,8 @@ class FishTTS:
                         else:
                             latest = turn
                     eos_snap = drv.codec_snapshot()
+                    if sig.carry:
+                        self._carry = (sig, eos_snap)
                     pending = (np.concatenate(held)[:cap] if held and spoke else None,
                                _piece_pause(piece, p.sentence_pause, p.clause_pause))
                     break

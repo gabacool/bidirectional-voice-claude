@@ -120,6 +120,10 @@ local:
     # stalled on this piece. (Old behaviour: silence_rms 0.01.)
     silence_rms: 0.001
     stall_seconds: 3.0
+    # Each request would start the codec cold (first ~0.5 s of speech +5 dB
+    # louder: chat sends one request per sentence group, so the volume pumps).
+    # true = carry the codec state across requests. false = old cold start.
+    carry_codec_state: true
     # Clone a wav instead (BOTH keys; ref_text = exact words in the clip).
     # 44.1 kHz, 5-15 s, one speaker, quiet room. Longer clips add prefill latency.
     # ref_audio: "/Users/you/Git/nvidia_parakeet/client/voices/my_voice.wav"

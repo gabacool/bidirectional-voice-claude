@@ -4,6 +4,7 @@ The engine is driven through ``_Drama3Driver``; these tests replace it with a
 ``FakeDriver`` (scripted per-chunk levels, recorded calls) so no MLX model runs.
 """
 
+import itertools
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,6 +29,9 @@ REF = _TMP / "ref.wav"
 REF.write_bytes(b"RIFF" + b"\0" * 100)
 
 
+_SNAP_IDS = itertools.count(1)
+
+
 class FakeFrame:
     def __init__(self, rms):
         self.rms = rms
@@ -48,7 +52,7 @@ class FakeDriver:
         self.calls: list[SimpleNamespace] = []   # one per frames() call
         self.closed = 0
         self.events: list[tuple] = []            # codec reset/snapshot/restore
-        self._snaps = 0
+        self.yielded = 0                         # frames handed to the engine
 
     def frames(self, text, history, prefix=None):
         self.calls.append(SimpleNamespace(
@@ -61,6 +65,7 @@ class FakeDriver:
             for item in script:
                 rms, n = item if isinstance(item, tuple) else (item, FPC)
                 for _ in range(n):
+                    self.yielded += 1
                     yield FakeFrame(rms)
         finally:
             self.closed += 1
@@ -76,9 +81,11 @@ class FakeDriver:
     def codec_reset(self):
         self.events.append(("reset",))
 
+    def codec_position(self):
+        return 0
+
     def codec_snapshot(self):
-        self._snaps += 1
-        snap = ("snap", self._snaps)
+        snap = ("snap", next(_SNAP_IDS))           # unique across drivers
         self.events.append(("snapshot", snap))
         return snap
 
@@ -242,8 +249,9 @@ def test_missing_reference_clip_fails_clearly(tmp_path):
         tts._check_reference()
 
 
-def test_warmup_runs_one_short_generation(monkeypatch):
-    drv = FakeDriver([[(0.3, 7)], [(0.3, 7)]])
+def test_warmup_seeds_the_codec_with_the_voices_own_speech(monkeypatch):
+    pieces = fish_tts_engine.split_text(fish_tts_engine.WARMUP_TEXT, clauses=True)
+    drv = FakeDriver([[0.3] * 12 for _ in pieces] + [[0.3] * 3])
     monkeypatch.setattr("fish_tts_engine._load_model", lambda name: object())
 
     def make(self, model, sig):
@@ -253,9 +261,19 @@ def test_warmup_runs_one_short_generation(monkeypatch):
     monkeypatch.setattr(FishTTS, "_make_driver", make)
     tts = FishTTS({"fish_ref_audio": str(REF), "fish_ref_text": "x"})
     tts._ensure_model()
-    assert [c.text for c in drv.calls] == [fish_tts_engine.WARMUP_TEXT]
-    tts._ensure_model()  # idempotent
-    assert len(drv.calls) == 1
+    # The whole warm-up text runs through the normal piece loop, from a cold codec...
+    assert [c.text for c in drv.calls] == pieces
+    assert drv.signature.ref_audio == str(REF)
+    assert drv.events[0] == ("reset",) and "restore" not in drv.kinds()
+    # ...its history grows like a real request's, and only the carry is kept.
+    assert drv.calls[-1].history == [84, 84]
+    assert tts._carry == (drv.signature, _snapshots(drv)[-1])
+    tts._ensure_model()  # idempotent: same signature, no second warm-up
+    assert len(drv.calls) == len(pieces)
+    # The first real request starts from the warm carry, not a reset.
+    seed_last, n = _snapshots(drv)[-1], len(drv.events)
+    list(tts.synthesize_stream("Hello there."))
+    assert drv.events[n] == ("restore", seed_last, False)
 
 
 def test_model_swap_releases_the_old_model_before_loading_the_new(monkeypatch):
@@ -436,6 +454,161 @@ def test_runaway_babble_is_cut_once_without_resume(monkeypatch, capsys):
     assert _seconds(out) < (3 + 27 + 3) * 0.32 + 1.5
 
 
+# --- codec carry across requests, keyed invalidation --------------------------
+
+def _snapshots(drv):
+    return [e[1] for e in drv.events if e[0] == "snapshot"]
+
+
+def _write_clip(path, fill):
+    path.write_bytes(b"RIFF" + bytes([fill]) * (50 + 40 * fill))
+
+
+def test_codec_state_carried_across_requests(monkeypatch):
+    pieces = ["First piece here today.", "Second piece follows it."]
+    drv = FakeDriver([[0.3] * 3, [0.3] * 3, [0.3] * 3, [0.3] * 3])
+    tts = _loaded(driver=drv)
+    _text_pieces(monkeypatch, pieces)
+    list(tts.synthesize_stream("a"))
+    assert drv.events[0] == ("reset",)                    # nothing to carry yet
+    last_eos = _snapshots(drv)[-1]
+    n_before = len(drv.events)
+    list(tts.synthesize_stream("b"))
+    second = drv.events[n_before:]
+    assert second[0] == ("restore", last_eos, False)      # warm start, no reset
+    assert ("reset",) not in second
+
+
+def test_carry_off_resets_every_request(monkeypatch):
+    drv = FakeDriver([[0.3] * 3, [0.3] * 3])
+    tts = _loaded({"fish_carry_codec_state": False}, driver=drv)
+    _text_pieces(monkeypatch, ["Only piece here."])
+    list(tts.synthesize_stream("a"))
+    list(tts.synthesize_stream("b"))
+    assert drv.kinds().count("reset") == 2
+    assert "restore" not in drv.kinds()
+    assert tts._carry is None
+
+
+def test_aborted_request_does_not_poison_carry(monkeypatch):
+    pieces = ["First piece here today.", "Second piece follows it."]
+    drv = FakeDriver([[0.3] * 3, [0.3] * 6, [0.3] * 3])
+    tts = _loaded(driver=drv)
+    _text_pieces(monkeypatch, pieces)
+    gen = tts.synthesize_stream("a")
+    for _ in range(5):
+        next(gen)
+    assert drv.yielded > 21      # well into piece 1, which has not ended
+    gen.close()                  # client disconnect / Stop mid-piece
+    eos_snaps = _snapshots(drv)
+    assert len(eos_snaps) == 1   # only piece 0 ended at EOS
+    assert tts._carry == (drv.signature, eos_snaps[0])
+    n = len(drv.events)
+    drv.scripts[:] = [[0.3] * 3]
+    list(tts.synthesize_stream("b"))
+    assert drv.events[n] == ("restore", eos_snaps[0], False)
+
+
+def _warm_tts(monkeypatch, config=None, pieces=("Only piece here.",), pool=12):
+    """FishTTS with the warm-up seed on and a driver factory sharing one script pool."""
+    shared = [[0.3] * 3 for _ in range(pool)]
+    tts = _loaded({"fish_warmup": True, **(config or {})}, scripts=shared)
+    _text_pieces(monkeypatch, list(pieces))
+    return tts
+
+
+def test_carry_rejected_after_reference_change(monkeypatch, tmp_path):
+    tts = _warm_tts(monkeypatch)
+    list(tts.synthesize_stream("a"))
+    old = tts.made[0]
+    old_snaps = _snapshots(old)
+    assert tts._carry[0] == old.signature and old_snaps
+    other = tmp_path / "other.wav"
+    _write_clip(other, 3)
+    tts.apply_config({"fish_ref_audio": str(other), "fish_ref_text": "another voice",
+                      "fish_first_chunk_frames": FPC})
+    assert len(tts.made) == 1 and tts._driver is old       # apply_config built nothing
+    list(tts.synthesize_stream("b"))
+    new = tts.made[1]
+    assert new is not old and new.signature.ref_audio == str(other)
+    assert not any(e[0] == "restore" and e[1] in old_snaps for e in new.events)
+    assert new.events[0] == ("reset",)                     # the warm-up seed starts cold
+    assert len(new.calls) == 2                             # warm-up seed + the request
+    assert tts._carry[0] == new.signature
+
+
+def test_reference_rerecorded_in_place_invalidates_voice_and_carry(monkeypatch, tmp_path):
+    clip = tmp_path / "clip.wav"
+    _write_clip(clip, 1)
+    tts = _warm_tts(monkeypatch, {"fish_ref_audio": str(clip), "fish_ref_text": "x"},
+                    pool=20)
+    list(tts.synthesize_stream("a"))
+    first = tts.made[0]
+    list(tts.synthesize_stream("b"))
+    assert len(tts.made) == 1                              # same clip: same driver
+    _write_clip(clip, 2)                                   # re-recorded, same path
+    list(tts.synthesize_stream("c"))
+    assert len(tts.made) == 2 and tts.made[1].signature != first.signature
+    assert tts.made[1].events[0] == ("reset",)
+
+
+def test_apply_config_publishes_one_immutable_tuple():
+    tts = _loaded()
+    before = tts._cfg
+    tts.apply_config({"fish_ref_audio": "/tmp/a.wav", "fish_ref_text": "aa",
+                      "fish_warmup": False})
+    after = tts._cfg
+    assert isinstance(after, tuple) and before is not after
+    assert (after.ref_audio, after.ref_text) == ("/tmp/a.wav", "aa")
+    assert before.ref_audio == str(REF)                    # the old tuple is untouched
+    with pytest.raises(AttributeError):
+        after.ref_audio = "/tmp/b.wav"
+
+
+def test_first_chunk_not_held(monkeypatch):
+    drv = FakeDriver([[(0.3, 4), (0.3, 14)]])
+    tts = _loaded({"fish_first_chunk_frames": 4}, driver=drv)
+    _text_pieces(monkeypatch, ["Hello there."])
+    gen = tts.synthesize_stream("Hello there.")
+    first = next(gen)
+    assert drv.yielded == 4                                # no look-ahead, no hold
+    assert first.size / OUT_SAMPLE_RATE == pytest.approx(4 * SPF / 44100, abs=0.02)
+    gen.close()
+
+
+def test_config_change_during_open_stream(monkeypatch, tmp_path):
+    tts = _loaded(scripts=[[0.3] * 3, [0.3] * 6] + [[0.3] * 3 for _ in range(10)])
+    _text_pieces(monkeypatch, ["First piece here today.", "Second piece follows it."])
+    gen = tts.synthesize_stream("a")
+    next(gen)
+    old = tts.made[0]
+    carry_before, n_events = tts._carry, len(old.events)
+    other = tmp_path / "other.wav"
+    _write_clip(other, 4)
+    tts.apply_config({"fish_ref_audio": str(other), "fish_ref_text": "another voice",
+                      "fish_first_chunk_frames": FPC, "fish_warmup": False})
+    # apply_config made no driver or codec call and touched no carry.
+    assert len(tts.made) == 1 and tts._driver is old and tts._carry is carry_before
+    assert len(old.events) == n_events
+    list(gen)                                              # the stream finishes on its driver
+    assert tts._carry[0] == old.signature                  # tagged with the OLD signature
+    old_snaps = _snapshots(old)
+    list(tts.synthesize_stream("b"))
+    new = tts.made[1]
+    assert new.signature.ref_audio == str(other)
+    assert new.events[0] == ("reset",)
+    assert not any(e[0] == "restore" and e[1] in old_snaps for e in new.events)
+
+
+def test_carry_config_key_flattens():
+    from tts_client import flatten_local_tts_config
+    flat = flatten_local_tts_config(
+        {"tts_engine": "fish", "fish": {"carry_codec_state": False}})
+    assert flat["fish_carry_codec_state"] is False
+    assert FishTTS(flat).carry_codec_state is False
+    assert FishTTS({}).carry_codec_state is True
+
+
 # --- pieces, pauses, and the last word -------------------------------------
 
 from fish_tts_engine import split_text  # noqa: E402
@@ -605,7 +778,7 @@ class GuardModel:
 
 
 def _sig():
-    return fish_tts_engine._Signature("m", "/r.wav", "t", 1, 2, 0.7, 30, 0.7, 1024)
+    return fish_tts_engine._Signature("m", "/r.wav", "t", 1, 2, 0.7, 30, 0.7, 1024, True)
 
 
 def test_driver_guard_fails_loudly():
