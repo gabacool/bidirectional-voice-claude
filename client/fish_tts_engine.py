@@ -61,11 +61,31 @@ PAUSE_CAP_S = 0.6            # longest pause we ever play
 # no cache = ~10% slower and +0.05 s first audio; 4 GB ~15 ms faster first
 # audio than 2 GB.
 DEFAULT_MLX_CACHE_LIMIT_GB = 4.0
-# A piece's voiced frames are bounded by its text; babble at 0.001-0.01 RMS is
-# "voiced" now, so this is what stops a runaway (593 real pieces: 1/593 over).
 QUIET_RMS = 0.01             # the old silence line; quiet speech sits below it
-RUNAWAY_MIN_FRAMES = 96      # ~4.5 s
-RUNAWAY_FRAMES_PER_CHAR = 3.0
+# Runaway budget. Babble at 0.001-0.01 RMS counts as voiced, so a piece's
+# voiced frames are bounded by how long its text takes to say. Characters
+# are a poor ruler: "N V D A" or "142.18" take several times longer than
+# their length suggests, and a CJK character is a whole syllable. The
+# expected voiced frames come from what the text is made of, fitted on real
+# pieces (voiced frames as counted below); the budget is a slack plus a
+# factor over that. Fit on 523 normal pieces (Drama 3 4-bit, S_J clone;
+# English, spelled tickers, numbers, Chinese up to 95 chars): the worst sits
+# at 0.85 of its budget. Normal takes of one text vary up to ~1.45x, so a
+# piece that repeats itself once is cut late or not at all; a repeat-
+# detector on the semantic tokens could not tell repeats from text that
+# repeats words (spec section 2.2 step 3).
+_FRAMES_BASE = 3.7           # per piece
+_FRAMES_PER_LETTER = 1.3     # a letter of an ordinary word
+_FRAMES_PER_SPELLED = 6.3    # a letter said on its own ("N V D A", "GPU")
+_FRAMES_PER_DIGIT = 9.1      # "142.18" -> "one hundred forty two point one eight"
+_FRAMES_PER_SYMBOL = 9.0     # % $ & said as a word (few in the data: set lenient)
+_FRAMES_PER_CJK = 4.1        # one syllable per CJK character
+RUNAWAY_MIN_FRAMES = 21      # three chunks: voiced frames come in whole chunks
+RUNAWAY_FACTOR = 1.55
+_CJK_CHAR = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")
+_LONE_LETTER = re.compile(r"(?<![A-Za-z])[A-Za-z](?![A-Za-z])")
+_ACRONYM = re.compile(r"(?<![A-Za-z])[A-Z]{2,5}(?![A-Za-z])")
+_SPOKEN_SYMBOL = re.compile(r"[%$&€£¥]")
 _SEPARATOR_LINE = re.compile(r"^[\s\-_=*~#•·—–]+$")
 _BULLET = re.compile(r"^(?:[-•·*–—]+|\d{1,3}[.)])\s+")
 _TERMINATED = re.compile(r"[.!?;:…。！？；：][\"'”’)\]]*$")
@@ -182,6 +202,23 @@ def split_text(text: str, clauses: bool = False) -> list[str]:
         else:
             out.append(carry)
     return [p.strip(ck.WHITE_SPACE) for p in out if p.strip(ck.WHITE_SPACE)]
+
+
+def _expected_frames(piece: str) -> float:
+    """Voiced frames the model normally spends saying ``piece``."""
+    cjk = len(_CJK_CHAR.findall(piece))
+    spelled = (len(_LONE_LETTER.findall(piece))
+               + sum(len(m) for m in _ACRONYM.findall(piece)))
+    letters = sum(c.isascii() and c.isalpha() for c in piece) - spelled
+    digits = sum(c.isdigit() for c in piece)
+    return (_FRAMES_BASE + _FRAMES_PER_LETTER * letters + _FRAMES_PER_SPELLED * spelled
+            + _FRAMES_PER_DIGIT * digits + _FRAMES_PER_CJK * cjk
+            + _FRAMES_PER_SYMBOL * len(_SPOKEN_SYMBOL.findall(piece)))
+
+
+def _runaway_budget(piece: str, max_frames: int) -> int:
+    """Voiced frames past which a piece is a runaway."""
+    return min(max_frames, int(RUNAWAY_MIN_FRAMES + RUNAWAY_FACTOR * _expected_frames(piece)))
 
 
 def _piece_pause(piece: str, sentence_s: float, clause_s: float) -> float:
@@ -803,8 +840,7 @@ class FishTTS:
 
         for idx, piece in enumerate(pieces):
             history = [t for t in (pinned, latest) if t is not None]
-            budget = min(drv.max_frames,
-                         int(RUNAWAY_MIN_FRAMES + RUNAWAY_FRAMES_PER_CHAR * len(piece)))
+            budget = _runaway_budget(piece, drv.max_frames)
             where = f"piece {idx}/{total}"
             shown = f"text={repr(piece)[:200]}"
             left = p.stall_attempts      # re-generations still allowed for this piece

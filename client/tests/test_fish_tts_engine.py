@@ -271,7 +271,7 @@ def test_missing_reference_clip_fails_clearly(tmp_path):
 
 def test_warmup_seeds_the_codec_with_the_voices_own_speech(monkeypatch):
     pieces = fish_tts_engine.split_text(fish_tts_engine.WARMUP_TEXT, clauses=True)
-    drv = FakeDriver([[0.3] * 12 for _ in pieces] + [[0.3] * 3])
+    drv = FakeDriver([[0.3] * 3 for _ in pieces] + [[0.3] * 3])
     monkeypatch.setattr("fish_tts_engine._load_model", lambda name: object())
 
     def make(self, model, sig):
@@ -286,7 +286,7 @@ def test_warmup_seeds_the_codec_with_the_voices_own_speech(monkeypatch):
     assert drv.signature.ref_audio == str(REF)
     assert drv.events[0] == ("reset",) and "restore" not in drv.kinds()
     # ...its history grows like a real request's, and only the carry is kept.
-    assert drv.calls[-1].history == [84, 84]
+    assert drv.calls[-1].history == [21, 21]
     assert tts._carry == (drv.signature, _snapshots(drv)[-1])
     tts._ensure_model()  # idempotent: same signature, no second warm-up
     assert len(drv.calls) == len(pieces)
@@ -460,8 +460,9 @@ def test_watchdog_gives_up_after_one_retry(monkeypatch):
 def test_natural_pauses_are_kept_but_capped(monkeypatch):
     drv = FakeDriver([[0.3] * 3 + [0.0] * 4 + [0.3] * 3])    # 1.28s pause
     tts = _loaded(driver=drv)
-    _text_pieces(monkeypatch, ["Hi. There."])
-    out = list(tts.synthesize_stream("Hi. There."))
+    text = "Hi there, and then after a pause the rest of it."
+    _text_pieces(monkeypatch, [text])
+    out = list(tts.synthesize_stream(text))
     assert len(drv.calls) == 1
     total = _seconds(out)
     assert 6 * 0.32 + 0.4 < total < 6 * 0.32 + 0.8
@@ -473,16 +474,18 @@ def test_quiet_speech_inside_piece_is_played_in_full(monkeypatch):
     # 1.28 s of quiet speech (RMS 0.005) between two words: all of it plays.
     # (The 0.01 threshold cut it to the 0.6 s pause cap and lost words.)
     script = [0.3] * 3 + [0.005] * 4 + [0.3] * 3
-    tts, drv = _paced(monkeypatch, ["Hi. There."], [script])
-    out = list(tts.synthesize_stream("Hi. There."))
+    text = "Hi there, and then quietly the middle and the rest."
+    tts, drv = _paced(monkeypatch, [text], [script])
+    out = list(tts.synthesize_stream(text))
     assert len(drv.calls) == 1
     assert abs(_seconds(out) - 10 * 0.32) < 0.03
 
 
 def test_quiet_speech_never_counts_as_stall(monkeypatch, capsys):
     # 4 s at RMS 0.005, then EOS: not a stall, no extra generation, all played.
-    tts, drv = _paced(monkeypatch, ["Hello there."], [[0.005] * 13])
-    out = list(tts.synthesize_stream("Hello there."))
+    text = "Hello there, this whole sentence is spoken quietly to the very end."
+    tts, drv = _paced(monkeypatch, [text], [[0.005] * 13])
+    out = list(tts.synthesize_stream(text))
     assert len(drv.calls) == 1
     assert abs(_seconds(out) - 13 * 0.32) < 0.03
     log = capsys.readouterr().out
@@ -528,13 +531,15 @@ def test_new_config_keys_flatten():
 def test_runaway_babble_is_cut_once_without_resume(monkeypatch, capsys):
     pieces = ("Alpha one is fine here ok.", "This second piece babbles on.",
               "Omega three is fine too.")
-    # Piece 1: 40 quiet voiced chunks = 280 frames > its budget (96 + 3 * 29).
+    # Piece 1: 40 quiet voiced chunks = 280 frames, far over its budget.
     scripts = [[0.3] * 3, [0.005] * 40, [0.3] * 3]
     tts, drv = _paced(monkeypatch, pieces, scripts)
     out = list(tts.synthesize_stream(" ".join(pieces)))
     log = capsys.readouterr().out
     assert log.count("ERROR runaway") == 1
-    assert "budget 183" in log and "text='This second piece babbles on.'" in log
+    budget = fish_tts_engine._runaway_budget(pieces[1], 1024)
+    assert budget < 280 and f"budget {budget})" in log
+    assert "text='This second piece babbles on.'" in log
     assert [c.text for c in drv.calls] == list(pieces)    # no resume, no retry
     # The codec went back to the state after the last piece that ended at EOS.
     assert ("restore", drv.snap_before_call(1), False) in drv.events
@@ -544,6 +549,40 @@ def test_runaway_babble_is_cut_once_without_resume(monkeypatch, capsys):
     assert "quiet_dropped_s=0.3" in log           # the one babble chunk that was cut
     # Voiced audio up to the budget was played, the rest cut: far short of 40 chunks.
     assert _seconds(out) < (3 + 27 + 3) * 0.32 + 1.5
+
+
+@pytest.mark.parametrize("piece, longest_normal, runaway", [
+    # Real model, 15 takes each: the longest normal take's voiced frames, and
+    # the voiced frames of a take that repeated itself (STT-confirmed).
+    ("Volatility, the V I X,", 67, 102),             # "Volatility: The VIX." twice
+    ("closed at 19.99, crude at 99.39 dollars,", 126, 196),
+    ("N V D A up 2.3 percent to 142.18,", 116, 200),  # gate: the number three times
+])
+def test_runaway_budget_fits_normal_takes_and_cuts_repeats(piece, longest_normal, runaway):
+    budget = fish_tts_engine._runaway_budget(piece, 1024)
+    assert longest_normal < budget < runaway
+
+
+def test_runaway_budget_follows_how_text_is_spoken():
+    exp = fish_tts_engine._expected_frames
+    # Same length, very different speech: spelled letters and digits cost more.
+    assert exp("N V D A up 2.3 percent to 142.18,") > 1.8 * exp("Nvidia rose a bit to its old highs.")
+    # A CJK character is a syllable (4.3 voiced frames/char measured, 4.9 max).
+    assert exp("今" * 50) > 4 * 50
+
+
+def test_long_cjk_piece_is_not_cut(monkeypatch, capsys):
+    # 95 CJK characters fit in one piece (300 bytes). At the slowest rate
+    # measured on real Chinese (4.89 voiced frames/char) a 90-char sentence
+    # is 441 voiced frames: the old 96 + 3 x chars budget (366) cut it.
+    piece = ("在人工智能训练和推理需求持续增长的背景下数据中心对高带宽存储器的采购规模不断扩大而供应端新"
+             "增产能的释放却需要至少两年时间所以价格在短期内仍然可能维持在较高的水平上而且这种情况可能。")
+    assert len(piece) == 90
+    tts, drv = _paced(monkeypatch, [piece], [[0.3] * 63])      # 441 voiced frames
+    out = list(tts.synthesize_stream(piece))
+    log = capsys.readouterr().out
+    assert "runaway=0" in log and len(drv.calls) == 1
+    assert abs(_seconds(out) - 63 * 0.32) < 0.05
 
 
 # --- codec carry across requests, keyed invalidation --------------------------

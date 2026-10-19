@@ -800,14 +800,14 @@ def g13(fe, tts, long_text) -> Row:
 
     tts._make_driver = make
     tts._driver = None
-    old = fe.RUNAWAY_FRAMES_PER_CHAR
-    fe.RUNAWAY_FRAMES_PER_CHAR = 0.5
+    old = fe.RUNAWAY_FACTOR
+    fe.RUNAWAY_FACTOR = 0.8          # under a normal take: forces runaways
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
             audio = np.concatenate(list(tts.synthesize_stream(long_text)))
     finally:
-        fe.RUNAWAY_FRAMES_PER_CHAR = old
+        fe.RUNAWAY_FACTOR = old
         del tts._make_driver
         tts._driver = None
     log = buf.getvalue()
