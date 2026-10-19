@@ -204,6 +204,28 @@ def _load_model(name: str):
     return load_model(name)
 
 
+def _silent_tail(raw: np.ndarray, n_frames: int, threshold: float) -> int:
+    """How many of a decoded chunk's last frames hold no sound of their own.
+
+    A frame is silent when its audio after the first quarter is below
+    ``threshold``. The first quarter is skipped because the frame after a
+    word carries the codec's overlap-add tail of that word there (measured
+    0.0004-0.009 RMS over the frame, ~0 after it): that is the old word
+    ending, not new sound. May be all ``n_frames`` (a chunk that is only
+    the tail of the previous one).
+    """
+    if n_frames <= 0 or raw.size < n_frames:
+        return 0
+    spf = raw.size // n_frames
+    k = 0
+    for i in range(n_frames - 1, -1, -1):
+        body = raw[i * spf + spf // 4:(i + 1) * spf]
+        if body.size and float(np.sqrt(np.mean(np.square(body)))) >= threshold:
+            break
+        k += 1
+    return k
+
+
 def _collect(frames, sink: list) -> Iterator:
     """Pass frames through, recording each in ``sink`` (the piece's codes)."""
     for frame in frames:
@@ -789,7 +811,7 @@ class FishTTS:
             used = 0
             spoke = False                # any voiced chunk, in any attempt
             content: list = []           # this piece's frames so far (prefix + new)
-            prefix_len = 0               # of `content`: through the last voiced chunk
+            prefix_len = 0               # of `content`: through the last frame with sound
             voiced = 0                   # voiced frames in `content`
             voiced_snap = None           # codec state after the last voiced chunk
             held: list[np.ndarray] = []  # silent chunks since the last voiced one
@@ -826,7 +848,12 @@ class FishTTS:
                             silent_s = 0.0
                             parts.append(raw)
                             spoke = True
-                            prefix_len = len(content)
+                            # The resume prefix ends at the last frame with
+                            # sound: silent frames at its end tell the model
+                            # the word is over, and it skips the rest of it.
+                            quiet = _silent_tail(raw, len(chunk), p.silence_rms)
+                            if quiet < len(chunk):
+                                prefix_len = len(content) - quiet
                             voiced_snap = drv.codec_snapshot()
                         else:
                             held.append(raw)

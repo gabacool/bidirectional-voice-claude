@@ -33,8 +33,11 @@ _SNAP_IDS = itertools.count(1)
 
 
 class FakeFrame:
-    def __init__(self, rms):
+    def __init__(self, rms, tail_only=False):
         self.rms = rms
+        # Sound only in the frame's first quarter, like the codec's overlap
+        # tail of a word in the frame that follows it.
+        self.tail_only = tail_only
 
 
 class FakeDriver:
@@ -64,15 +67,18 @@ class FakeDriver:
         script = self.scripts.pop(0) if self.scripts else []
         try:
             for item in script:
-                rms, n = item if isinstance(item, tuple) else (item, FPC)
+                rms, n, *flags = item if isinstance(item, tuple) else (item, FPC)
                 for _ in range(n):
                     self.yielded += 1
-                    yield FakeFrame(rms)
+                    yield FakeFrame(rms, tail_only="tail" in flags)
         finally:
             self.closed += 1
 
     def decode(self, frames):
         rms = np.repeat([f.rms for f in frames], SPF)
+        for i, f in enumerate(frames):
+            if f.tail_only:
+                rms[i * SPF + SPF // 4:(i + 1) * SPF] = 0.0
         t = np.arange(rms.size) / self.sample_rate
         return (rms * np.sqrt(2) * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
 
@@ -764,6 +770,28 @@ def test_stall_after_speech_resumes_in_place(monkeypatch):
     # words, pause, C. Nothing repeated.
     expected = 3 * 0.32 + 0.5 + 3 * 0.32 + 0.6 + 2 * 0.32 + 0.5 + 3 * 0.32
     assert abs(_seconds(out) - expected) < 0.06
+
+
+def test_resume_prefix_ends_at_the_last_frame_with_sound(monkeypatch):
+    # The model went quiet 3 frames into a chunk: that chunk is voiced (it is
+    # played), but its 4 silent frames must not reach the prefix. Measured on
+    # the real model: with 7 trailing silent frames the resumed piece skipped
+    # words or ended at once; cut at the last sound it continued correctly.
+    scripts = [[(0.3, 10), (0.0, 74)], [0.3] * 2]
+    tts, drv = _paced(monkeypatch, [P_B], scripts)
+    list(tts.synthesize_stream("x"))
+    assert [c.prefix_len for c in drv.calls] == [0, 10]
+
+
+def test_resume_prefix_skips_a_chunk_that_is_only_the_codec_tail(monkeypatch):
+    # After a word cut mid-way the next chunk's first frame carries the
+    # codec's overlap tail of that word (sound in its first quarter only) and
+    # can read as voiced. It holds no new sound: the prefix keeps ending at
+    # the word's last frame, 14, not at 21.
+    scripts = [[(0.3, 14), (0.02, 1, "tail"), (0.0, 80)], [0.3] * 2]
+    tts, drv = _paced(monkeypatch, [P_B], scripts)
+    list(tts.synthesize_stream("x"))
+    assert [c.prefix_len for c in drv.calls] == [0, 14]
 
 
 def test_resumed_turn_is_prefix_plus_resumed_frames(monkeypatch):
