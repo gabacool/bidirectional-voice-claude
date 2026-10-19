@@ -34,6 +34,20 @@ local:
   # engines that play inside the job (not fish) are not timed.
   stall_slack_seconds: 30
   stall_auto_restart: false         # true = on a stall, exit so launchd restarts the API
+  # Two-level queue on the single TTS worker. POST /synthesize and
+  # /v1/audio/speech honor the header "X-Voice-Priority: batch"; anything else
+  # (including no header, which is what every existing client sends) is
+  # interactive and always runs first. Nothing is preempted: a running job
+  # finishes. A batch request still queued after queue_wait_max_seconds gets
+  # 503 + Retry-After (no audio was generated; safe to retry).
+  queue_wait_max_seconds: 90
+  # The three stall checks, one [stall] log tag: (1) fish engine SILENCE_ABORT_S=3
+  # skips a silent piece and continues inside the job; (2) stall_seconds: a job
+  # that reports chunks (synthesize, speech, Fish Option+S) and produces no new
+  # audio for this long is aborted, the HTTP request fails at once and the worker
+  # is released (time blocked on a slow client counts as progress); (3) the
+  # length budget above (stall_slack_seconds) only warns.
+  stall_seconds: 20
 
   # Playback shared by every TTS engine
   tts_speed: 1.0                    # Playback speed, pitch preserved (1.0 normal, 1.5 faster)

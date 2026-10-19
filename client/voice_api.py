@@ -24,6 +24,11 @@ Endpoints (bound to 0.0.0.0 — LAN only, no auth):
                         16-bit; "wav" prepends a streaming WAV header, "pcm" is
                         raw 16-bit LE PCM
 
+                     Both accept header "X-Voice-Priority: batch" (anything else,
+                     or no header, = interactive): batch waits behind interactive
+                     jobs and gets 503 + Retry-After if still queued after
+                     local.queue_wait_max_seconds.
+
   GET  /health       -> "ok tts=<engine> voice=<name>"   (exact text; clients match it)
 
   GET  /status       -> JSON: TTS queue depth (total + by endpoint), the job on
@@ -46,6 +51,7 @@ Run:  python voice_api.py            (port from config.yaml: local.voice_api_por
 
 import io
 import json
+import math
 import os
 import queue
 import re
@@ -58,8 +64,10 @@ import tempfile
 import threading
 import time
 import wave
+from collections import deque
 from collections.abc import Callable, Iterator
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
+from concurrent.futures import wait as futures_wait
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -114,118 +122,380 @@ def stall_budget_s(chars: int, slack_s: float = DEFAULT_STALL_SLACK_S) -> float:
     return (chars / STALL_CHARS_PER_S) / STALL_REALTIME + slack_s
 
 
-class JobTracker:
-    """What runs on (and waits for) the single TTS inference thread.
+def estimated_work_s(chars: int) -> float:
+    """The stall model without slack: how long ``chars`` characters should take."""
+    return (chars / STALL_CHARS_PER_S) / STALL_REALTIME
 
-    Every TTS job is submitted through ``submit`` so /status can report the
-    queue by endpoint, the current job, and the last success. A job with
-    ``stall_watch`` arms a timer for its length-based budget when it starts;
-    if it is still running when the timer fires, a [stall] warning is logged
-    and, only with ``auto_restart``, the process exits for launchd to restart.
+
+# Two-level queue: a request may send ``X-Voice-Priority: batch`` to /synthesize
+# or /v1/audio/speech; anything else (including no header) is interactive.
+PRIORITY_HEADER = 'X-Voice-Priority'
+PRIORITY_INTERACTIVE = "interactive"
+PRIORITY_BATCH = "batch"
+DEFAULT_QUEUE_WAIT_MAX_S = 90.0
+# A job that reports chunks and then produces no new audio for this long is
+# aborted (see JobTracker._watch).
+DEFAULT_STALL_S = 20.0
+
+
+def parse_priority(value: str | None) -> str:
+    """``batch`` (any case, surrounding space ignored) -> batch; anything else -> interactive."""
+    if isinstance(value, str) and value.strip().lower() == PRIORITY_BATCH:
+        return PRIORITY_BATCH
+    return PRIORITY_INTERACTIVE
+
+
+class QueueWaitExceeded(Exception):
+    """A batch job waited in the queue longer than queue_wait_max: no audio was generated."""
+
+    def __init__(self, waited_s: float, retry_after_s: int):
+        self.waited_s = float(waited_s)
+        self.retry_after_s = int(retry_after_s)
+        super().__init__(
+            f"TTS queue busy: batch request waited {waited_s:.0f}s without starting; "
+            f"retry in about {retry_after_s}s")
+
+
+class GenerationStalled(Exception):
+    """A running job produced no new audio for stall_seconds and was aborted."""
+
+
+class _Job:
+    """One queued unit of work (internal to JobTracker)."""
+
+    __slots__ = ("id", "executor", "endpoint", "chars", "fn", "args", "priority",
+                 "stall_watch", "progress", "on_abort", "future", "enqueued",
+                 "counted", "wait_timer")
+
+    def __init__(self, **kw):
+        self.wait_timer = None
+        self.counted = True
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+class JobTracker:
+    """The two-level queue in front of the single TTS inference thread.
+
+    Every TTS job is submitted through ``submit``. JobTracker keeps its own two
+    FIFO deques (interactive, batch) and hands the executor at most ONE job at a
+    time; the next one is dispatched from the finished job's ``finally`` on the
+    worker, so the oldest interactive job always goes first and batch runs only
+    when no interactive job is queued. Nothing is preempted: a job on the worker
+    runs to its own end (or its own abort). ``submit`` returns the job's own
+    Future (not the executor's), which can be cancelled while queued.
+
+    /status reports the queue by endpoint (both levels together), the current
+    job and the last success.
+
+    One watchdog per running job (a single Timer, re-armed to the nearest
+    pending deadline, one ``[stall]`` log tag) enforces two thresholds:
+      * no-progress (jobs submitted with ``progress=True``): no new audio chunk
+        (and no time spent blocked on a slow client) for ``stall_s`` -> log,
+        fail the job future with GenerationStalled so the HTTP handler returns
+        at once, and call ``on_abort``; if the same job still holds the worker
+        ``stall_s`` later, log again and (only with ``auto_restart``) restart.
+      * length budget ((chars/15)/2 + slack, jobs with ``stall_watch``):
+        warning only (exit only with ``auto_restart``), fires once.
+    A third check lives in the fish engine and is deliberately NOT here:
+    SILENCE_ABORT_S=3 sees chunk *content* (RMS) that this watchdog never
+    receives, because fish holds silent chunks back, and it recovers within the
+    job (skips the piece and continues). It only ever fires earlier than the
+    no-progress check and never conflicts with it.
+
+    A batch job still queued after ``queue_wait_max_s`` is removed and its
+    future fails with QueueWaitExceeded (event-driven: one Timer per batch job).
     """
 
     def __init__(self, slack_s: float = DEFAULT_STALL_SLACK_S,
                  auto_restart: bool = False, restart: Callable[[], None] | None = None,
                  clock: Callable[[], float] = time.time,
-                 mono: Callable[[], float] = time.monotonic):
+                 mono: Callable[[], float] = time.monotonic,
+                 queue_wait_max_s: float = DEFAULT_QUEUE_WAIT_MAX_S,
+                 stall_s: float = DEFAULT_STALL_S):
         self.slack_s = float(slack_s)
         self.auto_restart = bool(auto_restart)
+        self.queue_wait_max_s = float(queue_wait_max_s)
+        self.stall_s = float(stall_s)
         self._restart = restart or (lambda: os._exit(STALL_EXIT_CODE))
         self._clock = clock
         self._mono = mono
         self._lock = threading.Lock()
         self._queued: dict[str, int] = {}
+        self._interactive: deque[_Job] = deque()
+        self._batch: deque[_Job] = deque()
+        self._busy = False                 # a job is dispatched or running
+        self._inflight: _Job | None = None  # dispatched, not yet started
         self._current: dict | None = None
         self._last_success: float | None = None
         self._next_id = 0
 
+    # -- submission and dispatch ------------------------------------------------
+
     def submit(self, executor: ThreadPoolExecutor, endpoint: str, chars: int,
-               fn: Callable, *args, stall_watch: bool = True) -> Future:
-        """``executor.submit(fn, *args)``, tracked. ``fn`` returning False = failed."""
+               fn: Callable, *args, stall_watch: bool = True,
+               priority: str = PRIORITY_INTERACTIVE, progress: bool = False,
+               on_abort: Callable[[], None] | None = None) -> Future:
+        """Queue ``fn(*args)`` for the worker. ``fn`` returning False = failed."""
+        batch = priority == PRIORITY_BATCH
         with self._lock:
             self._next_id += 1
-            job_id = self._next_id
+            job = _Job(id=self._next_id, executor=executor, endpoint=endpoint,
+                       chars=int(chars), fn=fn, args=args,
+                       priority=PRIORITY_BATCH if batch else PRIORITY_INTERACTIVE,
+                       stall_watch=stall_watch, progress=progress,
+                       on_abort=on_abort, future=Future(),
+                       enqueued=self._mono())
             self._queued[endpoint] = self._queued.get(endpoint, 0) + 1
+            (self._batch if batch else self._interactive).append(job)
+            if batch and self.queue_wait_max_s > 0:
+                timer = threading.Timer(self.queue_wait_max_s, self._expire, (job,))
+                timer.daemon = True
+                job.wait_timer = timer
+                timer.start()
+        job.future.add_done_callback(lambda f, j=job: self._on_future_done(j, f))
+        self._pump()
+        return job.future
 
-        def run():
+    def _on_future_done(self, job: _Job, f: Future) -> None:
+        if not f.cancelled():
+            return
+        with self._lock:              # cancelled before it started: leave the queue now
+            for dq in (self._interactive, self._batch):
+                try:
+                    dq.remove(job)
+                except ValueError:
+                    pass
+            self._drop_wait_timer(job)
+            self._uncount(job)
+
+    def _uncount(self, job: _Job) -> None:
+        if not job.counted:
+            return
+        job.counted = False
+        n = self._queued.get(job.endpoint, 0) - 1
+        if n > 0:
+            self._queued[job.endpoint] = n
+        else:
+            self._queued.pop(job.endpoint, None)
+
+    @staticmethod
+    def _drop_wait_timer(job: _Job) -> None:
+        timer, job.wait_timer = job.wait_timer, None
+        if timer is not None:
+            timer.cancel()
+
+    def _pop_next_locked(self) -> _Job | None:
+        for dq in (self._interactive, self._batch):
+            while dq:
+                job = dq.popleft()
+                self._drop_wait_timer(job)
+                if job.future.cancelled():
+                    self._uncount(job)
+                    continue
+                return job
+        return None
+
+    def _pump(self) -> None:
+        """Dispatch the next queued job unless one is already dispatched/running."""
+        while True:
+            with self._lock:
+                if self._busy:
+                    return
+                job = self._pop_next_locked()
+                if job is None:
+                    return
+                self._busy = True
+                self._inflight = job
+            try:
+                job.executor.submit(self._run_job, job)
+                return
+            except BaseException as exc:   # executor shut down: fail this job, keep draining
+                with self._lock:
+                    self._busy = False
+                    self._inflight = None
+                    self._uncount(job)
+                self._finish(job.future, exc=exc)
+
+    @staticmethod
+    def _finish(future: Future, result=None, exc: BaseException | None = None) -> None:
+        # An abort or queue-wait expiry may have finished the future already.
+        try:
+            if exc is not None:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+        except InvalidStateError:
+            pass
+
+    def _run_job(self, job: _Job) -> None:
+        """Runs on the worker thread."""
+        try:
+            # False = cancelled between dispatch and start (e.g. the worker was
+            # briefly held by a foreign job): skip it, the finally dispatches on.
+            if not job.future.set_running_or_notify_cancel():
+                with self._lock:
+                    self._uncount(job)
+                return
             now = self._mono()
             with self._lock:
-                self._unqueue(endpoint)
-                self._current = {"id": job_id, "endpoint": endpoint,
-                                 "chars": int(chars), "started": now,
-                                 "last_chunk": None, "blocked_s": 0.0,
-                                 "timer": None}
-            if stall_watch:
-                self._arm(job_id, stall_budget_s(chars, self.slack_s))
+                self._uncount(job)
+                self._inflight = None
+                self._current = {"id": job.id, "endpoint": job.endpoint,
+                                 "chars": job.chars, "started": now,
+                                 "last_chunk": None, "last_progress": now,
+                                 "blocked_s": 0.0, "timer": None, "job": job,
+                                 "aborted": False, "abort_t": 0.0,
+                                 "second_done": False, "budget_fired": False}
+                self._schedule_watch_locked(self._current)
             ok = False
+            result = exc = None
             try:
-                result = fn(*args)
+                result = job.fn(*job.args)
                 ok = result is not False
-                return result
-            finally:
-                with self._lock:
-                    cur, self._current = self._current, None
-                    if ok:
-                        self._last_success = self._clock()
-                if cur is not None and cur["timer"] is not None:
-                    cur["timer"].cancel()
+            except BaseException as e:  # noqa: BLE001 - relayed to the submitter
+                exc = e
+            with self._lock:
+                cur, self._current = self._current, None
+                if ok and not cur["aborted"]:
+                    self._last_success = self._clock()
+            if cur["timer"] is not None:
+                cur["timer"].cancel()
+            self._finish(job.future, result=result, exc=exc)
+        finally:
+            with self._lock:
+                self._busy = False
+                self._inflight = None
+            self._pump()
 
-        future = executor.submit(run)
+    # -- queue-wait limit ---------------------------------------------------------
 
-        def _done(f: Future) -> None:
-            if f.cancelled():          # never started: it left the queue here
-                with self._lock:
-                    self._unqueue(endpoint)
-        future.add_done_callback(_done)
-        return future
-
-    def _unqueue(self, endpoint: str) -> None:
-        n = self._queued.get(endpoint, 0) - 1
-        if n > 0:
-            self._queued[endpoint] = n
-        else:
-            self._queued.pop(endpoint, None)
-
-    def _arm(self, job_id: int, delay_s: float) -> None:
-        timer = threading.Timer(max(delay_s, 0.0), self._stalled, (job_id,))
-        timer.daemon = True
+    def _expire(self, job: _Job) -> None:
+        """Timer: a batch job waited too long without being dispatched."""
         with self._lock:
-            if self._current is None or self._current["id"] != job_id:
-                return
-            self._current["timer"] = timer
-            timer.start()
+            try:
+                self._batch.remove(job)
+            except ValueError:
+                return                # dispatched or cancelled meanwhile
+            job.wait_timer = None
+            self._uncount(job)
+            now = self._mono()
+            ahead = 0.0
+            cur = self._current
+            if cur is not None:
+                working = now - cur["started"] - cur["blocked_s"]
+                ahead += max(0.0, estimated_work_s(cur["chars"]) - working)
+            if self._inflight is not None:
+                ahead += estimated_work_s(self._inflight.chars)
+            for q in (self._interactive, self._batch):
+                ahead += sum(estimated_work_s(j.chars) for j in q)
+            retry_after = max(1, math.ceil(ahead))
+            waited = now - job.enqueued
+        print(f"{log_ts()} [queue] batch {job.endpoint} chars={job.chars} "
+              f"waited {waited:.1f}s > queue_wait_max {self.queue_wait_max_s:.0f}s: "
+              f"503 Retry-After={retry_after}", file=sys.stderr, flush=True)
+        self._finish(job.future, exc=QueueWaitExceeded(waited, retry_after))
+
+    # -- progress reports from the running job -----------------------------------------
 
     def note_wait(self, seconds: float) -> None:
-        """Time the producer sat blocked on a slow client: not a stall."""
+        """Time the producer sat blocked on a slow client: not a stall, and progress."""
         with self._lock:
             if self._current is not None:
                 self._current["blocked_s"] += seconds
+                self._current["last_progress"] = self._mono()
 
     def note_chunk(self) -> None:
         with self._lock:
             if self._current is not None:
-                self._current["last_chunk"] = self._mono()
+                now = self._mono()
+                self._current["last_chunk"] = now
+                self._current["last_progress"] = now
 
-    def _stalled(self, job_id: int) -> None:
+    # -- the watchdog -------------------------------------------------------------------
+
+    def _next_delay_locked(self, cur: dict, now: float) -> float | None:
+        job = cur["job"]
+        delays = []
+        if job.progress and self.stall_s > 0:
+            if not cur["aborted"]:
+                delays.append(cur["last_progress"] + self.stall_s - now)
+            elif not cur["second_done"]:
+                delays.append(cur["abort_t"] + self.stall_s - now)
+        if job.stall_watch and not cur["budget_fired"]:
+            busy = now - cur["started"] - cur["blocked_s"]
+            delays.append(stall_budget_s(cur["chars"], self.slack_s) - busy)
+        return max(min(delays), 0.0) if delays else None
+
+    def _schedule_watch_locked(self, cur: dict) -> None:
+        delay = self._next_delay_locked(cur, self._mono())
+        if delay is None:
+            return
+        timer = threading.Timer(delay, self._watch, (cur["id"],))
+        timer.daemon = True
+        cur["timer"] = timer
+        timer.start()
+
+    def _watch(self, job_id: int) -> None:
+        eps = 1e-3
+        actions: list[tuple] = []
         with self._lock:
             cur = self._current
             if cur is None or cur["id"] != job_id:
                 return
+            job = cur["job"]
             now = self._mono()
             age = now - cur["started"]
             busy = age - cur["blocked_s"]
-            quiet = None if cur["last_chunk"] is None else now - cur["last_chunk"]
-        budget = stall_budget_s(cur["chars"], self.slack_s)
-        if busy < budget:
-            # Part of the time went to waiting on the client: check again
-            # once the remaining working time is used up.
-            self._arm(job_id, budget - busy)
-            return
-        quiet_txt = "no chunk yet" if quiet is None else f"last chunk {quiet:.1f}s ago"
-        print(f"{log_ts()} [stall] {cur['endpoint']} chars={cur['chars']} "
-              f"running {age:.1f}s (working {busy:.1f}s) > budget {budget:.1f}s "
-              f"({quiet_txt})",
-              file=sys.stderr, flush=True)
+            if job.progress and self.stall_s > 0:
+                if not cur["aborted"]:
+                    quiet = now - cur["last_progress"]
+                    if quiet >= self.stall_s - eps:
+                        cur["aborted"] = True
+                        cur["abort_t"] = now
+                        actions.append(("abort", quiet))
+                elif not cur["second_done"] and now - cur["abort_t"] >= self.stall_s - eps:
+                    cur["second_done"] = True
+                    actions.append(("blocked", now - cur["abort_t"]))
+            if job.stall_watch and not cur["budget_fired"]:
+                budget = stall_budget_s(cur["chars"], self.slack_s)
+                if busy >= budget - eps:
+                    cur["budget_fired"] = True
+                    chunk_quiet = (None if cur["last_chunk"] is None
+                                   else now - cur["last_chunk"])
+                    actions.append(("budget", age, busy, budget, chunk_quiet))
+            self._schedule_watch_locked(cur)
+            endpoint, chars = cur["endpoint"], cur["chars"]
+        for act in actions:
+            kind = act[0]
+            if kind == "abort":
+                quiet = act[1]
+                print(f"{log_ts()} [stall] {endpoint} chars={chars} no audio for "
+                      f"{quiet:.1f}s >= stall {self.stall_s:.0f}s: aborting",
+                      file=sys.stderr, flush=True)
+                self._finish(job.future, exc=GenerationStalled(
+                    f"no audio for {quiet:.1f}s (stall limit {self.stall_s:.0f}s); "
+                    f"generation aborted"))
+                if job.on_abort is not None:
+                    try:
+                        job.on_abort()
+                    except Exception as e:  # noqa: BLE001 - never let the timer die
+                        print(f"{log_ts()} [stall] on_abort failed: {e}",
+                              file=sys.stderr, flush=True)
+            elif kind == "blocked":
+                print(f"{log_ts()} [stall] {endpoint} chars={chars} worker still "
+                      f"blocked {act[1]:.1f}s after abort", file=sys.stderr, flush=True)
+                self._maybe_restart()
+            else:
+                _, age, busy, budget, chunk_quiet = act
+                quiet_txt = ("no chunk yet" if chunk_quiet is None
+                             else f"last chunk {chunk_quiet:.1f}s ago")
+                print(f"{log_ts()} [stall] {endpoint} chars={chars} "
+                      f"running {age:.1f}s (working {busy:.1f}s) > budget {budget:.1f}s "
+                      f"({quiet_txt})", file=sys.stderr, flush=True)
+                self._maybe_restart()
+
+    def _maybe_restart(self) -> None:
         if self.auto_restart:
             print(f"{log_ts()} [stall] stall_auto_restart on: exiting for launchd",
                   file=sys.stderr, flush=True)
@@ -577,7 +847,10 @@ def run_generator_on(
       * with ``cancelled`` (e.g. "has the HTTP client hung up?") the consumer
         polls it every ``CANCEL_POLL_S`` while waiting — including while the job
         is still queued behind others — and before handing over each chunk, and
-        raises ``ClientDisconnected`` once it is true. The producer checks it
+        raises ``ClientDisconnected`` once it is true. The consumer always polls
+        (``cancelled`` or not): if the job future finishes without the producer
+        feeding it (queue-wait expiry, watchdog abort, refused by the executor)
+        its exception is raised here, or the stream ends. The producer checks it
         too, before the model starts and after every chunk, so a job whose
         client left while it was queued never generates at all, and a running
         one stops within one chunk. ``cancelled`` must be safe to call from
@@ -593,8 +866,9 @@ def run_generator_on(
             (``JobTracker`` routing). The producer returns True only when the
             stream ran to its end.
         on_chunk: Optional callback on the inference thread after each chunk.
-        on_wait: Optional callback with the seconds the producer just spent
-            blocked on a full hand-off queue (a client reading at its own pace).
+        on_wait: Optional callback with each increment of seconds the producer
+            spent blocked on a full hand-off queue (a client reading at its own
+            pace), called every 0.1s tick while blocked, not once at the end.
 
     Yields:
         The chunks produced by ``gen_factory()``, in order.
@@ -605,16 +879,23 @@ def run_generator_on(
     def _put(item: object) -> bool:
         # Block for space, but wake every 0.1s to honour an early-stop request so
         # a full queue can never wedge the producer after the consumer is gone.
-        t0 = time.monotonic()
+        # Blocked time is reported as it accrues (every 0.1s tick), so a long
+        # client pause keeps the job's no-progress watchdog satisfied; the
+        # total reported is still the full time spent blocked.
+        last = time.monotonic()
         blocked = False
         while not stop.is_set():
             try:
                 handoff.put(item, timeout=0.1)
                 if blocked and on_wait is not None:
-                    on_wait(time.monotonic() - t0)
+                    on_wait(time.monotonic() - last)
                 return True
             except queue.Full:
                 blocked = True
+                if on_wait is not None:
+                    now = time.monotonic()
+                    on_wait(now - last)
+                    last = now
                 continue
         return False
 
@@ -653,15 +934,26 @@ def run_generator_on(
     future = submit(_produce) if submit is not None else executor.submit(_produce)
     try:
         while True:
-            if cancelled is None:
-                item = handoff.get()
-            else:
-                try:
-                    item = handoff.get(timeout=CANCEL_POLL_S)
-                except queue.Empty:
-                    if cancelled():
-                        raise ClientDisconnected()
+            try:
+                item = handoff.get(timeout=CANCEL_POLL_S)
+            except queue.Empty:
+                if cancelled is not None and cancelled():
+                    raise ClientDisconnected()
+                if not future.done():
                     continue
+                # The job future finished without the producer ever (or any
+                # longer) feeding us: expired in the queue, aborted by the
+                # watchdog, or the executor refused it. Anything the producer
+                # queued before finishing is read first.
+                try:
+                    item = handoff.get_nowait()
+                except queue.Empty:
+                    if future.cancelled():
+                        break
+                    exc = future.exception()
+                    if exc is not None:
+                        raise exc
+                    break
             if item is _STREAM_SENTINEL:
                 break
             if isinstance(item, _GeneratorError):
@@ -678,8 +970,12 @@ def run_generator_on(
                 handoff.get_nowait()
         except queue.Empty:
             pass
-        if not future.cancel():  # cancel() only wins if the job never started
-            future.result()
+        # cancel() only wins if the job never started. A future the watchdog
+        # or the queue-wait limit already failed is done: nothing to join (the
+        # producer, if it is still inside a model call, sees ``stop`` at its
+        # next chunk and the worker frees itself).
+        if not future.cancel() and not future.done():
+            futures_wait([future])
 
 
 class VoiceAPIHandler(BaseHTTPRequestHandler):
@@ -826,7 +1122,11 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             return tts.generate_into_tape(
                 text, tape, gen_error, server.stop_event, jobs.note_chunk)
 
-        gen = jobs.submit(server.tts_executor, "speak", len(text), generate)
+        # progress=True: generation reports every chunk, so a job that stops
+        # producing audio is aborted by the watchdog, which also sets
+        # stop_event (playback ends, generate_into_tape stops at its next chunk).
+        gen = jobs.submit(server.tts_executor, "speak", len(text), generate,
+                          progress=True, on_abort=server.stop_event.set)
         try:
             # Playback's prime / max-wait clock must start with generation,
             # not while this job waits behind another one on the worker.
@@ -834,8 +1134,10 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             while not gen_started.wait(0.05):
                 if server.stop_event.is_set() and gen.cancel():
                     return
-            if server.stop_event.is_set():
-                return
+                if gen.done():       # finished without ever starting: don't spin
+                    break
+            if not gen_started.is_set() or server.stop_event.is_set():
+                return               # (a failed job's error is raised below)
             tts.play_tape(
                 tape, gen_error, server.stop_event, server.pause_event,
                 server.seek, server.audible,
@@ -971,12 +1273,14 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
         tts = self.server.tts
         t0 = time.monotonic()
         jobs = self._jobs()
+        priority = self._priority()
         stream = run_generator_on(
             self.server.tts_executor,
             lambda: tts.synthesize_stream(text),
             cancelled=self._client_gone,
             submit=lambda fn: jobs.submit(
-                self.server.tts_executor, "synthesize", len(text), fn),
+                self.server.tts_executor, "synthesize", len(text), fn,
+                priority=priority, progress=True),
             on_chunk=jobs.note_chunk,
             on_wait=jobs.note_wait,
         )
@@ -987,7 +1291,11 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
                   f"{(time.monotonic() - t0) * 1000:.0f}ms; generation stopped",
                   file=sys.stderr, flush=True)
             return
-        except Exception as e:
+        except QueueWaitExceeded as e:
+            # Logged by the tracker. Nothing was generated: safe to retry.
+            self._respond_queue_wait(e, openai_shape=False)
+            return
+        except Exception as e:   # includes GenerationStalled (logged by the watchdog)
             print(f"{log_ts()} [synthesize error] {e}", file=sys.stderr, flush=True)
             self._respond_json(500, {"error": str(e)})
             return
@@ -1015,6 +1323,10 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
         Vireo TTFB is ~0.2s and never trips it. Validation still 400s before
         any headers. The body stays unknown-length ``Connection: close``; a
         mid-stream failure can only close the socket.
+
+        Exception: ``X-Voice-Priority: batch`` holds the headers until the first
+        chunk exists, so a queue-wait expiry (503 + Retry-After) or a failure
+        before any audio is a real status code, not a dropped connection.
         """
         body = self._read_body()
         params, err = parse_speech_request(body)
@@ -1033,17 +1345,47 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
         # close it in every exit path below. Submit generation *before* writing
         # headers so clone prefill overlaps the round-trip.
         jobs = self._jobs()
+        priority = self._priority()
         stream = run_generator_on(
             self.server.tts_executor,
             lambda: self.server.tts.synthesize_stream(
                 text, voice=voice, streaming_interval=SPEECH_STREAMING_INTERVAL),
             cancelled=self._client_gone,
             submit=lambda fn: jobs.submit(
-                self.server.tts_executor, "speech", len(text), fn),
+                self.server.tts_executor, "speech", len(text), fn,
+                priority=priority, progress=True),
             on_chunk=jobs.note_chunk,
             on_wait=jobs.note_wait,
         )
         try:
+            engine = getattr(self.server.tts, 'engine', '')
+            primed = stream
+            if engine == 'breeze':
+                primed = prime_chunks(
+                    stream,
+                    BREEZE_PLAY_PRIME_SAMPLES,
+                    max_wait_s=BREEZE_SPEECH_PRIME_MAX_WAIT_S,
+                )
+            first = None
+            if priority == PRIORITY_BATCH:
+                # Batch callers retry on 503, so hold the 200 headers until the
+                # first chunk exists: a queue-wait expiry or a generation error
+                # before any audio can still be a proper status code. (Interactive
+                # keeps headers first: Origin's 30s proxy timeout depends on it.)
+                try:
+                    first = next(primed, None)
+                except QueueWaitExceeded as e:
+                    self._respond_queue_wait(e, openai_shape=True)
+                    return
+                except (BrokenPipeError, ConnectionResetError, ClientDisconnected) as e:
+                    print(f"{log_ts()} [speech] client disconnected while queued: "
+                          f"{str(e) or 'socket closed'}", file=sys.stderr, flush=True)
+                    return
+                except Exception as e:
+                    print(f"{log_ts()} [speech] generation error before first chunk: "
+                          f"{e}", file=sys.stderr, flush=True)
+                    self._respond_json(500, error_body(str(e), openai_shape=True))
+                    return
             self.send_response(200)
             self.send_header('Content-Type',
                              'audio/wav' if fmt == 'wav' else 'audio/pcm')
@@ -1053,18 +1395,8 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
             try:
-                engine = getattr(self.server.tts, 'engine', '')
-                primed = stream
-                if engine == 'breeze':
-                    primed = prime_chunks(
-                        stream,
-                        BREEZE_PLAY_PRIME_SAMPLES,
-                        max_wait_s=BREEZE_SPEECH_PRIME_MAX_WAIT_S,
-                    )
-                first = None
-                for chunk in primed:
-                    first = chunk
-                    break
+                if priority != PRIORITY_BATCH:
+                    first = next(primed, None)
                 if first is None:
                     return
                 if fmt == 'wav':
@@ -1087,6 +1419,14 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
         finally:
             # Stop the producer (aborts generation if we exited early) and join it.
             stream.close()
+
+    def _priority(self) -> str:
+        """Queue level requested by this request (header names are case-insensitive)."""
+        return parse_priority(self.headers.get(PRIORITY_HEADER))
+
+    def _respond_queue_wait(self, exc: QueueWaitExceeded, openai_shape: bool) -> None:
+        self._respond_json(503, error_body(str(exc), openai_shape),
+                           headers={'Retry-After': str(exc.retry_after_s)})
 
     def _jobs(self) -> JobTracker:
         jobs = getattr(self.server, 'jobs', None)
@@ -1114,11 +1454,13 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def _respond_json(self, code: int, obj: dict):
+    def _respond_json(self, code: int, obj: dict, headers: dict | None = None):
         payload = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(payload)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(payload)
 
@@ -1199,6 +1541,8 @@ def main():
     server.jobs = JobTracker(
         slack_s=local_cfg.get('stall_slack_seconds', DEFAULT_STALL_SLACK_S),
         auto_restart=bool(local_cfg.get('stall_auto_restart', False)),
+        queue_wait_max_s=local_cfg.get('queue_wait_max_seconds', DEFAULT_QUEUE_WAIT_MAX_S),
+        stall_s=local_cfg.get('stall_seconds', DEFAULT_STALL_S),
     )
     try:
         server.config_mtime = CONFIG_PATH.stat().st_mtime
