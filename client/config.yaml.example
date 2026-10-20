@@ -33,16 +33,8 @@ local:
   tts_seek_seconds: 15              # Option+< / Option+> step while speaking
   tts_max_pause_seconds: 0.2        # Cap inter-sentence silence on the batch path (0 = off)
 
-  # Active TTS engine: edge | qwen | breeze | vireo | fish
-  tts_engine: edge
-
-  # --- edge (internet, no GPU) ---
-  # List voices: edge-tts --list-voices
-  edge:
-    voice: "en-US-EmmaMultilingualNeural"
-    rate: "+0%"                     # if omitted, derived from tts_speed (1.2 -> +20%)
-    volume: "+0%"
-    pitch: "+0Hz"
+  # Active TTS engine: qwen | breeze | vireo | fish
+  tts_engine: fish
 
   # --- qwen (on-device Qwen3-TTS via mlx-audio) ---
   # Speakers: aiden, ryan (EN male); serena, vivian (ZH female);

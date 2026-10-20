@@ -3,7 +3,7 @@
 TTS client for Claude Code voice output.
 Reads text from clipboard, synthesizes speech, and plays audio.
 Supports two backends: "origin" (GPU server via WebSocket) or "local"
-(Edge TTS or Qwen3-TTS on Mac).
+(Qwen3-TTS, Breeze, Vireo, or Fish on Mac).
 """
 
 import asyncio
@@ -170,11 +170,11 @@ def _play_tape(tape: AudioTape, producer_thread: threading.Thread, gen_error: li
                max_wait_s=PLAY_MAX_WAIT_S, min_realtime=PLAY_MIN_REALTIME):
     """Play an AudioTape while a producer fills it.
 
-    Shared by Qwen, Edge, and Breeze. The producer appends PCM and calls
+    Shared by Qwen, Breeze, Vireo, and Fish. The producer appends PCM and calls
     tape.finish(); this loop only talks to the audio device (PortAudio /
     CoreAudio are not thread-safe).
 
-    Default (Vireo/Qwen/Edge): wait until generation is done, *or* until we
+    Default (Vireo/Qwen): wait until generation is done, *or* until we
     have a 2s prime and are clearly faster than realtime, *or* until
     ``PLAY_MAX_WAIT_S``. Breeze passes a 15s prime and ``max_wait_s=None`` so
     a short clip is fully generated before the speaker opens.
@@ -306,17 +306,11 @@ def _play_tape(tape: AudioTape, producer_thread: threading.Thread, gen_error: li
     print(f"Done [{written/24000:.1f}s played, {outcome}]", flush=True)
 
 
-_ENGINE_SECTIONS = ("edge", "qwen", "breeze", "vireo", "fish")
+_ENGINE_SECTIONS = ("qwen", "breeze", "vireo", "fish")
 
 # Short names inside local.<engine> map onto the flat keys each engine already
 # reads. Prefixed aliases (tts_voice, vireo_model, …) pass through unchanged.
 _ENGINE_KEY_MAP = {
-    "edge": {
-        "voice": "tts_voice",
-        "rate": "tts_rate",
-        "volume": "tts_volume",
-        "pitch": "tts_pitch",
-    },
     "qwen": {
         "model": "tts_model",
         "speaker": "tts_speaker",
@@ -407,10 +401,12 @@ def flatten_local_tts_config(local: dict) -> dict:
 
 
 def resolve_tts_engine(config: dict) -> str:
-    """Canonical local TTS engine name: edge, qwen, breeze, vireo, or fish."""
-    engine = str(config.get("tts_engine", "edge")).lower().strip()
-    if engine in ("edge", "edge-tts"):
-        return "edge"
+    """Canonical local TTS engine name: qwen, breeze, vireo, or fish.
+
+    Default is fish. Unknown names (including the removed ``edge``) raise
+    ValueError instead of falling back silently.
+    """
+    engine = str(config.get("tts_engine", "fish")).lower().strip()
     if engine in ("qwen", "mlx", "local"):
         return "qwen"
     if engine in ("breeze", "breeze-tts", "breeze_tts"):
@@ -422,17 +418,14 @@ def resolve_tts_engine(config: dict) -> str:
         return "fish"
     raise ValueError(
         f"Unknown tts_engine: {engine!r} "
-        f"(use 'edge', 'qwen', 'breeze', 'vireo', or 'fish')"
+        f"(valid engines: qwen, breeze, vireo, fish)"
     )
 
 
 def create_local_tts(config: dict):
-    """Build the local TTS engine selected by ``local.tts_engine`` (default edge)."""
+    """Build the local TTS engine selected by ``local.tts_engine`` (default fish)."""
     config = flatten_local_tts_config(config)
     engine = resolve_tts_engine(config)
-    if engine == "edge":
-        from edge_tts_engine import EdgeTTS
-        return EdgeTTS(config)
     if engine == "breeze":
         from breeze_tts_engine import BreezeTTS
         return BreezeTTS(config)
@@ -683,7 +676,7 @@ class LocalTTS:
 
 
 class TTSClient:
-    """Manages TTS via origin server or local engine (Edge / Qwen)."""
+    """Manages TTS via origin server or local engine (Qwen / Breeze / Vireo / Fish)."""
 
     def __init__(self, config_path: str = None):
         self.config = self._load_config(config_path)

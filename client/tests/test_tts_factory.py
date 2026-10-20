@@ -5,7 +5,6 @@ from pathlib import Path
 import pytest
 
 from breeze_tts_engine import DEFAULT_INSTRUCT, DEFAULT_MODEL, BreezeTTS
-from edge_tts_engine import EdgeTTS
 from tts_client import (
     LocalTTS,
     create_local_tts,
@@ -19,12 +18,32 @@ from vireo_tts_engine import (
 )
 
 
-def test_resolve_defaults_to_edge():
-    assert resolve_tts_engine({}) == "edge"
+def test_resolve_defaults_to_fish():
+    assert resolve_tts_engine({}) == "fish"
+
+
+@pytest.mark.parametrize("name", ["edge", "Edge", "edge-tts"])
+def test_resolve_removed_edge_fails_loudly(name):
+    """Edge was removed: a stale config must error, never fall back silently."""
+    with pytest.raises(ValueError) as exc:
+        resolve_tts_engine({"tts_engine": name})
+    msg = str(exc.value)
+    assert "Unknown tts_engine" in msg
+    for valid in ("qwen", "breeze", "vireo", "fish"):
+        assert valid in msg
+
+
+def test_create_local_tts_edge_raises():
+    with pytest.raises(ValueError, match="Unknown tts_engine"):
+        create_local_tts({"tts_engine": "edge"})
+
+
+def test_flatten_edge_raises():
+    with pytest.raises(ValueError, match="Unknown tts_engine"):
+        flatten_local_tts_config({"tts_engine": "edge", "edge": {"voice": "x"}})
 
 
 def test_resolve_aliases():
-    assert resolve_tts_engine({"tts_engine": "edge-tts"}) == "edge"
     assert resolve_tts_engine({"tts_engine": "Qwen"}) == "qwen"
     assert resolve_tts_engine({"tts_engine": "mlx"}) == "qwen"
     assert resolve_tts_engine({"tts_engine": "local"}) == "qwen"
@@ -39,11 +58,11 @@ def test_resolve_unknown_raises():
         resolve_tts_engine({"tts_engine": "piper"})
 
 
-def test_factory_default_is_edge():
+def test_factory_default_is_fish():
+    from fish_tts_engine import FishTTS
     tts = create_local_tts({})
-    assert isinstance(tts, EdgeTTS)
-    assert tts.engine == "edge"
-    assert tts.voice == "en-US-EmmaMultilingualNeural"
+    assert isinstance(tts, FishTTS)
+    assert tts.engine == "fish"
 
 
 def test_factory_qwen():
@@ -64,17 +83,17 @@ def test_factory_breeze():
 
 
 def test_reconfigure_same_engine_keeps_object():
-    tts = create_local_tts({"tts_engine": "edge", "tts_voice": "en-US-AriaNeural"})
+    tts = create_local_tts({"tts_engine": "qwen", "tts_speaker": "aiden"})
     same, swapped = replace_or_reconfigure_tts(
-        tts, {"tts_engine": "edge", "tts_voice": "en-US-JennyNeural"},
+        tts, {"tts_engine": "qwen", "tts_speaker": "serena"},
     )
     assert swapped is False
     assert same is tts
-    assert tts.voice == "en-US-JennyNeural"
+    assert tts.speaker == "serena"
 
 
 def test_reconfigure_swaps_engine():
-    tts = create_local_tts({"tts_engine": "edge"})
+    tts = create_local_tts({"tts_engine": "vireo"})
     other, swapped = replace_or_reconfigure_tts(
         tts, {"tts_engine": "qwen", "tts_speaker": "serena"},
     )
@@ -85,7 +104,7 @@ def test_reconfigure_swaps_engine():
 
 
 def test_reconfigure_swaps_to_breeze():
-    tts = create_local_tts({"tts_engine": "edge"})
+    tts = create_local_tts({"tts_engine": "qwen"})
     other, swapped = replace_or_reconfigure_tts(
         tts, {"tts_engine": "breeze", "tts_instruct": "A calm narrator."},
     )
@@ -119,10 +138,6 @@ def _nested_local(**overrides):
         "tts_engine": "vireo",
         "tts_speed": 1.1,
         "tts_seek_seconds": 12,
-        "edge": {
-            "voice": "en-US-JennyNeural",
-            "rate": "+10%",
-        },
         "qwen": {
             "model": "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit",
             "speaker": "serena",
@@ -171,16 +186,13 @@ def test_flatten_switch_to_breeze_keeps_vireo_section_unused():
     assert "vireo_ref_audio" not in flat
 
 
-def test_flatten_switch_to_qwen_and_edge():
+def test_flatten_switch_to_qwen():
     qwen = flatten_local_tts_config(_nested_local(tts_engine="qwen"))
     assert qwen["tts_model"].endswith("0.6B-CustomVoice-4bit")
     assert qwen["tts_speaker"] == "serena"
     assert qwen["tts_language"] == "chinese"
     assert qwen["tts_instruct"] == "whispering"
     assert qwen["tts_temperature"] == 0.8
-    edge = flatten_local_tts_config(_nested_local(tts_engine="edge"))
-    assert edge["tts_voice"] == "en-US-JennyNeural"
-    assert edge["tts_rate"] == "+10%"
 
 
 def test_flatten_flat_keys_still_work():
@@ -192,11 +204,12 @@ def test_flatten_flat_keys_still_work():
 
 
 def test_example_yaml_can_select_all_four_engines():
+    from fish_tts_engine import FishTTS
     import yaml
     path = Path(__file__).resolve().parent.parent / "config.yaml.example"
     local = yaml.safe_load(path.read_text())["local"]
     for name, cls in (
-        ("edge", EdgeTTS),
+        ("fish", FishTTS),
         ("qwen", LocalTTS),
         ("breeze", BreezeTTS),
         ("vireo", VireoTTS),
@@ -267,10 +280,29 @@ def test_flatten_fish_section_is_isolated():
 
 def test_reconfigure_vireo_to_fish_swaps_and_fish_reconfigures_in_place():
     from fish_tts_engine import FishTTS
-    tts = create_local_tts({"tts_engine": "edge"})
+    tts = create_local_tts({"tts_engine": "vireo"})
     fish, swapped = replace_or_reconfigure_tts(tts, {"tts_engine": "fish"})
     assert swapped is True and isinstance(fish, FishTTS)
     same, swapped = replace_or_reconfigure_tts(
         fish, {"tts_engine": "fish", "fish": {"temperature": 0.6}})
     assert swapped is False and same is fish
     assert fish.temperature == 0.6
+
+
+def test_example_yaml_default_is_fish_and_has_no_edge():
+    import yaml
+    path = Path(__file__).resolve().parent.parent / "config.yaml.example"
+    local = yaml.safe_load(path.read_text())["local"]
+    assert local["tts_engine"] == "fish"
+    assert "edge" not in local
+    assert resolve_tts_engine(local) == "fish"
+
+
+def test_stale_edge_block_is_ignored_when_another_engine_is_active():
+    """A leftover local.edge block (old config.yaml) must not break fish."""
+    from fish_tts_engine import FishTTS
+    tts = create_local_tts({
+        "tts_engine": "fish",
+        "edge": {"voice": "en-US-EmmaMultilingualNeural", "rate": "+0%"},
+    })
+    assert isinstance(tts, FishTTS)

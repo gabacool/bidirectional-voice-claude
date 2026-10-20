@@ -127,18 +127,45 @@ def _log_warmup_failure(future) -> None:
 
 
 def maybe_reload_config(server) -> None:
-    """Re-apply config.yaml if it changed. Engine swaps replace the TTS object."""
+    """Re-apply config.yaml if it changed. Engine swaps replace the TTS object.
+
+    The mtime is recorded only AFTER the config applied cleanly. A bad config
+    (unknown ``tts_engine``, YAML error, failed model load) therefore raises on
+    every request until it is fixed, instead of being marked as applied and
+    silently leaving the old engine serving. The error is logged here and
+    re-raised so the HTTP handler can return it.
+    """
     try:
         mtime = CONFIG_PATH.stat().st_mtime
     except OSError:
         return
     if mtime == getattr(server, 'config_mtime', None):
         return
+    try:
+        _apply_config(server)
+    except Exception as exc:
+        print(f"[config error] config.yaml not applied, will retry on the next "
+              f"request: {exc}", file=sys.stderr, flush=True)
+        raise
     server.config_mtime = mtime
+
+
+def _apply_config(server) -> None:
     local_cfg = load_config().get('local', {})
     server.tts, swapped = replace_or_reconfigure_tts(server.tts, local_cfg)
+    # An engine swap leaves server.tts pointing at a NEW, unloaded engine.
+    # `tts_load_pending` stays set until its model has really loaded, so a
+    # failed load cannot be mistaken for "same engine, just reconfigure" on
+    # the next request: that retry loads synchronously (and raises again on
+    # failure) instead of taking the fire-and-forget warm-up below. Memory:
+    # engines are lazy (constructing one loads nothing), and the old engine
+    # loses its last reference on the assignment above, before the new model
+    # loads here, so two large models are never resident together.
     if swapped:
+        server.tts_load_pending = True
+    if getattr(server, 'tts_load_pending', False):
         server.tts_executor.submit(server.tts._ensure_model).result()
+        server.tts_load_pending = False
         print(f"Switched TTS engine to {server.tts.engine} "
               f"(speaker={server.tts.speaker})", flush=True)
     else:
@@ -556,7 +583,8 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             return
 
         with self.server.speak_lock:
-            maybe_reload_config(self.server)
+            if not self._reload_config_or_respond():
+                return
             self.server.stop_event.clear()
             self.server.pause_event.clear()
             self.server.audible.clear()
@@ -595,7 +623,8 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             return
 
         with self.server.speak_lock:
-            maybe_reload_config(self.server)
+            if not self._reload_config_or_respond():
+                return
 
         try:
             audio = self.server.tts_executor.submit(
@@ -789,6 +818,15 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             # Stop the producer (aborts generation if we exited early) and join it.
             stream.close()
 
+    def _reload_config_or_respond(self) -> bool:
+        """Reload config.yaml; on failure answer 500 with the error, return False."""
+        try:
+            maybe_reload_config(self.server)
+        except Exception as e:
+            self._respond_text(500, f'config error: {e}')
+            return False
+        return True
+
     def _respond_text(self, code: int, body: str):
         payload = body.encode()
         self.send_response(code)
@@ -860,7 +898,7 @@ def main():
     stt = LocalTranscriber(stt_model)
     # Warm each model ON its own inference thread so its thread-local mlx stream
     # is created where that model's inference will later run (not on the main
-    # thread, and not on the other model's thread). Edge TTS has no local model.
+    # thread, and not on the other model's thread).
     print(f"Loading TTS ({tts.engine}, {tts.speaker})...", flush=True)
     tts_executor.submit(tts._ensure_model).result()
     print("Loading STT model (Qwen3-ASR)...", flush=True)

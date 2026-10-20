@@ -268,3 +268,121 @@ def test_reload_warmup_failure_is_logged(monkeypatch, tmp_path, capsys):
         tts_exec.shutdown(wait=True)               # callbacks run before shutdown returns
     out = capsys.readouterr().out
     assert "warm-up after config reload failed" in out and "reference clip not found" in out
+
+
+# --- config reload: a failed reload must not be marked as applied -----------
+
+def test_failed_reload_is_retried_until_config_is_fixed(monkeypatch, tmp_path, capsys):
+    """A bad config (e.g. a removed `tts_engine: edge`) must keep failing loudly
+    on every request; only a successful apply records the mtime."""
+    import os
+    release = threading.Event()
+    release.set()
+    tts = _ReloadTTS(release)
+    voice_api, server, tts_exec = _reload_env(monkeypatch, tmp_path, tts)
+    cfg = voice_api.CONFIG_PATH
+    cfg.write_text("local:\n  tts_engine: edge\n")
+    try:
+        for _ in range(2):            # same unchanged file, two requests
+            with pytest.raises(ValueError, match="Unknown tts_engine"):
+                voice_api.maybe_reload_config(server)
+        assert server.config_mtime is None          # never marked applied
+        assert server.tts is tts                    # old engine object untouched
+        assert capsys.readouterr().err.count("[config error]") == 2
+
+        cfg.write_text("local:\n  tts_engine: fish\n")
+        st = cfg.stat()
+        os.utime(cfg, (st.st_atime, st.st_mtime + 5))   # fixed file, new mtime
+        voice_api.maybe_reload_config(server)           # now applies
+        assert server.config_mtime == cfg.stat().st_mtime
+        assert tts.applied == 1
+        voice_api.maybe_reload_config(server)           # unchanged -> no-op
+        assert tts.applied == 1
+    finally:
+        tts_exec.shutdown(wait=True)
+
+
+# --- engine swap whose model load fails: never served as if loaded -----------
+
+def _swap_env(monkeypatch, tmp_path, load_failures):
+    """Server on a fish-shaped TTS; config asks for vireo, whose lazy engine's
+    _ensure_model fails `load_failures` times, then succeeds."""
+    import types
+    import voice_api
+    from vireo_tts_engine import VireoTTS
+    release = threading.Event()
+    release.set()
+    voice_api_, server, tts_exec = _reload_env(monkeypatch, tmp_path, _ReloadTTS(release))
+    voice_api.CONFIG_PATH.write_text("local:\n  tts_engine: vireo\n")
+    calls = {"n": 0, "loaded": 0}
+
+    def fake_ensure(self):
+        calls["n"] += 1
+        if calls["n"] <= load_failures:
+            raise RuntimeError("load failed")
+        calls["loaded"] += 1
+
+    monkeypatch.setattr(VireoTTS, "_ensure_model", fake_ensure)
+    return voice_api, server, tts_exec, calls
+
+
+def test_failed_swap_load_keeps_failing_until_load_succeeds(monkeypatch, tmp_path, capsys):
+    voice_api, server, tts_exec, calls = _swap_env(monkeypatch, tmp_path, load_failures=2)
+    try:
+        for _ in range(2):            # the original request + the next one
+            with pytest.raises(RuntimeError, match="load failed"):
+                voice_api.maybe_reload_config(server)
+            assert server.config_mtime is None           # never marked applied
+            assert server.tts.engine == "vireo"          # new engine is current...
+        assert calls["loaded"] == 0                       # nothing served as loaded
+        assert server.tts_load_pending is True            # ...and flagged unloaded
+        assert capsys.readouterr().err.count("[config error]") == 2
+
+        voice_api.maybe_reload_config(server)             # transient failure over
+        assert server.tts_load_pending is False
+        assert server.config_mtime == voice_api.CONFIG_PATH.stat().st_mtime
+        assert calls["loaded"] == 1
+        voice_api.maybe_reload_config(server)             # unchanged -> no-op
+        assert calls["n"] == 3
+    finally:
+        tts_exec.shutdown(wait=True)
+
+
+def test_failed_swap_then_same_engine_config_edit_still_loads_synchronously(
+        monkeypatch, tmp_path):
+    """An edit that keeps the (unloaded) new engine must not drop to the
+    fire-and-forget in-place path: it has to load, or fail, in the request."""
+    import os
+    voice_api, server, tts_exec, calls = _swap_env(monkeypatch, tmp_path, load_failures=1)
+    try:
+        with pytest.raises(RuntimeError, match="load failed"):
+            voice_api.maybe_reload_config(server)
+        cfg = voice_api.CONFIG_PATH
+        cfg.write_text("local:\n  tts_engine: vireo\n  vireo:\n    seed: 7\n")
+        st = cfg.stat()
+        os.utime(cfg, (st.st_atime, st.st_mtime + 5))
+        voice_api.maybe_reload_config(server)             # load now succeeds, synchronously
+        assert calls["loaded"] == 1
+        assert server.tts_load_pending is False
+        assert server.config_mtime == cfg.stat().st_mtime
+    finally:
+        tts_exec.shutdown(wait=True)
+
+
+def test_speak_returns_500_config_error_when_reload_fails(monkeypatch, tmp_path):
+    import types
+    import voice_api
+    release = threading.Event()
+    voice_api_, server, tts_exec = _reload_env(monkeypatch, tmp_path, _ReloadTTS(release))
+    voice_api.CONFIG_PATH.write_text("local:\n  tts_engine: edge\n")
+    sent = []
+    handler = types.SimpleNamespace(
+        server=server, _respond_text=lambda code, body: sent.append((code, body)))
+    try:
+        for _ in range(2):
+            ok = voice_api.VoiceAPIHandler._reload_config_or_respond(handler)
+            assert ok is False
+        assert [c for c, _ in sent] == [500, 500]
+        assert all(b.startswith("config error: Unknown tts_engine") for _, b in sent)
+    finally:
+        tts_exec.shutdown(wait=True)

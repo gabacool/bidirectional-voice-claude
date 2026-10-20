@@ -3,7 +3,7 @@
 Voice input and output for terminal sessions. Talk, and hear a reply.
 
 - **STT (local):** Qwen3-ASR on Apple Silicon
-- **TTS (local):** Fish Audio Drama 3 is the active engine on this Mac (`local.tts_engine: fish`). The template default is Microsoft Edge TTS (internet, no GPU). Switch to on-device Qwen3-TTS, Breeze TTS 2, Vireo, or Fish anytime.
+- **TTS (local):** Fish Audio Drama 3 is the default and the active engine on this Mac (`local.tts_engine: fish`). All engines run on-device. Switch to Qwen3-TTS, Breeze TTS 2, or Vireo anytime.
 - **Origin (optional):** NVIDIA Parakeet ASR + Piper TTS on a GPU server
 
 ---
@@ -43,7 +43,7 @@ The same process also serves Origin's voice chat over the LAN, so one Fish model
 
 ## Setup
 
-**Needs:** Apple Silicon Mac (M1+), Python 3.14+, [ffmpeg](https://ffmpeg.org/), [Hammerspoon](https://www.hammerspoon.org/). Edge TTS also needs internet.
+**Needs:** Apple Silicon Mac (M1+), Python 3.14+, [ffmpeg](https://ffmpeg.org/), [Hammerspoon](https://www.hammerspoon.org/).
 
 ```bash
 cd ~/git/nvidia_parakeet
@@ -64,15 +64,14 @@ On first STT use, Qwen3-ASR downloads from HuggingFace (~1.2GB). Qwen, Breeze, V
 
 ## TTS engines
 
-Edit `local.tts_engine` in `client/config.yaml` (`edge` | `qwen` | `breeze` | `vireo` | `fish`). Each engine has its own nested block; unused blocks stay in the file and are ignored. Option+S hot-reloads engine/voice/speed on the next press. Changing Qwen’s `model` reloads that model on the next press.
+Edit `local.tts_engine` in `client/config.yaml` (`qwen` | `breeze` | `vireo` | `fish`; default `fish`). An unknown name, including the removed `edge`, fails with an error listing the valid engines; it never falls back silently. Each engine has its own nested block; unused blocks stay in the file and are ignored. Option+S hot-reloads engine/voice/speed on the next press. Changing Qwen’s `model` reloads that model on the next press.
 
 | `tts_engine` / backend | Needs | How to choose a voice | Streaming |
 |------------------------|-------|------------------------|-----------|
-| **`edge`** (default) | Internet | `local.edge.voice` (e.g. `en-US-EmmaMultilingualNeural`). List: `edge-tts --list-voices`. | After full clip (then chunked) |
 | **`qwen`** | Apple Silicon, ~3GB | `local.qwen.model` + `speaker` + `instruct`. Use `language: chinese` + `serena`/`vivian` for Mandarin. | Yes — PCM as generated |
 | **`breeze`** | Apple Silicon, ~3GB ([MLX 4-bit](https://huggingface.co/mlx-community/Breeze-TTS-2-mlx-4bit)) | Auto-locks one speaker from `instruct` (clone). Optional: `ref_audio` + `ref_text`. Slower than realtime. | Yes — 24 kHz chunks |
 | **`vireo`** | Apple Silicon, ~2.1GB ([mixed-4-bit](https://huggingface.co/mchen04/Vireo-TTS-3B-MLX-mixed4bit), gated) | Clones `ref_audio` (default `breeze_lock.wav`) at `cfg_scale: 1`. English-tuned; not a Chinese TTS. | Yes — breeze_mlx codec frames |
-| **`fish`** (active on this Mac) | Apple Silicon, ~22GB disk, ~24GB weights in RAM, 28-29GB with the buffer cache ([Fish Audio Drama 3, MLX 4-bit](https://huggingface.co/mlx-community/fish-audio-drama-3-4bit)) | Clones `ref_audio` + `ref_text`; by default the same voice as Breeze (`voices/breeze_lock.wav`). Inline cues like `[whispers]` work; `[pause]` does not (see below). | Yes, 0.32s chunks, about 2x realtime (median 1.95x measured in-process), ~0.15s to first audio in-process; Option+S first audio is ~0.5s (0.34s when the Mac is quiet) because `/speak` buffers before the speaker opens |
+| **`fish`** (default; active on this Mac) | Apple Silicon, ~22GB disk, ~24GB weights in RAM, 28-29GB with the buffer cache ([Fish Audio Drama 3, MLX 4-bit](https://huggingface.co/mlx-community/fish-audio-drama-3-4bit)) | Clones `ref_audio` + `ref_text`; by default the same voice as Breeze (`voices/breeze_lock.wav`). Inline cues like `[whispers]` work; `[pause]` does not (see below). | Yes, 0.32s chunks, about 2x realtime (median 1.95x measured in-process), ~0.15s to first audio in-process; Option+S first audio is ~0.5s (0.34s when the Mac is quiet) because `/speak` buffers before the speaker opens |
 | Origin Piper | `backend: origin` + GPU server | Unrelated to `tts_engine`. | Full WAV |
 
 ```yaml
@@ -227,7 +226,7 @@ Or run `client/scripts/start_voice_api.sh` in a terminal (not while the LaunchAg
   ```
 - **Or revert the commits:** both PRs were squash-merged (one parent each), so there is no `-m` flag. On a branch run `git revert 0d4f8b7` (PR #26, the stall/volume fix) and, to remove the engine too, `git revert 42e165c` (PR #24). Open a PR and restart.
 - **Config-only, no code change** (hot-reloads on the next Option+S): `fish.carry_codec_state: false`, `fish.silence_rms: 0.01`, `fish.stall_attempts: 0`. This restores the old cold start, silence line and skip-on-stall, but not the old code path.
-- **Leave Fish entirely:** set `local.tts_engine` back to `vireo` (or `edge`) and restart.
+- **Leave Fish entirely:** set `local.tts_engine` back to `vireo` and restart.
 
 ---
 
@@ -238,8 +237,7 @@ Canonical file: [`client/config.yaml.example`](client/config.yaml.example). Copy
 | Key | Where | Meaning |
 |-----|-------|---------|
 | `backend` | top-level | `local` (Mac) or `origin` (GPU server). Affects STT + the CLI TTS client. Option+S always uses localhost `/speak` on the voice API. |
-| `local.tts_engine` | local | **The switch:** `edge`, `qwen`, `breeze`, `vireo`, or `fish` |
-| `local.edge.*` | local.edge | Edge: `voice`, `rate`, `volume`, `pitch` |
+| `local.tts_engine` | local | **The switch:** `qwen`, `breeze`, `vireo`, or `fish` (default `fish`) |
 | `local.qwen.*` | local.qwen | Qwen: `model`, `speaker`, `language`, `instruct`, sampling |
 | `local.breeze.*` | local.breeze | Breeze mlx-audio: `model`, `instruct`, `cfg_scale`, `seed`, optional `ref_audio`/`ref_text` |
 | `local.vireo.*` | local.vireo | Vireo: `model`, `speaker`, `instruct`, `cfg_scale` (use 1), `seed`, `ref_audio`/`ref_text` |
@@ -279,7 +277,7 @@ Local STT still uses Qwen3-ASR (`Qwen/Qwen3-ASR-0.6B` default; `Qwen/Qwen3-ASR-1
 ```
 Local (default)
   Option+V  →  voice_client.py  →  Qwen3-ASR (MLX)
-  Option+S  →  Hammerspoon → localhost :9900 /speak   →  Edge / Qwen / Breeze / Vireo / Fish → Mac speaker
+  Option+S  →  Hammerspoon → localhost :9900 /speak   →  Qwen / Breeze / Vireo / Fish → Mac speaker
   Option+Shift+S →  localhost :9900 /save  →  ~/Downloads/{engine}-*.wav
   Origin voice chat (sends text only) → LAN :9900 /v1/audio/speech, /synthesize → same process → audio back to Origin
   LAN :9900 →  /transcribe  →  Qwen3-ASR, bytes only
@@ -300,7 +298,6 @@ nvidia_parakeet/
 │   ├── config.yaml.example  # copy to config.yaml
 │   ├── voice_client.py      # STT
 │   ├── tts_client.py        # TTS factory + Qwen + playback
-│   ├── edge_tts_engine.py   # Microsoft Edge TTS
 │   ├── breeze_tts_engine.py # Breeze TTS 2 (mlx-audio)
 │   ├── vireo_tts_engine.py  # Vireo mixed-4-bit (breeze_mlx)
 │   ├── fish_tts_engine.py   # Fish Audio Drama 3 (mlx-audio): piece loop, stall recovery, codec carry
@@ -324,8 +321,7 @@ nvidia_parakeet/
 |-------|----------|
 | No audio captured | Mic permissions in System Settings |
 | STT download slow | First run fetches ~1.2GB; later runs are instant |
-| Option+S silent (edge) | Check internet; `curl http://127.0.0.1:9900/health`; look at `/tmp/voice_api.log` |
-| Edge TTS 403 / connection error | Microsoft’s service is blocked or stale; retry, or set `tts_engine: qwen` |
+| `Unknown tts_engine: 'edge'` at startup or on Option+S | Edge TTS was removed. Set `local.tts_engine` to `fish`, `qwen`, `breeze`, or `vireo` in `client/config.yaml`; a leftover `local.edge` block is ignored. |
 | Option+S silent (qwen) | First load ~30s; check volume; `tts_temperature` 0.7–1.0 |
 | Option+S silent (breeze) | First load downloads ~3GB (4-bit) and builds a lock clip; `curl http://127.0.0.1:9900/health` should say `tts=breeze`; `/tmp/voice_api.log` |
 | Option+S silent (fish) | First load is ~22GB of weights plus warm-up. `curl http://127.0.0.1:9900/health` should say `tts=fish`; `/tmp/voice_api.log` shows `[fish] warm-up done` when ready |
