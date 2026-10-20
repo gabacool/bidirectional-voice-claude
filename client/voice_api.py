@@ -860,7 +860,7 @@ def main():
     stt = LocalTranscriber(stt_model)
     # Warm each model ON its own inference thread so its thread-local mlx stream
     # is created where that model's inference will later run (not on the main
-    # thread, and not on the other model's thread). Edge TTS has no local model.
+    # thread, and not on the other model's thread).
     print(f"Loading TTS ({tts.engine}, {tts.speaker})...", flush=True)
     tts_executor.submit(tts._ensure_model).result()
     print("Loading STT model (Qwen3-ASR)...", flush=True)

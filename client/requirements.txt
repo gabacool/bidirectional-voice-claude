@@ -11,6 +11,5 @@ mlx-qwen3-asr>=0.3.5
 # (PR #1018). Switch to mlx-audio>=0.5.10 once released. Rollback: mlx-audio==0.5.4.
 mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@dad2087f790dfe96b07d5aac1405db4b578b411f
 huggingface_hub>=0.26.0  # Vireo gated bundle (mchen04/Vireo-TTS-3B-MLX-mixed4bit)
-edge-tts>=7.0.0   # Microsoft Edge online TTS (default local engine; no API key)
 soundfile>=0.12.0
 soxr>=0.3.0      # streaming 44.1k->24k resample for Fish Drama 3
