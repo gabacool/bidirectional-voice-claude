@@ -51,6 +51,7 @@ code { background: var(--code-bg); padding: 0.08em 0.35em; border-radius: 4px; }
 table { border-collapse: collapse; width: 100%; font-size: 0.93rem; background: var(--card); }
 th, td { border: 1px solid var(--line); padding: 7px 10px; text-align: left; vertical-align: top; }
 th { background: var(--code-bg); font-weight: 600; }
+.tablewrap table { min-width: 560px; }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .card {
   background: var(--card); border: 1px solid var(--line); border-radius: 10px;
@@ -72,7 +73,8 @@ dl.five dd p:first-child { margin-top: 0; }
 .warn { border-color: var(--warn); background: var(--warn-bg); }
 .good { border-color: var(--good); background: var(--good-bg); }
 figure { margin: 1.1rem 0; }
-figure svg { width: 100%; height: auto; display: block; background: var(--card); border: 1px solid var(--line); border-radius: 8px; }
+.scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+figure svg { width: 100%; min-width: 640px; height: auto; display: block; background: var(--card); border: 1px solid var(--line); border-radius: 8px; }
 figcaption { color: var(--muted); font-size: 0.86rem; margin-top: 6px; }
 ul, ol { padding-left: 1.3rem; }
 li { margin: 0.25rem 0; }
@@ -119,7 +121,7 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
 
 <h1>How the Fish TTS was made to work</h1>
 <p class="meta">Lessons learned, written 2026-10-20. Covers PR #24 (engine) and PR #26 (stall and volume fix) in the voice API on the Mac.</p>
-<p class="lede">Fish Audio Drama 3 reads text aloud on the Mac at about 2.2x realtime. Getting it to read <em>everything, at an even volume, with real pauses</em> took six separate fixes. Each one started as something a person heard, became a number, and ended as a code change with a measurement behind it. This page keeps the reusable part: the method, the numbers, and the mistakes in our own measuring.</p>
+<p class="lede">Fish Audio Drama 3 reads text aloud on the Mac at about 2x realtime (a typical figure, not a floor: 1.95x median in-process, slower when the Mac is short of memory). Getting it to read <em>everything, at an even volume, with real pauses</em> took six separate fixes. Each one started as something a person heard, became a number, and ended as a code change with a measurement behind it. This page keeps the reusable part: the method, the numbers, and the mistakes in our own measuring.</p>
 
 <div class="note"><b>Not a spec.</b> The design is in <code>docs/superpowers/specs/2026-10-19-fish-stall-and-volume-design.md</code>. This page explains what went wrong, how we found out, and what to do differently next time.</div>
 
@@ -134,6 +136,13 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
   <div><b>RMS</b> = average loudness of a block of audio. Normal speech chunks mostly sit above 0.01; 0.0004 or less is true silence.</div>
   <div><b>STT</b> (speech-to-text) = we transcribe the output and compare to the input text. It is our "did every word come out?" test.</div>
   <div><b>Onset-steady</b> = loudness 50-550 ms into a piece minus that piece's later loudness, in dB. +5 dB means the start is clearly louder.</div>
+  <div><b>dBFS</b> = loudness against digital full scale; 0 is the loudest possible, so -30 is quieter than -27 (3 dB less).</div>
+  <div><b>SNR</b> (signal-to-noise ratio, dB) = how closely two decodes of the same audio match. Higher is closer; 55 dB or more is a tiny difference.</div>
+  <div><b>p99 / p99.9</b> = the value that 99% (or 99.9%) of the measurements stay below. A limit set at p99 flags about 1 in 100.</div>
+  <div><b>RoPE table</b> = the table of position codes the decoder reads as it advances; this one was built for 4,096 frames.</div>
+  <div><b>Watchdog</b> = the engine code that watches the output for silence and decides a piece has stalled.</div>
+  <div><b>Prefix</b> = the audio frames of a piece already played, handed back to the model so it continues rather than starts over.</div>
+  <div><b>R0-R3</b> = the rungs of the recovery ladder (diagram in 2.4): R1 retry from scratch, R2 resume, R3 repeat the piece, R0 skip.</div>
   <div><b>Runaway</b> = a piece that keeps producing sound far longer than its text needs (repeats or babble).</div>
 </div>
 
@@ -146,7 +155,7 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
 <tr><td>2</td><td>Pauses too short</td><td>Model's own comma gap is about 0.1 s; <span class="mono">[pause]</span> cues stall it</td><td>One piece per sentence/clause, exact silence inserted (0.5 s / 0.25 s)</td><td>23/23 boundaries at the set length</td></tr>
 <tr><td>3</td><td>Long read goes silent</td><td>One long piece stalls after about 50 s</td><td>Splitting (same fix as 2)</td><td>26% read unsplit vs 97% split</td></tr>
 <tr><td>4</td><td>Sentences skipped</td><td>Silence line 0.01 counted quiet words as silence; skip-on-stall lost the rest of the piece</td><td>Line 0.001, resume in place, ladder, runaway budget</td><td>556 chat requests: 27 stalls, 25 resumed, 2 retried, 0 skipped</td></tr>
-<tr><td>5</td><td>Volume pumps per paragraph</td><td>Decoder state reset cold at every request</td><td>Carry the decoder state across requests</td><td>First-piece onset +5.03 dB to +0.85 dB (70 paired requests)</td></tr>
+<tr><td>5</td><td>Volume pumps at the start of each chat request</td><td>Decoder state reset cold at every request</td><td>Carry the decoder state across requests</td><td>First-piece onset +5.03 dB to +0.85 dB (70 paired requests)</td></tr>
 <tr><td>6</td><td>Memory 35 to 59 GB</td><td>MLX buffer cache, not a leak</td><td>Cap the cache at 4 GB</td><td>320 requests: footprint flat at 28.6-28.8 GB</td></tr>
 </tbody>
 </table>
@@ -156,7 +165,7 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
 <p>The same engine behaves differently on two routes, and that difference explains problems 4 and 5. Only the Mac runs the model. Origin sends text and plays what comes back.</p>
 
 <figure>
-<svg viewBox="0 0 760 330" role="img" aria-label="System diagram: Hammerspoon and Origin voice chat both call the voice API on the Mac, which holds one Fish model and plays to the Mac speaker or returns audio to Origin.">
+<div class="scroll"><svg viewBox="0 0 760 330" role="img" aria-label="System diagram: Hammerspoon and Origin voice chat both call the voice API on the Mac, which holds one Fish model and plays to the Mac speaker or returns audio to Origin.">
   <rect class="box" x="10" y="10" width="440" height="310" rx="10"/>
   <text class="b" x="24" y="32">Mac (Apple Silicon)</text>
   <text class="m sm" x="24" y="48">the only place the TTS model runs</text>
@@ -172,7 +181,7 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
 
   <rect class="wrn" x="225" y="244" width="200" height="56" rx="8"/>
   <text class="mid b" x="325" y="267">Fish Drama 3, 4-bit</text>
-  <text class="mid sm m" x="325" y="284">one copy, about 26 GB RAM</text>
+  <text class="mid sm m" x="325" y="284">~24 GB weights, 28-29 GB total</text>
 
   <rect class="gd" x="28" y="244" width="150" height="56" rx="8"/>
   <text class="mid b" x="103" y="267">Mac speaker</text>
@@ -191,7 +200,7 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
 
   <rect class="acc" x="560" y="96" width="170" height="60" rx="8"/>
   <text class="mid b" x="645" y="120">Voice chat</text>
-  <text class="mid sm m" x="645" y="137">one request per paragraph</text>
+  <text class="mid sm m" x="645" y="137">a request per sentence group</text>
 
   <rect class="gd" x="560" y="238" width="170" height="56" rx="8"/>
   <text class="mid b" x="645" y="262">Player</text>
@@ -201,7 +210,7 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
   <text class="sm s mid" x="492" y="124">text (LAN)</text>
   <path class="ln" marker-end="url(#ah)" d="M425,184 L560,252"/>
   <text class="sm s mid" x="500" y="264">audio back</text>
-</svg>
+</svg></div>
 <figcaption>Both routes end in the same process and the same model. Origin never runs TTS.</figcaption>
 </figure>
 
@@ -213,13 +222,15 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
 <tr><td>Requests per read</td><td><b>One</b> for the whole clipboard text</td><td><b>One per sentence group</b>: first sentence alone, then groups</td></tr>
 <tr><td>Model state</td><td>One <span class="mono">synthesize_stream</span>: many pieces, history kept, decoder warm after piece 1</td><td>Each request used to start the model and the decoder cold</td></tr>
 <tr><td>Where it plays</td><td>Mac speaker</td><td>Origin's player</td></tr>
+<tr><td>Playback</td><td>Buffered locally: waits for <span class="mono">play_prime_seconds</span> (0.5 s) of audio, and never holds longer than 1.5 s once audio exists (<span class="mono">PLAY_MAX_WAIT_S</span>); starts early only if generation is clearly ahead of playback</td><td>Streams 24 kHz PCM to Origin's player (<span class="mono">/v1/audio/speech</span>), or returns a whole WAV (<span class="mono">/synthesize</span>)</td></tr>
+<tr><td>First audio</td><td>About 0.43-0.57 s under load, 0.34 s on a quiet Mac (the 0.5 s playback buffer is part of it)</td><td>Median 0.21 s, p90 0.28 s to the first PCM byte (415 streamed requests)</td></tr>
 <tr><td>What it exposed</td><td>Clipped words, short pauses, silent long pieces</td><td>Volume pumping, most skipped sentences</td></tr>
 </tbody>
 </table>
 </div>
 
 <figure>
-<svg viewBox="0 0 760 180" role="img" aria-label="Option+S path: clipboard text to Hammerspoon to one /speak request to one stream of many pieces with pauses, one cold start at the beginning, to the Mac speaker.">
+<div class="scroll"><svg viewBox="0 0 760 180" role="img" aria-label="Option+S path: clipboard text to Hammerspoon to one /speak request to one stream of many pieces with pauses, one cold start at the beginning, to the Mac speaker.">
   <text class="b" x="14" y="24">Path A: Option+S, one request for the whole text</text>
   <rect class="box" x="14" y="44" width="110" height="46" rx="8"/>
   <text class="mid" x="69" y="64">clipboard</text><text class="mid sm m" x="69" y="80">3 minutes of text</text>
@@ -243,16 +254,16 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
   <path class="ln" marker-end="url(#ah)" d="M650,99 L680,99"/>
   <rect class="gd" x="680" y="76" width="68" height="46" rx="8"/>
   <text class="mid" x="714" y="96">Mac</text><text class="mid" x="714" y="112">speaker</text>
-</svg>
+</svg></div>
 <figcaption>Path A pays the cold-start cost once, then every later piece sits on a warm decoder. That is why Option+S rarely showed the volume problem.</figcaption>
 </figure>
 
 <figure>
-<svg viewBox="0 0 760 250" role="img" aria-label="Origin chat path: three paragraphs become three separate HTTP requests over the LAN, each with its own cold decoder start before the fix.">
-  <text class="b" x="14" y="24">Path B: Origin voice chat, one request per paragraph</text>
-  <rect class="box" x="14" y="44" width="120" height="46" rx="8"/><text class="mid" x="74" y="64">paragraph 1</text><text class="mid sm m" x="74" y="80">first sentence alone</text>
-  <rect class="box" x="14" y="104" width="120" height="46" rx="8"/><text class="mid" x="74" y="124">paragraph 2</text><text class="mid sm m" x="74" y="140">sentence group</text>
-  <rect class="box" x="14" y="164" width="120" height="46" rx="8"/><text class="mid" x="74" y="184">paragraph 3</text><text class="mid sm m" x="74" y="200">sentence group</text>
+<div class="scroll"><svg viewBox="0 0 760 250" role="img" aria-label="Origin chat path: the first sentence and then each sentence group become separate HTTP requests over the LAN, each with its own cold decoder start before the fix.">
+  <text class="b" x="14" y="24">Path B: Origin voice chat, one request per sentence group</text>
+  <rect class="box" x="14" y="44" width="120" height="46" rx="8"/><text class="mid" x="74" y="64">request 1</text><text class="mid sm m" x="74" y="80">first sentence alone</text>
+  <rect class="box" x="14" y="104" width="120" height="46" rx="8"/><text class="mid" x="74" y="124">request 2</text><text class="mid sm m" x="74" y="140">sentence group</text>
+  <rect class="box" x="14" y="164" width="120" height="46" rx="8"/><text class="mid" x="74" y="184">request 3</text><text class="mid sm m" x="74" y="200">sentence group</text>
   <path class="ln" marker-end="url(#ah)" d="M134,67 L170,67"/>
   <path class="ln" marker-end="url(#ah)" d="M134,127 L170,127"/>
   <path class="ln" marker-end="url(#ah)" d="M134,187 L170,187"/>
@@ -269,8 +280,8 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
   <rect class="gd" x="612" y="96" width="136" height="62" rx="8"/>
   <text class="mid" x="680" y="120">Origin player</text><text class="mid sm m" x="680" y="138">audio over the LAN</text>
   <text class="sm s" x="170" y="232">Requests are sent back to back (the next one starts 3 ms after the last ends), but each is a separate model call.</text>
-</svg>
-<figcaption>Before the fix, each request ended with the decoder state thrown away. Every paragraph therefore started 5-8 dB too loud (problem 5).</figcaption>
+</svg></div>
+<figcaption>Before the fix, each request ended with the decoder state thrown away. Every request therefore started 5-8 dB too loud (problem 5).</figcaption>
 </figure>
 
 <h2>2. The problems, one at a time</h2>
@@ -302,11 +313,11 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
 </div>
 
 <figure>
-<svg viewBox="0 0 760 270" role="img" aria-label="How text becomes pieces: a two-sentence example is split into four pieces with 0.25 s and 0.5 s of inserted silence, and the splitter refuses to cut at 1,255, 3.14, Dr., 10:30 and U.S.">
+<div class="scroll"><svg viewBox="0 0 760 270" role="img" aria-label="How text becomes pieces: a two-sentence example is split into four pieces with 0.25 s and 0.5 s of inserted silence, and the splitter refuses to cut at 1,255, 3.14, Dr., 10:30 and U.S.">
   <text class="b" x="14" y="24">How text becomes pieces plus inserted pauses</text>
   <text class="m sm" x="14" y="44">Input (one line):</text>
   <rect class="box" x="14" y="52" width="732" height="34" rx="6"/>
-  <text class="mono" x="26" y="74">Sales hit 1,255 units, up 3.14 percent. Dr. Lee said so at 10:30, in the U.S. office.</text>
+  <text class="mono" textLength="696" lengthAdjust="spacingAndGlyphs" x="26" y="74">Sales hit 1,255 units, up 3.14 percent. Dr. Lee said so at 10:30, in the U.S. office.</text>
 
   <text class="m sm" x="14" y="112">What the splitter does:</text>
   <text class="sm tw" x="14" y="130">kept whole: "1,255"  "3.14"  "Dr."  "10:30"  "U.S."  (a comma or period inside a number or abbreviation is not a cut)</text>
@@ -320,14 +331,12 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
   <rect class="gd" x="355" y="188" width="156" height="34" rx="5"/><text class="mid sm" x="433" y="209">Dr. Lee said so at 10:30,</text>
   <rect class="zone" x="513" y="188" width="25" height="34"/>
   <rect class="gd" x="540" y="188" width="140" height="34" rx="5"/><text class="mid sm" x="610" y="209">in the U.S. office.</text>
-  <rect class="zone" x="682" y="188" width="50" height="34"/>
 
   <text class="mid sm tw" x="168" y="240">0.25 s</text>
   <text class="mid sm tw" x="328" y="240">0.5 s</text>
   <text class="mid sm tw" x="525" y="240">0.25 s</text>
-  <text class="mid sm tw" x="707" y="240">0.5 s</text>
   <text class="sm m" x="14" y="260">Dashed boxes = silence we insert (to scale). Green = text the model speaks. Real output of the splitter on this sentence.</text>
-</svg>
+</svg></div>
 <figcaption>The model is never asked to pause. It speaks one short piece, stops at EOS, and the engine writes the silence.</figcaption>
 </figure>
 
@@ -338,7 +347,7 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
 <dt>Symptom</dt><dd>Long text was not spoken to the end.</dd>
 <dt>Measurement</dt><dd>A 190 s article fed as one piece (frame and chunk limits lifted), then the same article through the sentence/clause engine. STT recall and words per second over time.</dd>
 <dt>Root cause</dt><dd>Drama 3 does <em>not</em> murmur on long text the way Vireo does (Vireo's trouble was its bilingual clone clip). Its failure is a silent stall: one long piece speaks clearly for about 53 s, then samples silence. This matches the library's own design of roughly 47 s or 300 bytes per piece.</dd>
-<dt>Fix</dt><dd>Keep the sentence/clause splitting. It is required, not a nicety, and costs no speed (about 2.2x realtime either way).</dd>
+<dt>Fix</dt><dd>Keep the sentence/clause splitting. It is required, not a nicety, and costs no measurable speed (about 2x realtime either way).</dd>
 <dt>Evidence</dt><dd>One piece: <b>26%</b> of the article read. Split: 190 s read at a steady 2.4-3.2 words per second, <b>97%</b> STT recall.</dd>
 </dl>
 <p class="m">Do not remove or lengthen splitting, and never use <span class="mono">[pause]</span> cues in the text.</p>
@@ -374,9 +383,9 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
 <table>
 <thead><tr><th>Check</th><th>Result</th></tr></thead>
 <tbody>
-<tr><td>Natural stalls in 556 chat requests (real model)</td><td>27 events: <b>25 resumed, 2 retried, 0 skipped</b>. STT recall min 0.952, mean 0.996.</td></tr>
+<tr><td>Natural stalls in 556 chat requests (real model)</td><td>27 events: <b>25 resumed, 2 retried, 0 skipped</b>. STT recall min 0.952, mean 0.996 (508 requests checked).</td></tr>
 <tr><td>Prefix A/B on 34 cuts, same snapshot</td><td>Prefix to the last sounding frame: <b>0</b> trials lost words. Prefix plus 7 silent frames (what the engine passed first): <b>17</b> lost words, 19 ended at once, 3 ran to the 1,024-frame cap.</td></tr>
-<tr><td>Forced resumes after the prefix fix</td><td>59 trials, 0 lost words, 0 repeats.</td></tr>
+<tr><td>Forced resumes after the prefix fix</td><td>59 forced resumes (60 trials, one did not stall), 0 lost words, 0 repeats.</td></tr>
 <tr><td>Runaway budget vs normal takes</td><td>0 of 1,582 normal pieces over budget (62 Chinese, worst at 71% of budget). Real repeats cut: "Volatility, the V I X," 102 voiced frames vs budget 82 (normal 39-67).</td></tr>
 <tr><td>Quiet words kept</td><td>Long text via <span class="mono">/synthesize</span>, 16 runs: <span class="mono">quiet_dropped_s=0.0</span> in 16 of 16.</td></tr>
 </tbody>
@@ -386,7 +395,7 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
 </div>
 
 <figure>
-<svg viewBox="0 0 760 230" role="img" aria-label="Chunk loudness on a log scale. True silence sits below 0.0004, quiet words between 0.003 and 0.01, normal speech above 0.01. The old silence line at 0.01 cut through quiet words; the new line at 0.001 sits between silence and quiet words.">
+<div class="scroll"><svg viewBox="0 0 760 230" role="img" aria-label="Chunk loudness on a log scale. True silence sits below 0.0004, quiet words between 0.003 and 0.01, normal speech above 0.01. The old silence line at 0.01 cut through quiet words; the new line at 0.001 sits between silence and quiet words.">
   <text class="b" x="14" y="24">Where the silence line belongs (chunk RMS, log scale)</text>
   <line class="ln" x1="40" y1="120" x2="720" y2="120"/>
   <!-- ticks: 0.0001 at 40, 0.001 at 253, 0.01 at 467, 0.1 at 680 -->
@@ -408,12 +417,12 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
   <text class="sm tg end" x="247" y="164">NEW line 0.001</text>
   <text class="sm tg end" x="247" y="180">silence on the left, words on the right</text>
   <text class="sm m" x="14" y="212">Measured on 1,093 normal chunks: none below 0.001. Natural word gaps (0.0001-0.0003) stay on the silent side.</text>
-</svg>
+</svg></div>
 <figcaption>The line has to sit in the empty gap between "real silence" and "quietest real speech". 0.01 sat inside the speech.</figcaption>
 </figure>
 
 <figure>
-<svg viewBox="0 0 760 330" role="img" aria-label="Stall recovery ladder: stall detected after 3 seconds of silence. If nothing was spoken yet, retry from scratch. If speech happened, resume in place twice, then repeat the piece once with a warning, then skip with an error.">
+<div class="scroll"><svg viewBox="0 0 760 330" role="img" aria-label="Stall recovery ladder: stall detected after 3 seconds of silence. If nothing was spoken yet, retry from scratch. If speech happened, resume in place twice, then repeat the piece once with a warning, then skip with an error.">
   <text class="b" x="14" y="24">Stall recovery ladder (default stall_attempts: 3, so 4 generations at most)</text>
   <rect class="wrn" x="14" y="44" width="170" height="52" rx="8"/>
   <text class="mid b" x="99" y="66">Stall detected</text><text class="mid sm m" x="99" y="82">3 s of silent chunks</text>
@@ -437,6 +446,8 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
   <text class="mid b" x="647" y="68">R3 repeat the piece once</text><text class="mid sm tw" x="647" y="83">WARNING: played words repeat</text>
 
   <path class="ln" marker-end="url(#ah)" d="M647,92 L647,176"/>
+  <path class="ln" marker-end="url(#ah)" d="M510,130 L530,130 L530,202 L548,202"/>
+  <text class="sm m end" x="524" y="172">3 tries used up</text>
   <text class="sm m" x="655" y="130">still stalls</text>
   <rect class="bd" x="548" y="176" width="198" height="52" rx="8"/>
   <text class="mid b" x="647" y="197">R0 skip the piece</text><text class="mid sm tb" x="647" y="213">ERROR log, with the piece text</text>
@@ -444,7 +455,7 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
   <text class="sm s" x="14" y="262">Each attempt: codec restored to the last point it was good, held silence capped at 0.6 s, history of earlier pieces re-sent.</text>
   <text class="sm s" x="14" y="280">A runaway (piece far too long for its text) is cut once with an ERROR and is never resumed from.</text>
   <text class="sm s" x="14" y="298">Cost to the listener: one resume waits 2.5-4 s; a piece that fails every rung waited up to 7.5 s (measured, client side).</text>
-</svg>
+</svg></div>
 <figcaption>Skipping is the last rung, and the only one that loses text. In the 556-request run it was reached 0 times.</figcaption>
 </figure>
 
@@ -452,7 +463,7 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
 <div class="card">
 <h3>2.5 Volume pumped on every chat chunk <span class="tag">PR #26</span></h3>
 <dl class="five">
-<dt>Symptom</dt><dd>In voice chat each paragraph started louder, then settled lower. Per-second level over one chat request (dBFS): -26.9, -30.3, -29.3, -30.8, -30.2, -31.2, -30.9, -31.7.</dd>
+<dt>Symptom</dt><dd>In voice chat each request (a sentence group) started louder, then settled lower. Per-second level over one chat request (dBFS): -26.9, -30.3, -29.3, -30.8, -30.2, -31.2, -30.9, -31.7.</dd>
 <dt>Measurement</dt>
 <dd>
 <p>Onset-steady, split four ways. The same generated audio codes were decoded two ways, so only the decoder differed:</p>
@@ -468,7 +479,7 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
 </table>
 </div>
 <p>The decoder start decides the onset. Text history does not. Option+S has one cold start per read (first piece +8.0 dB, n=1); chat has one per request (+5.2 dB, n=7); later pieces sit at +1.6 to +1.9 dB.</p></dd>
-<dt>Root cause</dt><dd>Every request is a fresh model call, and a fresh call resets the decoder's streaming state. The first half second of a cold decoder is louder. Within one request the state carries over pieces, so only the first piece is hot. Origin sends one request per paragraph, so it gets this at every paragraph.</dd>
+<dt>Root cause</dt><dd>Every request is a fresh model call, and a fresh call resets the decoder's streaming state. The first half second of a cold decoder is louder. Within one request the state carries over pieces, so only the first piece is hot. Origin sends one request per sentence group (the first sentence alone, then groups of a few sentences), so it gets this at the start of every request.</dd>
 <dt>Fix</dt><dd>
 <p>Keep the decoder state from the end of the last finished piece (a cheap snapshot, no array copies) and restore it at the start of the next request. The state is tagged with a signature of model, reference clip, and sampling settings, so a changed voice never inherits an old decoder. After a model or voice change, a warm-up of about 8 s of the voice's own speech seeds it. Config: <span class="mono">carry_codec_state: true</span>.</p>
 <p>The decoder position can grow past the 4,096-frame table it was built for. We measured that: decoding after a 17,000-frame primer vs a 600-frame primer differs by SNR 55-67 dB and under 0.002 dB in level. Not audible.</p></dd>
@@ -476,7 +487,7 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
 <ul>
 <li>70 paired requests, live vs the fix, same minute: onset-steady <b>+5.03 dB to +0.85 dB</b>.</li>
 <li>Second 1 minus seconds 2-8 of each request: +3.73 dB to +0.84 dB (paired).</li>
-<li>First audio unchanged: median 0.212 s, p90 0.278 s over 415 streamed requests.</li>
+<li>First audio within the gate threshold (median at most 0.25 s, p90 at most 0.35 s): median 0.212 s, p90 0.278 s over 415 streamed requests.</li>
 </ul></dd>
 </dl>
 <h3 style="margin-top:1rem">Rejected alternatives, and why</h3>
@@ -495,7 +506,7 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
 </div>
 
 <figure>
-<svg viewBox="0 0 760 350" role="img" aria-label="Left: per-second level of one chat request before the fix drops from minus 26.9 to about minus 31 dBFS, measured; after the fix the start sits within a fraction of a dB of the rest, shown dashed as a schematic. Right: bars of request-first onset in dB, cold decoder plus 6.43 versus continuous plus 1.49, and live plus 5.03 versus fix plus 0.85.">
+<div class="scroll"><svg viewBox="0 0 760 350" role="img" aria-label="Left: per-second level of one chat request before the fix drops from minus 26.9 to about minus 31 dBFS, measured; after the fix the start sits within a fraction of a dB of the rest, shown dashed as a schematic. Right: bars of request-first onset in dB, cold decoder plus 6.43 versus continuous plus 1.49, and live plus 5.03 versus fix plus 0.85.">
   <text class="b" x="14" y="24">Cold vs carried decoder</text>
 
   <!-- left panel: per-second level; plot area x 60..350, y 50..260 ; dB -26 at y=60, -33 at y=250 => 27.14 px/dB -->
@@ -527,7 +538,7 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
   <text class="mid sm m" x="655" y="278">70 paired requests,</text><text class="mid sm m" x="655" y="292">live vs fix</text>
   <text class="sm tb" x="430" y="316">red = cold per request</text>
   <text class="sm tg" x="580" y="316">green = decoder state carried</text>
-</svg>
+</svg></div>
 <figcaption>Left: the real "louder at each chunk, then lower" shape, and what it became. Right: the same effect on two independent tests.</figcaption>
 </figure>
 
@@ -544,7 +555,7 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
 </div>
 
 <figure>
-<svg viewBox="0 0 760 270" role="img" aria-label="Stacked bars: without a cap, live arrays 24.2 GB plus cache 29.7 GB reached a 54.4 GB footprint after 29 requests; with a 4 GB cap, 24.2 GB plus about 4 GB gave 28.7 GB after 320 requests.">
+<div class="scroll"><svg viewBox="0 0 760 270" role="img" aria-label="Stacked bars: without a cap, live arrays 24.2 GB plus cache 29.7 GB reached a 54.4 GB footprint after 29 requests; with a 4 GB cap, 24.2 GB plus about 4 GB gave 28.7 GB after 320 requests.">
   <text class="b" x="14" y="24">Where the memory went (GB)</text>
   <line class="ln" x1="60" y1="236" x2="720" y2="236"/>
   <!-- scale 3.3 px/GB ; baseline 236 -->
@@ -565,7 +576,7 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
   <text class="sm s" x="560" y="80">The live arrays are the same in both:</text>
   <text class="sm s" x="560" y="96">the model did not grow. Only the</text>
   <text class="sm s" x="560" y="112">allocator's spare buffers did.</text>
-</svg>
+</svg></div>
 <figcaption>Footprints are process measurements; the stacked parts are active and cache memory from the same runs, so the parts sum to slightly under the footprint.</figcaption>
 </figure>
 
@@ -575,7 +586,7 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
 <table>
 <thead><tr><th>Ruler</th><th>What it said</th><th>What was true</th><th>Replacement</th></tr></thead>
 <tbody>
-<tr><td><b>Click check</b> (peak jump in 5 ms vs 3x the surrounding median)</td><td>64% of ordinary request starts "clicked" (n=345, median ratio 5.4). Two gate rows red.</td><td>Speech onsets are steep by nature; the ruler could not tell a join from speech.</td><td>Join step divided by the speech's own p99.9 step. Limit = p99 of natural onsets (0.88, from 3,651 onsets in 508 requests). New flag rate: 1.0% of natural onsets, 1.8% of request starts, 0 of 8 post-disconnect starts.</td></tr>
+<tr><td><b>Click check</b> (peak jump in 5 ms vs 3x the surrounding median)</td><td>64% of 345 ordinary request starts "clicked" (median ratio 5.4). Two gate rows red.</td><td>Speech onsets are steep by nature; the ruler could not tell a join from speech.</td><td>Join step divided by the speech's own p99.9 step. Limit = p99 of natural onsets (0.88, from 3,651 onsets in 508 requests). Under the new ruler: 0 of 8 post-disconnect starts and 0 of 24 forced resume joins are over the limit.</td></tr>
 <tr><td><b>Onset-steady on short requests</b></td><td>A 1.2 s first sentence showed +3.7 dB, above the +2.0 dB limit.</td><td>One short sentence's own level decay inflates the number.</td><td>Report requests of 6 s and longer separately.</td></tr>
 <tr><td><b>"October sixteenth" missing</b></td><td>One run of 16 lacked the string.</td><td>STT wrote "October sixteen". The audio was present (<span class="mono">quiet_dropped_s=0.0</span>); the last 1.5 s alone transcribed "Dated October sixteenth."</td><td>Do not treat one STT miss as a missing word until the audio is checked.</td></tr>
 <tr><td><b>Onset trim</b> (a fix, judged by onset level alone)</td><td>Looked like it worked on the target number.</td><td>It cost +0.7 s first audio and trimmed natural emphasis.</td><td>Judge a fix on all the numbers it can move, not only the one it aimed at.</td></tr>
@@ -587,8 +598,8 @@ svg text.ta { fill: var(--acc); } svg text.tw { fill: var(--warn); } svg text.tg
 <ol>
 <li><b>Measure before fixing.</b> Every fix here began with a probe: STT of the output plus per-chunk RMS. The silence line was found by listing the 9 quiet runs and reading what each said, not by guessing a number.</li>
 <li><b>Check the metric is fit for the question.</b> A ruler that fails 64% of normal speech measures the ruler. Before trusting a pass or fail, run it on audio you know is fine and on audio you know is broken.</li>
-<li><b>Reproduce on the real model, not mocks.</b> Fake-driver unit tests passed while the real model, given the prefix the engine first built, lost words in 17 of 34 resume trials. The first gate run saw 0 natural stalls in about 40 requests; the independent 556-request run found 27. Rare failures need volume.</li>
-<li><b>Separate the two request paths when the symptom differs by path.</b> Option+S pays one cold start per read, chat pays one per paragraph. Test both, with Origin's real grouping (first sentence alone, then groups).</li>
+<li><b>Reproduce on the real model, not mocks.</b> Fake-driver unit tests passed while the real model, given the prefix the engine first built, lost words in 17 of 34 resume trials. The implementer's own run saw 0 natural stalls in about 40 requests; the verifier's 556-request gate found 27. Rare failures need volume.</li>
+<li><b>Separate the two request paths when the symptom differs by path.</b> Option+S pays one cold start per read, chat pays one per request. Test both, with Origin's real grouping (first sentence alone, then groups).</li>
 <li><b>Keep a rollback tag and a config-only mitigation.</b> Tag <span class="mono">voice-stable-live-20261019</span> marks the code before PR #26. Setting <span class="mono">carry_codec_state: false</span>, <span class="mono">silence_rms: 0.01</span> and <span class="mono">stall_attempts: 0</span> restores the old behaviour without touching code.</li>
 <li><b>Probes must stop their GPU processes.</b> The Mac sat at 127 of 128 GB during the gate, so every latency number was taken under pressure, and one 16.8 s gap with no engine log line could not be explained. Run one extra model copy at a time, on its own port (9921), never the live service, and confirm the process table is clean afterwards.</li>
 <li><b>Make the log answer the next question.</b> The old log recorded 34 skips but never which text. Every stall, retry, skip and runaway line now carries <span class="mono">text='...'</span> and the <span class="mono">done</span> line carries counters, so the next bug starts with evidence.</li>

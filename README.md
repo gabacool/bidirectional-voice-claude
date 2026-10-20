@@ -72,7 +72,7 @@ Edit `local.tts_engine` in `client/config.yaml` (`edge` | `qwen` | `breeze` | `v
 | **`qwen`** | Apple Silicon, ~3GB | `local.qwen.model` + `speaker` + `instruct`. Use `language: chinese` + `serena`/`vivian` for Mandarin. | Yes — PCM as generated |
 | **`breeze`** | Apple Silicon, ~3GB ([MLX 4-bit](https://huggingface.co/mlx-community/Breeze-TTS-2-mlx-4bit)) | Auto-locks one speaker from `instruct` (clone). Optional: `ref_audio` + `ref_text`. Slower than realtime. | Yes — 24 kHz chunks |
 | **`vireo`** | Apple Silicon, ~2.1GB ([mixed-4-bit](https://huggingface.co/mchen04/Vireo-TTS-3B-MLX-mixed4bit), gated) | Clones `ref_audio` (default `breeze_lock.wav`) at `cfg_scale: 1`. English-tuned; not a Chinese TTS. | Yes — breeze_mlx codec frames |
-| **`fish`** (active on this Mac) | Apple Silicon, ~22GB disk, ~26GB RAM ([Fish Audio Drama 3, MLX 4-bit](https://huggingface.co/mlx-community/fish-audio-drama-3-4bit)) | Clones `ref_audio` + `ref_text`; by default the same voice as Breeze (`voices/breeze_lock.wav`). Inline cues like `[whispers]` work; `[pause]` does not (see below). | Yes, 0.32s chunks, ~2.2x realtime, ~0.15s to first audio |
+| **`fish`** (active on this Mac) | Apple Silicon, ~22GB disk, ~24GB weights in RAM, 28-29GB with the buffer cache ([Fish Audio Drama 3, MLX 4-bit](https://huggingface.co/mlx-community/fish-audio-drama-3-4bit)) | Clones `ref_audio` + `ref_text`; by default the same voice as Breeze (`voices/breeze_lock.wav`). Inline cues like `[whispers]` work; `[pause]` does not (see below). | Yes, 0.32s chunks, about 2x realtime (median 1.95x measured in-process), ~0.15s to first audio in-process; Option+S first audio is ~0.5s (0.34s when the Mac is quiet) because `/speak` buffers before the speaker opens |
 | Origin Piper | `backend: origin` + GPU server | Unrelated to `tts_engine`. | Full WAV |
 
 ```yaml
@@ -99,7 +99,7 @@ local:
 
 ### Fish Audio Drama 3 (`tts_engine: fish`)
 
-Fish Audio Community License: personal / non-commercial use only. Code: `client/fish_tts_engine.py`. Mac RAM use is about 26GB of weights plus a 4GB buffer cache (below).
+Fish Audio Community License: personal / non-commercial use only. Code: `client/fish_tts_engine.py`. Mac RAM use is about 24GB of weights plus a 4GB buffer cache, 28-29GB in total (below).
 
 ```yaml
 local:
@@ -110,7 +110,7 @@ local:
     clause_pause_seconds: 0.25
 ```
 
-How it reads text (plain version; the full story is in the [tuning lessons](docs/%5BKB%5Dfish-tts-tuning-lessons_20261020.html)):
+How it reads text (plain version; the full story is in the [tuning lessons](docs/%5BKB%5Dfish-tts-tuning-lessons_20261020.html), an HTML page to open locally):
 
 - **Piece** = one sentence or clause handed to the model. The model gets one piece at a time and the engine inserts an exact silence between pieces, because `[pause]` cues make it stall and one long unsplit piece goes silent after about 50 s.
 - **Stall** = the model goes silent for ~3 s mid-piece instead of finishing it. The engine resumes the piece where it stopped; it only skips a piece after 3 failed attempts, and says so in the log.
@@ -163,7 +163,7 @@ Keep `tts_temperature` in **0.7–1.0** or Qwen collapses to silence after the f
 | Model state | one `synthesize_stream`: many pieces, history kept, decoder warm after the first piece | each request starts fresh unless `carry_codec_state` carries the decoder over |
 | Where audio plays | Mac speaker | Origin's player |
 
-The two paths show different symptoms for the same engine, so a fix has to be checked on both. Lessons and measurements: [`docs/[KB]fish-tts-tuning-lessons_20261020.html`](docs/%5BKB%5Dfish-tts-tuning-lessons_20261020.html).
+The two paths show different symptoms for the same engine, so a fix has to be checked on both. Lessons and measurements: [`docs/[KB]fish-tts-tuning-lessons_20261020.html`](docs/%5BKB%5Dfish-tts-tuning-lessons_20261020.html). It is a self-contained HTML page: open the file locally in a browser (GitHub shows only its source).
 
 ---
 
@@ -225,7 +225,7 @@ Or run `client/scripts/start_voice_api.sh` in a terminal (not while the LaunchAg
   cd ~/Git/nvidia_parakeet && git checkout voice-stable-live-20261019
   launchctl kickstart -k "gui/$(id -u)/com.gabagool.voiceapi"
   ```
-- **Or revert the merge:** `git revert -m 1 <merge-commit>` on a branch, open a PR, and restart.
+- **Or revert the commits:** both PRs were squash-merged (one parent each), so there is no `-m` flag. On a branch run `git revert 0d4f8b7` (PR #26, the stall/volume fix) and, to remove the engine too, `git revert 42e165c` (PR #24). Open a PR and restart.
 - **Config-only, no code change** (hot-reloads on the next Option+S): `fish.carry_codec_state: false`, `fish.silence_rms: 0.01`, `fish.stall_attempts: 0`. This restores the old cold start, silence line and skip-on-stall, but not the old code path.
 - **Leave Fish entirely:** set `local.tts_engine` back to `vireo` (or `edge`) and restart.
 
@@ -243,7 +243,7 @@ Canonical file: [`client/config.yaml.example`](client/config.yaml.example). Copy
 | `local.qwen.*` | local.qwen | Qwen: `model`, `speaker`, `language`, `instruct`, sampling |
 | `local.breeze.*` | local.breeze | Breeze mlx-audio: `model`, `instruct`, `cfg_scale`, `seed`, optional `ref_audio`/`ref_text` |
 | `local.vireo.*` | local.vireo | Vireo: `model`, `speaker`, `instruct`, `cfg_scale` (use 1), `seed`, `ref_audio`/`ref_text` |
-| `local.fish.*` | local.fish | Fish Drama 3: see the key table in [Fish Audio Drama 3](#fish-audio-drama-3-tts_enginefish) |
+| `local.fish.*` | local.fish | Fish Drama 3: see the key table in [Fish Audio Drama 3](#fish-audio-drama-3-tts_engine-fish) |
 | `local.tts_speed` | local | Playback speed for every engine |
 | `local.tts_seek_seconds` | local | Option+< / Option+> step |
 | `local.voice_api_port` | local | LAN API port, default 9900 |
@@ -338,7 +338,7 @@ nvidia_parakeet/
 | A sentence is missing or a word repeats (fish) | `grep -E '\[fish\] (stall\|WARNING\|ERROR)' /tmp/voice_api.log`. A stall line carries the piece text, e.g. `stall in piece 5/11 after 3s silence (spoke 3.4s); resume 1/3 text='...'`. `resume` is the normal recovery. `WARNING ... repeating from start` means the piece was replayed (words repeat). `ERROR giving up ... skipping text=...` is the only line that means a piece was lost. |
 | Fish read ends early or babbles | `ERROR runaway in piece N/M (... voiced frames > budget ...); skipping text='...'`: the piece ran far longer than its text should take and was cut (not retried). Rare, mostly number-heavy pieces. |
 | Health of one fish request | Each request ends with `[fish] done audio=... wall=... rtf=... stalls= resumed= retried= skipped= runaway= quiet_dropped_s=`. Healthy: `skipped=0 runaway=0 quiet_dropped_s=0.0`. `stalls` and `resumed` above 0 are normal on spelled-ticker text. |
-| Chat volume uneven (fish) | Look for `[fish] carry: restored (codec position N)` at each request start. `carry: reset (signature changed)` right after a config edit is normal once; repeated resets mean `carry_codec_state: false` or the config keeps changing. |
+| Chat volume uneven (fish) | Look for `[fish] carry: restored (codec position N)` at each request start. `carry: reset (nothing carried)` = no carry is stored for this voice yet (for example `warmup: false` before the first finished piece). `carry: reset (signature changed)` = a config edit changed the voice or sampling; normal once. With `carry_codec_state: false` no `[fish] carry:` line appears at all, and volume pumping is expected. Repeated resets mean the config keeps changing. |
 | Fish process keeps growing in memory | Check for `[fish] mlx cache limit 4 GB` in the log; lower `mlx_cache_limit_gb` if the Mac is tight. |
 | Stale engine / old code still on :9900 | `launchctl kickstart -k "gui/$(id -u)/com.gabagool.voiceapi"` then `curl -s http://127.0.0.1:9900/health` |
 | ASR/TTS server down (origin) | `systemctl --user restart parakeet-asr.service` / `tts-server.service` |
