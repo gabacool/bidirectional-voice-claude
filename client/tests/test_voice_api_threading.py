@@ -268,3 +268,35 @@ def test_reload_warmup_failure_is_logged(monkeypatch, tmp_path, capsys):
         tts_exec.shutdown(wait=True)               # callbacks run before shutdown returns
     out = capsys.readouterr().out
     assert "warm-up after config reload failed" in out and "reference clip not found" in out
+
+
+# --- config reload: a failed reload must not be marked as applied -----------
+
+def test_failed_reload_is_retried_until_config_is_fixed(monkeypatch, tmp_path, capsys):
+    """A bad config (e.g. a removed `tts_engine: edge`) must keep failing loudly
+    on every request; only a successful apply records the mtime."""
+    import os
+    release = threading.Event()
+    release.set()
+    tts = _ReloadTTS(release)
+    voice_api, server, tts_exec = _reload_env(monkeypatch, tmp_path, tts)
+    cfg = voice_api.CONFIG_PATH
+    cfg.write_text("local:\n  tts_engine: edge\n")
+    try:
+        for _ in range(2):            # same unchanged file, two requests
+            with pytest.raises(ValueError, match="Unknown tts_engine"):
+                voice_api.maybe_reload_config(server)
+        assert server.config_mtime is None          # never marked applied
+        assert server.tts is tts                    # old engine object untouched
+        assert capsys.readouterr().err.count("[config error]") == 2
+
+        cfg.write_text("local:\n  tts_engine: fish\n")
+        st = cfg.stat()
+        os.utime(cfg, (st.st_atime, st.st_mtime + 5))   # fixed file, new mtime
+        voice_api.maybe_reload_config(server)           # now applies
+        assert server.config_mtime == cfg.stat().st_mtime
+        assert tts.applied == 1
+        voice_api.maybe_reload_config(server)           # unchanged -> no-op
+        assert tts.applied == 1
+    finally:
+        tts_exec.shutdown(wait=True)

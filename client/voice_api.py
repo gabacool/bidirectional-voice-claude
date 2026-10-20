@@ -127,14 +127,30 @@ def _log_warmup_failure(future) -> None:
 
 
 def maybe_reload_config(server) -> None:
-    """Re-apply config.yaml if it changed. Engine swaps replace the TTS object."""
+    """Re-apply config.yaml if it changed. Engine swaps replace the TTS object.
+
+    The mtime is recorded only AFTER the config applied cleanly. A bad config
+    (unknown ``tts_engine``, YAML error, failed model load) therefore raises on
+    every request until it is fixed, instead of being marked as applied and
+    silently leaving the old engine serving. The error is logged here and
+    re-raised so the HTTP handler can return it.
+    """
     try:
         mtime = CONFIG_PATH.stat().st_mtime
     except OSError:
         return
     if mtime == getattr(server, 'config_mtime', None):
         return
+    try:
+        _apply_config(server)
+    except Exception as exc:
+        print(f"[config error] config.yaml not applied, will retry on the next "
+              f"request: {exc}", file=sys.stderr, flush=True)
+        raise
     server.config_mtime = mtime
+
+
+def _apply_config(server) -> None:
     local_cfg = load_config().get('local', {})
     server.tts, swapped = replace_or_reconfigure_tts(server.tts, local_cfg)
     if swapped:
@@ -556,7 +572,8 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             return
 
         with self.server.speak_lock:
-            maybe_reload_config(self.server)
+            if not self._reload_config_or_respond():
+                return
             self.server.stop_event.clear()
             self.server.pause_event.clear()
             self.server.audible.clear()
@@ -595,7 +612,8 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             return
 
         with self.server.speak_lock:
-            maybe_reload_config(self.server)
+            if not self._reload_config_or_respond():
+                return
 
         try:
             audio = self.server.tts_executor.submit(
@@ -788,6 +806,15 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
         finally:
             # Stop the producer (aborts generation if we exited early) and join it.
             stream.close()
+
+    def _reload_config_or_respond(self) -> bool:
+        """Reload config.yaml; on failure answer 500 with the error, return False."""
+        try:
+            maybe_reload_config(self.server)
+        except Exception as e:
+            self._respond_text(500, f'config error: {e}')
+            return False
+        return True
 
     def _respond_text(self, code: int, body: str):
         payload = body.encode()
