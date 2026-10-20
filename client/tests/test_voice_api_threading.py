@@ -198,3 +198,73 @@ def test_live_transcription_stays_responsive_during_synthesis(tmp_path):
         f"transcription queued behind synthesis: {during:.2f}s "
         f"during vs {solo:.2f}s solo"
     )
+
+
+# --- config reload: eager warm-up on the inference thread -------------------
+
+class _ReloadTTS:
+    """A Fish-shaped TTS for maybe_reload_config: records where warm-up ran."""
+
+    engine = "fish"
+    speaker = "s"
+    speed = 1.0
+
+    def __init__(self, release: threading.Event, fail: bool = False):
+        self.release = release
+        self.fail = fail
+        self.applied = 0
+        self.warm_thread: str | None = None
+        self.warm_done = threading.Event()
+
+    def apply_config(self, _flat):
+        self.applied += 1
+
+    def _ensure_model(self):
+        self.release.wait(timeout=5)
+        self.warm_thread = threading.current_thread().name
+        self.warm_done.set()
+        if self.fail:
+            raise RuntimeError("reference clip not found")
+
+
+def _reload_env(monkeypatch, tmp_path, tts):
+    import types
+    import voice_api
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("local:\n  tts_engine: fish\n")
+    monkeypatch.setattr(voice_api, "CONFIG_PATH", cfg)
+    tts_exec, _ = _make_executors()
+    server = types.SimpleNamespace(tts=tts, tts_executor=tts_exec, config_mtime=None)
+    return voice_api, server, tts_exec
+
+
+def test_reload_submits_warmup(monkeypatch, tmp_path):
+    release = threading.Event()
+    tts = _ReloadTTS(release)
+    voice_api, server, tts_exec = _reload_env(monkeypatch, tmp_path, tts)
+    try:
+        t0 = time.monotonic()
+        voice_api.maybe_reload_config(server)      # warm-up is blocked on `release`
+        assert time.monotonic() - t0 < 1.0         # ...and the reload did not wait for it
+        assert tts.applied == 1 and server.tts is tts
+        assert not tts.warm_done.is_set()
+        release.set()
+        assert tts.warm_done.wait(timeout=5)
+        assert tts.warm_thread.startswith("tts-infer")   # on the inference thread
+    finally:
+        release.set()
+        tts_exec.shutdown()
+
+
+def test_reload_warmup_failure_is_logged(monkeypatch, tmp_path, capsys):
+    release = threading.Event()
+    release.set()
+    tts = _ReloadTTS(release, fail=True)
+    voice_api, server, tts_exec = _reload_env(monkeypatch, tmp_path, tts)
+    try:
+        voice_api.maybe_reload_config(server)
+        assert tts.warm_done.wait(timeout=5)
+    finally:
+        tts_exec.shutdown(wait=True)               # callbacks run before shutdown returns
+    out = capsys.readouterr().out
+    assert "warm-up after config reload failed" in out and "reference clip not found" in out

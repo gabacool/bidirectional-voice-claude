@@ -116,6 +116,16 @@ def is_loopback_host(host: str) -> bool:
     return h.startswith('::ffff:') and h.endswith('127.0.0.1')
 
 
+def _log_warmup_failure(future) -> None:
+    """Done-callback for the eager post-reload warm-up: nobody awaits it, so a
+    failure (missing reference clip, pin drift) would otherwise vanish."""
+    if future.cancelled():
+        return
+    exc = future.exception()
+    if exc is not None:
+        print(f"TTS warm-up after config reload failed: {exc!r}", flush=True)
+
+
 def maybe_reload_config(server) -> None:
     """Re-apply config.yaml if it changed. Engine swaps replace the TTS object."""
     try:
@@ -132,6 +142,12 @@ def maybe_reload_config(server) -> None:
         print(f"Switched TTS engine to {server.tts.engine} "
               f"(speaker={server.tts.speaker})", flush=True)
     else:
+        # Warm any engine whose signature changed (Fish: new voice/reference
+        # -> driver + codec warm-up) on the inference thread, off the request
+        # path. Fire and forget: queued behind a running stream, never blocking
+        # this HTTP thread.
+        warm = server.tts_executor.submit(server.tts._ensure_model)
+        warm.add_done_callback(_log_warmup_failure)
         print(f"Reloaded config (speaker={server.tts.speaker}, "
               f"speed={server.tts.speed})", flush=True)
 

@@ -114,6 +114,24 @@ local:
     # (the model's own ~0.1s comma pause stays).
     sentence_pause_seconds: 0.5     # after . ! ? ;
     clause_pause_seconds: 0.25      # after , :
+    # Silence watchdog. A streamed chunk (~0.32 s) below silence_rms is
+    # silent: quiet sentence endings sit at 0.003-0.01 and are speech, true
+    # silence is <= 0.0004. stall_seconds of silence in a row = the model
+    # stalled on this piece. (Old behaviour: silence_rms 0.01.)
+    silence_rms: 0.001
+    stall_seconds: 3.0
+    # Re-generations per stalled piece: resume from where the model stopped
+    # (twice), then repeat the piece once (repeats words), then skip it with
+    # an ERROR in the log. 0 = skip at the first stall (old behaviour).
+    stall_attempts: 3
+    # Each request would start the codec cold (first ~0.5 s of speech +5 dB
+    # louder: chat sends one request per sentence group, so the volume pumps).
+    # true = carry the codec state across requests. false = old cold start.
+    carry_codec_state: true
+    # GB of freed GPU buffers MLX may keep for reuse (process-wide). With no
+    # cap MLX keeps them all and the process grows by 20+ GB within a few
+    # dozen requests; 0 = keep none (about 10% slower, +0.05 s first audio).
+    mlx_cache_limit_gb: 4
     # Clone a wav instead (BOTH keys; ref_text = exact words in the clip).
     # 44.1 kHz, 5-15 s, one speaker, quiet room. Longer clips add prefill latency.
     # ref_audio: "/Users/you/Git/nvidia_parakeet/client/voices/my_voice.wav"

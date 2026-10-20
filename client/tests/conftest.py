@@ -10,3 +10,8 @@ from pathlib import Path
 CLIENT_DIR = Path(__file__).resolve().parent.parent
 if str(CLIENT_DIR) not in sys.path:
     sys.path.insert(0, str(CLIENT_DIR))
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "slow: real-model test, run only with FISH_SLOW=1")
