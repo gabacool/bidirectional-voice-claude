@@ -153,8 +153,19 @@ def maybe_reload_config(server) -> None:
 def _apply_config(server) -> None:
     local_cfg = load_config().get('local', {})
     server.tts, swapped = replace_or_reconfigure_tts(server.tts, local_cfg)
+    # An engine swap leaves server.tts pointing at a NEW, unloaded engine.
+    # `tts_load_pending` stays set until its model has really loaded, so a
+    # failed load cannot be mistaken for "same engine, just reconfigure" on
+    # the next request: that retry loads synchronously (and raises again on
+    # failure) instead of taking the fire-and-forget warm-up below. Memory:
+    # engines are lazy (constructing one loads nothing), and the old engine
+    # loses its last reference on the assignment above, before the new model
+    # loads here, so two large models are never resident together.
     if swapped:
+        server.tts_load_pending = True
+    if getattr(server, 'tts_load_pending', False):
         server.tts_executor.submit(server.tts._ensure_model).result()
+        server.tts_load_pending = False
         print(f"Switched TTS engine to {server.tts.engine} "
               f"(speaker={server.tts.speaker})", flush=True)
     else:
